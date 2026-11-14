@@ -24,9 +24,10 @@ use vellev_storage::coordinator::{
     Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
+use vellev_storage::timings::{Timed, Timings};
 use vellev_storage::{
-    Batch, Embedded, GroupCommitter, Mutation, Receipt, State, StorageError, Transfers, Unembedded,
-    Vectorize, Writer,
+    Batch, Embedded, FlushFirst, GroupCommitter, MergeBuilds, Mutation, Receipt, State,
+    StorageError, Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
 };
 
 mod backing;
@@ -188,6 +189,14 @@ pub struct Settings {
     /// How long a tenant this node writes for is kept unused before it is
     /// let go, its memory given back and its lease left for any node.
     pub tenant_idle: Duration,
+    /// How long a tenant's maintenance goes, at most, without cleaning up
+    /// and making the curves of its segments' rows, once a round is under
+    /// way, though its merges wait for a turn or build for far longer: both
+    /// go on beside them, this long from the round's start and then this
+    /// far apart. So the longest gap, a round following one that left its
+    /// clean for a flush, is about twice this; and a merge may see more
+    /// than one clean.
+    pub clean_at_least_every: Duration,
     /// The most queries a second one tenant may ask of this node, if any.
     pub queries_per_second: Option<f64>,
     /// The most objects a second one tenant may write through this node,
@@ -249,6 +258,56 @@ pub struct Settings {
     /// no other node: the node never holds, follows or backs up a tenant
     /// it does not serve. Every tenant, unless told otherwise.
     pub served: Served,
+    /// Where merges are built: on rayon's global pool, with flushes and
+    /// loads, unless told otherwise (merge note, §3).
+    pub merge_pool: MergePool,
+}
+
+/// The threads a node builds its merges on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MergePool {
+    /// Rayon's global pool, which builds flushes and loads too, at the
+    /// process's priority.
+    #[default]
+    Global,
+    /// Pools of their own among `threads` threads, one pool for each
+    /// merge built at once and an equal share to each, any left over
+    /// unused, each thread run `nice` lower than the rest of the process,
+    /// on Linux, from 0, which runs them as it does, to 19, as
+    /// [`Settings::check`] makes sure. A build's clustered indexes tune on
+    /// the one tuning thread whatever this says.
+    Own { threads: usize, nice: i32 },
+}
+
+impl MergePool {
+    /// Why a node that builds `builds` merges at once cannot build them on
+    /// this, if it cannot: each build has its share of the threads, so
+    /// fewer than that leaves one with none; a nice below 0 would raise a
+    /// merge above the process's priority, which it never needs and the
+    /// image's user may not take; and one past 19 is lower than any there
+    /// is. [`Settings::check`] asks it, and so does whoever makes a node
+    /// without that check.
+    pub fn problem(&self, builds: usize) -> Option<String> {
+        let MergePool::Own { threads, nice } = *self else {
+            return None;
+        };
+        if threads < builds {
+            return Some(format!(
+                "a merge pool of {threads} threads cannot give each of {builds} builds at \
+                 once a thread"
+            ));
+        }
+        match nice {
+            0..=19 => None,
+            ..0 => Some(format!(
+                "a nice of {nice} for the merge pool would run merges above the process's \
+                 priority"
+            )),
+            _ => Some(format!(
+                "a nice of {nice} for the merge pool is past 19, the lowest there is"
+            )),
+        }
+    }
 }
 
 /// The tenants a node serves.
@@ -290,6 +349,7 @@ impl Settings {
             warm_most: 16,
             max_format: DEFAULT_MAX_FORMAT,
             tenant_idle: Duration::from_secs(15 * 60),
+            clean_at_least_every: Duration::from_secs(10 * 60),
             queries_per_second: None,
             writes_per_second: None,
             memory: None,
@@ -306,6 +366,7 @@ impl Settings {
             purge_after: Duration::from_secs(10 * 60),
             transfers: Transfers::default(),
             served: Served::Every,
+            merge_pool: MergePool::Global,
         }
     }
 
@@ -319,6 +380,7 @@ impl Settings {
             .grace_problem(self.grace)
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .or_else(|| self.backlog_problem())
+            .or_else(|| self.merge_pool.problem(MERGE_BUILDS))
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
     }
 
@@ -542,23 +604,44 @@ fn unembedded(error: EmbedError) -> Unembedded {
     }
 }
 
-/// A tenant this node writes for.
+/// A tenant this node writes for, as requests and restores hold it: a sweep
+/// lets a tenant go only if nothing but the node and the sweep holds this.
+/// Its tasks hold what they work on instead, its `TenantWork`.
 #[derive(Debug)]
 pub struct Tenant {
-    id: TenantId,
-    writer: Arc<Writer>,
+    work: Arc<TenantWork>,
     commits: GroupCommitter,
     embedders: Arc<Embedders>,
-    flush_rows: usize,
     /// See [`Settings::backlog_rows`].
     backlog_rows: usize,
+    /// When the tenant was last asked for.
+    used: Mutex<Instant>,
+    limits: Arc<Limits>,
+    /// The restore running here, if any.
+    running: Mutex<Option<Running>>,
+}
+
+/// What a tenant's tasks work on. Its flush task and its maintenance each
+/// upgrade a `Weak` of this for a flush or a round and hold no [`Tenant`], so
+/// that dropping the tenant ends them, wherever they are. What ends a restore
+/// holds this as well.
+#[derive(Debug)]
+struct TenantWork {
+    id: TenantId,
+    writer: Arc<Writer>,
+    /// How a flush is asked for of its flush task.
+    flushes: mpsc::Sender<()>,
+    flush_rows: usize,
     /// See [`Settings::flush_backoff`].
     flush_backoff: Duration,
+    /// See [`Settings::clean_at_least_every`].
+    clean_at_least_every: Duration,
+    /// When it was last cleaned up all through, or opened.
+    cleaned_at: Mutex<Instant>,
     /// Failed flushes in a row, and when the next may be tried.
     backoff: Mutex<(u32, Option<Instant>)>,
     /// The node's counts of flushes failed and writes refused for them.
     flushing: Arc<FlushCounts>,
-    flushes: mpsc::Sender<()>,
     /// Whether a flush or merge is due or under way: see [`Node::unsettled`].
     settling: Settling,
     /// Lost once the writer can no longer write or the node lets the tenant
@@ -567,23 +650,20 @@ pub struct Tenant {
     /// When the hold on the tenant runs out unless renewed, by this node's
     /// own clock.
     deadline: Arc<Mutex<Instant>>,
-    /// When the tenant was last asked for.
-    used: Mutex<Instant>,
-    limits: Arc<Limits>,
-    /// The restore running here, if any.
-    running: Mutex<Option<Running>>,
 }
 
-/// What a tenant's maintenance has done, to tell whether a flush or merge
-/// is due or under way.
+/// What a tenant's tasks have done, to tell whether a flush or merge is due
+/// or under way.
 #[derive(Debug, Default)]
 struct Settling {
     /// Flushes that went through.
     flushed: AtomicU64,
-    /// [`Self::flushed`] as it stood after the flush, if any, of the last
-    /// round that went through. A round merges until a merge finds nothing
-    /// to do, so once it has followed every flush, no merge is due.
+    /// [`Self::flushed`] as it stood at the start of the last round that
+    /// went through. A round merges until a merge finds nothing to do, so
+    /// once it has followed every flush, no merge is due.
     maintained: AtomicU64,
+    /// Passes over its segments' rows made.
+    rows_passes: AtomicU64,
 }
 
 /// A node's hold on a tenant, as everything that works on the tenant sees
@@ -593,8 +673,12 @@ struct Settling {
 #[derive(Debug, Default)]
 struct Hold {
     lost: AtomicBool,
+    /// The node's counts of the merges stopped by losing a hold.
+    stops: Arc<StopCounts>,
     /// The tenant's queue of writes, once it is open.
     commits: OnceLock<GroupCommitter>,
+    /// The tenant's writer, once it is open.
+    writer: OnceLock<Weak<Writer>>,
     tasks: Mutex<Vec<AbortHandle>>,
 }
 
@@ -605,14 +689,47 @@ impl Hold {
 
     /// Lose the hold, stopping every task working on the tenant: its
     /// writes, a commit under way being answered as unknown, and whatever
-    /// maintains or restores it.
-    fn lose(&self) {
+    /// maintains or restores it. A merge under way is stopped first: its
+    /// build, which an aborted task would leave running, gives up and lets
+    /// go of what it holds (merge note, step 3). All of it under the tasks'
+    /// lock, which [`Self::opened`] takes too, so that writes and a writer
+    /// set as the tenant opens are stopped whichever comes first. A merge
+    /// this stops, or cuts off with its task past where a stop ends it, is
+    /// counted for `why`; one stopped already is not, so what first stopped
+    /// it is what it is counted as. A merge that no task of this hold runs,
+    /// as a request's, past where a stop ends it, goes on: nothing here
+    /// stopped it.
+    fn lose(&self, why: Lost) {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
         self.lost.store(true, Ordering::SeqCst);
         if let Some(commits) = self.commits.get() {
             commits.stop();
         }
-        let stopped = std::mem::take(&mut *self.tasks.lock().expect("tasks lock"));
-        stopped.iter().for_each(AbortHandle::abort);
+        let tasks = std::mem::take(&mut *tasks);
+        if let Some(writer) = self.writer.get().and_then(Weak::upgrade) {
+            let aborting = |merging| tasks.iter().any(|task| task.id() == merging);
+            if writer.stop_merges_aborting(aborting) {
+                self.stops.count(why);
+            }
+        }
+        tasks.iter().for_each(AbortHandle::abort);
+    }
+
+    /// Note the tenant's `writer` and queue of `commits` as it opens:
+    /// stopped at once if the hold was lost meanwhile, as losing it would
+    /// have stopped them.
+    fn opened(&self, writer: &Arc<Writer>, commits: &GroupCommitter) {
+        let _tasks = self.tasks.lock().expect("tasks lock");
+        self.writer
+            .set(Arc::downgrade(writer))
+            .expect("a tenant's writer is opened once");
+        self.commits
+            .set(commits.clone())
+            .expect("a tenant's writes are queued once");
+        if self.lost.load(Ordering::SeqCst) {
+            commits.stop();
+            writer.stop_merges();
+        }
     }
 
     /// Have `task` stopped when the hold is lost, at once if it is already.
@@ -630,7 +747,85 @@ impl Hold {
 
 impl Drop for Tenant {
     fn drop(&mut self) {
-        self.hold.lose();
+        self.work.hold.lose(Lost::Dropped);
+    }
+}
+
+/// Why a hold on a tenant was lost, as a merge that stopped is counted.
+#[derive(Debug, Clone, Copy)]
+enum Lost {
+    /// A sweep let the tenant go.
+    LetGo,
+    /// Its lease ran out or was lost, or its writer can write no more.
+    Lease,
+    /// It was dropped, by a request or as nothing held it any more.
+    Dropped,
+    /// The node gave up every tenant.
+    Shutdown,
+}
+
+/// How many merges losing a hold has stopped or cut off, each once, by why
+/// it was lost.
+#[derive(Debug, Default)]
+struct StopCounts {
+    let_go: AtomicU64,
+    lease: AtomicU64,
+    dropped: AtomicU64,
+    shutdown: AtomicU64,
+}
+
+impl StopCounts {
+    fn count(&self, why: Lost) {
+        let count = match why {
+            Lost::LetGo => &self.let_go,
+            Lost::Lease => &self.lease,
+            Lost::Dropped => &self.dropped,
+            Lost::Shutdown => &self.shutdown,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn counted(&self) -> MergesStopped {
+        MergesStopped {
+            let_go: self.let_go.load(Ordering::Relaxed),
+            lease: self.lease.load(Ordering::Relaxed),
+            drop: self.dropped.load(Ordering::Relaxed),
+            shutdown: self.shutdown.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Held by a task whose end is the end of the hold, however it comes: every
+/// way it means to end, the hold is lost or the tenant gone already, and a
+/// panic is the one that would leave the tenant open with no such task. A
+/// merge lost to a panic is in no count of merges stopped, and nothing else
+/// names the tenant, so that a panic is logged here and counted. Each of a
+/// tenant's two tasks holds one: should both panic at once, two are counted.
+#[derive(Debug)]
+struct GivesUp {
+    hold: Arc<Hold>,
+    tenant: TenantId,
+    /// Which of the tenant's tasks it is.
+    task: &'static str,
+    /// The node's count of tenants given up for a panic.
+    given_up: Arc<AtomicU64>,
+}
+
+impl Drop for GivesUp {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                tenant = %self.tenant,
+                task = self.task,
+                "a tenant's task panicked; the tenant is given up"
+            );
+            self.given_up.fetch_add(1, Ordering::Relaxed);
+        }
+        // Lost already, what stopped it said why: a second `lose` would
+        // count a merge begun since as a lease lost.
+        if !self.hold.is_lost() {
+            self.hold.lose(Lost::Lease);
+        }
     }
 }
 
@@ -745,17 +940,45 @@ impl Drop for Ending {
 
 impl Tenant {
     pub fn id(&self) -> &TenantId {
-        &self.id
+        &self.work.id
     }
 
-    /// Whether this node still holds the tenant, as far as it can tell
-    /// without asking: its hold has not run out and nothing has failed.
+    /// Whether this node still holds the tenant: see [`TenantWork::held`].
     fn held(&self) -> bool {
-        !self.hold.is_lost() && Instant::now() < *self.deadline()
+        self.work.held()
     }
 
-    fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
-        self.deadline.lock().expect("deadline lock")
+    /// Hold the tenant's merges, past loading back what they built, until
+    /// let go. For tests.
+    #[doc(hidden)]
+    pub fn hold_merges_before_commit(&self) -> Arc<vellev_storage::MergeGate> {
+        self.work.writer.hold_merges_before_commit()
+    }
+
+    /// Stop the tenant's merges, as a sweep does. For tests.
+    #[doc(hidden)]
+    pub fn stop_merges(&self) {
+        self.work.writer.stop_merges();
+    }
+
+    /// How many flushes in a row have failed. For tests.
+    #[doc(hidden)]
+    pub fn flushes_failing(&self) -> u32 {
+        self.work.backoff.lock().expect("backoff lock").0
+    }
+
+    /// How many passes over its segments' rows its maintenance has made.
+    /// For tests.
+    #[doc(hidden)]
+    pub fn rows_passes(&self) -> u64 {
+        self.work.settling.rows_passes.load(Ordering::SeqCst)
+    }
+
+    /// When the hold on the tenant runs out unless renewed: each renewal
+    /// moves it on. For tests.
+    #[doc(hidden)]
+    pub fn held_until(&self) -> Instant {
+        *self.work.deadline()
     }
 
     fn touch(&self) {
@@ -773,12 +996,12 @@ impl Tenant {
 
     /// The tenant's data as this node holds it in memory.
     pub fn partition(&self) -> &Arc<vellev_storage::Partition> {
-        self.writer.partition()
+        self.work.writer.partition()
     }
 
     /// Run `f` against the tenant's data as of its last commit.
     pub fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
-        self.writer.partition().read(f)
+        self.work.read(f)
     }
 
     /// The vectors `mutations` will need made, for as many as can be made
@@ -787,7 +1010,7 @@ impl Tenant {
     /// time.
     async fn embedded(&self, mutations: &[Mutation]) -> Embedded {
         let mut alike: HashMap<Embedding, Vec<String>> = HashMap::new();
-        for (embedding, text) in self.writer.wanted(mutations) {
+        for (embedding, text) in self.work.writer.wanted(mutations) {
             alike.entry(embedding).or_default().push(text);
         }
         let made = alike.into_iter().map(|(embedding, texts)| async move {
@@ -826,7 +1049,8 @@ impl Tenant {
         if !mutations.iter().any(makes) {
             return Ok(());
         }
-        self.writer
+        self.work
+            .writer
             .creates(mutations)
             .iter()
             .try_for_each(|schema| {
@@ -854,7 +1078,7 @@ impl Tenant {
             // tenant's limits: a write turned away costs it nothing.
             self.not_backlogged()?;
             self.limits
-                .admit(&self.id, Asked::Write, batch.mutations.len())?;
+                .admit(&self.work.id, Asked::Write, batch.mutations.len())?;
             self.can_embed(&batch.mutations)?;
         }
         let made = match answered {
@@ -865,7 +1089,7 @@ impl Tenant {
             .commits
             .submit_batch(batch, made)
             .await
-            .map_err(|error| self.failed(error))?;
+            .map_err(|error| self.work.failed(error))?;
         // A delete by filter was let through as one write: every object
         // it deleted is one more, owed from now on.
         if !answered {
@@ -875,10 +1099,10 @@ impl Tenant {
                 }
                 _ => 0,
             });
-            self.limits.owe(&self.id, Asked::Write, deleted.sum());
+            self.limits.owe(&self.work.id, Asked::Write, deleted.sum());
         }
-        if self.read(State::unflushed) >= self.flush_rows {
-            let _ = self.flushes.try_send(());
+        if self.read(State::unflushed) >= self.work.flush_rows {
+            let _ = self.work.flushes.try_send(());
         }
         Ok(receipt)
     }
@@ -889,9 +1113,15 @@ impl Tenant {
     /// fewer than a flush stay in memory, searched exactly, and leave the
     /// tenant settled.
     fn settled(&self) -> bool {
-        let settling = &self.settling;
-        self.read(State::unflushed) < self.flush_rows
+        let settling = &self.work.settling;
+        self.figures().unflushed < self.work.flush_rows
             && settling.maintained.load(Ordering::SeqCst) >= settling.flushed.load(Ordering::SeqCst)
+    }
+
+    /// What the tenant comes to, as it was last changed: read without the
+    /// lock on its state, as a scrape and a sweep read it.
+    fn figures(&self) -> vellev_storage::Figures {
+        self.work.writer.partition().figures()
     }
 
     /// Refuse a write while the tenant holds [`Settings::backlog_rows`]
@@ -901,41 +1131,17 @@ impl Tenant {
         if self.read(State::unflushed) < self.backlog_rows {
             return Ok(());
         }
-        let _ = self.flushes.try_send(());
-        self.flushing.backlogged.fetch_add(1, Ordering::Relaxed);
-        let next = self.backoff.lock().expect("backoff lock").1;
+        let _ = self.work.flushes.try_send(());
+        let work = &self.work;
+        work.flushing.backlogged.fetch_add(1, Ordering::Relaxed);
+        let next = work.backoff.lock().expect("backoff lock").1;
         let wait = next.map_or(Duration::ZERO, |next| {
             next.saturating_duration_since(Instant::now())
         });
         Err(NodeError::Backlogged {
-            tenant: self.id.clone(),
-            wait: wait.max(self.flush_backoff),
+            tenant: work.id.clone(),
+            wait: wait.max(work.flush_backoff),
         })
-    }
-
-    /// Whether a flush may be tried now, none having failed lately.
-    fn flush_may_be_tried(&self) -> bool {
-        let next = self.backoff.lock().expect("backoff lock").1;
-        next.is_none_or(|next| Instant::now() >= next)
-    }
-
-    /// When the next flush may be tried, if the last one tried failed.
-    fn flush_retried_at(&self) -> Option<Instant> {
-        self.backoff.lock().expect("backoff lock").1
-    }
-
-    /// Note how the flush tried went: one that failed puts the next off,
-    /// twice as long as the one before, and one that went through ends that.
-    fn flush_tried(&self, went_through: bool) {
-        let mut backoff = self.backoff.lock().expect("backoff lock");
-        if went_through {
-            *backoff = (0, None);
-            return;
-        }
-        self.flushing.failed.fetch_add(1, Ordering::Relaxed);
-        let failed = backoff.0.saturating_add(1);
-        let wait = self.flush_backoff * 2u32.pow((failed - 1).min(6));
-        *backoff = (failed, Some(Instant::now() + wait));
     }
 
     /// Move what has been written since the last checkpoint out of memory.
@@ -943,12 +1149,7 @@ impl Tenant {
     /// tries off, as [`Settings::flush_backoff`] says, and is counted in
     /// [`Node::flushing`]; one that goes through ends that.
     pub async fn flush(&self) -> Result<LogPosition> {
-        let flushed = self.writer.flush().await;
-        self.flush_tried(flushed.is_ok());
-        if flushed.is_ok() {
-            self.settling.flushed.fetch_add(1, Ordering::SeqCst);
-        }
-        flushed.map_err(|error| self.failed(error))
+        self.work.flush().await
     }
 
     /// Merge segments until a merge finds nothing to do, and then delete
@@ -963,41 +1164,25 @@ impl Tenant {
     /// of that window names, and that is the caller's breach. What that
     /// floor does not cover is said at [`LEAST_GRACE`].
     pub async fn compact(&self, grace: Duration) -> Result<usize> {
-        while self
-            .writer
-            .merge()
-            .await
-            .map_err(|error| self.failed(error))?
-            .is_some()
-        {}
-        let mut deleted = 0;
-        loop {
-            let cleaned = self.writer.clean(grace).await;
-            let more = cleaned.map_err(|error| self.failed(error))?;
-            deleted += more;
-            if more < Writer::CLEANED_AT_ONCE {
-                return Ok(deleted);
-            }
-        }
+        self.work.merged().await?;
+        let cleaned = self.work.cleaned_unless(grace, &|| false).await?;
+        Ok(cleaned.unwrap_or(0))
     }
 
-    /// Forget the commits the tenant can no longer go back to, then merge
-    /// its segments and delete the files no restore within its window
-    /// needs, kept `grace` longer. Returns how many files were deleted.
-    async fn maintained(
-        &self,
-        coordinator: &dyn Coordinator,
-        default_window: Duration,
-        grace: Duration,
-    ) -> Result<usize> {
-        let window = restore_window(coordinator, &self.id, default_window).await?;
-        coordinator.forget_history(&key(&self.id), window).await?;
-        self.compact(window.saturating_add(grace)).await
+    /// Whether nothing holds the tenant's work but the tenant: no round of
+    /// its maintenance is under way, no flush of its flush task, nor is a
+    /// restore ending. Neither task holds a [`Tenant`], so only this says
+    /// so. Until a sweep can let a tenant go as it merges, with merging
+    /// tenants last, a bounded wait, and nothing cut (node memory note,
+    /// M7b), a round or a flush keeps its tenant, as when rounds held the
+    /// tenant itself.
+    fn between_rounds(&self) -> bool {
+        Arc::strong_count(&self.work) == 1
     }
 
     /// The generation of the lease this node writes the tenant under.
     pub(crate) fn generation(&self) -> Generation {
-        self.writer.lease().generation
+        self.work.writer.lease().generation
     }
 
     /// Put the tenant back as it stood at `head`, as `restore` asks, and
@@ -1014,13 +1199,14 @@ impl Tenant {
         adopting: Option<Lineage>,
     ) -> Result<Restored> {
         let position = self
+            .work
             .writer
             .restore_recorded(head.as_ref(), restore.clone(), adopting)
             .await
-            .map_err(|error| self.told(error))?;
+            .map_err(|error| self.work.told(error))?;
         Ok(Restored {
             restore,
-            incarnation: self.writer.partition().incarnation(),
+            incarnation: self.work.writer.partition().incarnation(),
             position,
         })
     }
@@ -1050,9 +1236,9 @@ impl Tenant {
             match &*running {
                 Some(same) if same.asking == asking => Err(same.ended.clone()),
                 Some(other) if other.asking.request == asking.request => {
-                    return Err(asking.reused(&self.id))
+                    return Err(asking.reused(&self.work.id))
                 }
-                Some(_) => return Err(NodeError::Restoring(self.id.clone())),
+                Some(_) => return Err(NodeError::Restoring(self.work.id.clone())),
                 None => {
                     let (ends, ended) = watch::channel(());
                     *running = Some(Running { asking, ended });
@@ -1077,7 +1263,7 @@ impl Tenant {
         // the restore closed has cost this node its hold: they then find
         // the tenant opened afresh, not this one again.
         let restoring = tokio::spawn(async move {
-            let recorded = asking.recorded(asked.as_ref(), &ending.tenant.id).await;
+            let recorded = asking.recorded(asked.as_ref(), ending.tenant.id()).await;
             let restored = match recorded {
                 Ok(Some(done)) => Ok(done),
                 Ok(None) => work.await,
@@ -1085,23 +1271,23 @@ impl Tenant {
             };
             (restored, ending)
         });
-        self.hold.stops(restoring.abort_handle());
+        self.work.hold.stops(restoring.abort_handle());
         // Whoever asked may stop waiting, and losing the hold stops the
         // task above wherever it is: so a task of its own, which neither
         // reaches, sees it end, and only then loses the hold if the
         // restore closed the writer, which is gone for good.
-        let tenant = self.clone();
+        let work = self.work.clone();
         let ended = tokio::spawn(async move {
             let ended = restoring.await;
-            if tenant.writer.is_closed() {
-                tenant.hold.lose();
+            if work.writer.is_closed() {
+                work.hold.lose(Lost::Lease);
             }
             ended.map(|(restored, _ending)| restored)
         });
         let failure = match ended.await {
             Ok(Ok(Ok(restored))) => return Ok(Some(restored)),
             Ok(Ok(Err(failure))) => failure,
-            Ok(Err(stopped)) if stopped.is_cancelled() => NodeError::Lost(self.id.clone()),
+            Ok(Err(stopped)) if stopped.is_cancelled() => NodeError::Lost(self.work.id.clone()),
             Ok(Err(stopped)) | Err(stopped) => StorageError::Background(stopped.to_string()).into(),
         };
         self.unfinished(coordinator.as_ref(), asking, failure).await
@@ -1133,9 +1319,9 @@ impl Tenant {
             ),
             _ => false,
         };
-        match asking.recorded(coordinator, &self.id).await {
+        match asking.recorded(coordinator, &self.work.id).await {
             Ok(Some(done)) => Ok(Some(done)),
-            Ok(None) if unmade || !self.writer.is_closed() => Err(failure),
+            Ok(None) if unmade || !self.work.writer.is_closed() => Err(failure),
             Err(reused @ NodeError::Reused { .. }) => Err(reused),
             Ok(None) | Err(_) => Err(NodeError::Storage(match failure {
                 NodeError::Storage(shared @ StorageError::Shared(_)) => shared,
@@ -1143,6 +1329,267 @@ impl Tenant {
                 _ => StorageError::Shared(Arc::new(StorageError::Closed)),
             })),
         }
+    }
+}
+
+impl TenantWork {
+    /// Whether this node still holds the tenant, as far as it can tell
+    /// without asking: its hold has not run out and nothing has failed.
+    fn held(&self) -> bool {
+        !self.hold.is_lost() && Instant::now() < *self.deadline()
+    }
+
+    fn deadline(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.deadline.lock().expect("deadline lock")
+    }
+
+    /// Run `f` against the tenant's data as of its last commit.
+    fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
+        self.writer.partition().read(f)
+    }
+
+    /// Whether the tenant's flush task would flush it now: it holds a
+    /// flush's worth of rows, and no failed flush puts the next off.
+    fn flush_due(&self) -> bool {
+        self.read(State::unflushed) >= self.flush_rows && self.flush_may_be_tried()
+    }
+
+    /// Whether a flush may be tried now, none having failed lately.
+    fn flush_may_be_tried(&self) -> bool {
+        let next = self.backoff.lock().expect("backoff lock").1;
+        next.is_none_or(|next| Instant::now() >= next)
+    }
+
+    /// When the next flush may be tried, if the last one tried failed.
+    fn flush_retried_at(&self) -> Option<Instant> {
+        self.backoff.lock().expect("backoff lock").1
+    }
+
+    /// How long until the flush that failed is to be tried again, if it is
+    /// to be: not with too few rows for its flush task to flush.
+    fn flush_wait(&self) -> Option<Duration> {
+        let at = self.flush_retried_at()?;
+        (self.read(State::unflushed) >= self.flush_rows)
+            .then(|| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Note how the flush tried went: one that failed puts the next off,
+    /// twice as long as the one before, and one that went through ends that.
+    fn flush_tried(&self, went_through: bool) {
+        let mut backoff = self.backoff.lock().expect("backoff lock");
+        if went_through {
+            *backoff = (0, None);
+            return;
+        }
+        self.flushing.failed.fetch_add(1, Ordering::Relaxed);
+        let failed = backoff.0.saturating_add(1);
+        let wait = self.flush_backoff * 2u32.pow((failed - 1).min(6));
+        *backoff = (failed, Some(Instant::now() + wait));
+    }
+
+    /// As [`Tenant::flush`].
+    async fn flush(&self) -> Result<LogPosition> {
+        let flushed = self.writer.flush().await;
+        self.flush_tried(flushed.is_ok());
+        if flushed.is_ok() {
+            self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+        }
+        flushed.map_err(|error| self.failed(error))
+    }
+
+    /// As [`Tenant::flush`], on the tenant's flush task, looking again once
+    /// it has the building lock: `None` if a flush's worth of rows is not
+    /// there by then, and nothing was tried.
+    async fn flush_when_due(&self) -> Result<Option<LogPosition>> {
+        let flushed = self.writer.flush_if_holding(self.flush_rows).await;
+        if matches!(flushed, Ok(None)) {
+            return Ok(None);
+        }
+        self.flush_tried(flushed.is_ok());
+        if flushed.is_ok() {
+            self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+        }
+        flushed.map_err(|error| self.failed(error))
+    }
+
+    /// As [`Tenant::flush`], made before the tenant is let go: its wait for
+    /// the building lock and its hold are timed under their own name, as
+    /// the merge bench holds the wait to a mark of its own (merge note,
+    /// §3).
+    async fn flush_to_let_go(&self) -> Result<LogPosition> {
+        let flushed = self.writer.flush_timed().await;
+        self.flush_tried(flushed.is_ok());
+        let (position, times) = flushed.map_err(|error| self.failed(error))?;
+        self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+        let timings = self.writer.timings();
+        let partition = &self.writer.lease().key;
+        timings.record(Timed::LetGoFlushWait, partition, times.waited);
+        if let Some(held) = times.held {
+            timings.record(Timed::LetGoFlushHeld, partition, held);
+        }
+        Ok(position)
+    }
+
+    /// Merge segments until a merge finds nothing to do. Nothing waits for
+    /// a merge, so none gives way, flushes being on a task of their own and
+    /// what is left of a round going on beside it: giving way is left for
+    /// the bench to show it is not missed (node memory note, D7).
+    ///
+    /// A merge's flush first is a flush as any other for the tenant's
+    /// backoff, and leaves the flush task with one to follow, which it may
+    /// be asleep through: rows replayed at an open ask for no flush. One that
+    /// goes through adds to no flushes to be followed, as this goes on
+    /// merging, and a merge dropped after one says so by a position.
+    async fn merged(&self) -> Result<()> {
+        let tried = |went_through| {
+            self.flush_tried(went_through);
+            if !went_through {
+                let _ = self.flushes.try_send(());
+            }
+        };
+        let flush_first = FlushFirst {
+            may_be_tried: &|| self.flush_may_be_tried(),
+            tried: &tried,
+        };
+        while self
+            .writer
+            .merge_giving_way(&|| false, flush_first)
+            .await
+            .map_err(|error| self.failed(error))?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    /// Delete the files nothing needs any more, as [`Writer::clean`] with
+    /// `grace`, which deletes so many at once, until one finds fewer than
+    /// that. Returns how many files were deleted, or `None` if cleaning up
+    /// was left for a later round, as a flush due goes first and cleaning
+    /// up waits on the store, holding the lock a flush needs; but not for
+    /// longer than [`Settings::clean_at_least_every`], or writes that never
+    /// let up would leave it undone for good.
+    async fn cleaned_unless(
+        &self,
+        grace: Duration,
+        flush_due: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<usize>> {
+        let cleaned_lately = self.cleaned_at().elapsed() < self.clean_at_least_every;
+        if flush_due() && cleaned_lately {
+            return Ok(None);
+        }
+        self.cleaned(grace).await.map(Some)
+    }
+
+    /// As [`Self::cleaned_unless`], whatever is due.
+    async fn cleaned(&self, grace: Duration) -> Result<usize> {
+        let mut deleted = 0;
+        loop {
+            let cleaned = self.writer.clean(grace).await;
+            let more = cleaned.map_err(|error| self.failed(error))?;
+            deleted += more;
+            if more < Writer::CLEANED_AT_ONCE {
+                *self.cleaned_at() = Instant::now();
+                return Ok(deleted);
+            }
+        }
+    }
+
+    /// Make the curves of its segments' rows, if no other tenant is: one
+    /// pass at a time on the node, another tenant's next round taking its
+    /// turn. What is missing is worked out afresh each time, so a pass
+    /// skipped or cut short is made at a later round.
+    async fn rows_passed(&self) {
+        if let Ok(_one) = ROWS_PASSES.try_acquire() {
+            self.settling.rows_passes.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self.writer.rows_pass().await {
+                tracing::warn!(tenant = %self.id, %error, "the curves of segments' rows were not made");
+            }
+        }
+    }
+
+    /// Clean up and pass over the rows as often as
+    /// [`Settings::clean_at_least_every`] says, from the round's start,
+    /// until `merges_ended` says the merges beside this are done. A merge
+    /// may wait for its turn for as long as other tenants' merges take, and
+    /// build for minutes, and neither is to hold these up. Timed from the
+    /// round's start however overdue a clean is, so that a merge about to
+    /// plan has the lock first; with `grace` as the round read it.
+    ///
+    /// Asked only between one clean and the next, so that no merge ending
+    /// cuts a clean part way, nor does anything else but what ends the
+    /// tenant's task with it. Nothing here runs on a hold that may be lost,
+    /// any more than a round is begun on one. A clean holds the building
+    /// lock, and so may hold its own tenant's merge up: at its plan, and at
+    /// its commit, each giving its turn back past
+    /// [`vellev_storage::TURN_IDLE_AT_MOST`].
+    async fn tidied_beside_merges(&self, merges_ended: &tokio::sync::Notify, grace: Duration) {
+        let every = self.clean_at_least_every.max(TIDIED_AT_LEAST_APART);
+        let mut tried = Instant::now();
+        let mut lapsed = false;
+        loop {
+            let wait = match lapsed {
+                true => TIDIED_AT_LEAST_APART,
+                false => every.saturating_sub(tried.elapsed()),
+            };
+            tokio::select! {
+                biased;
+                () = merges_ended.notified() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+            lapsed = !self.held();
+            if lapsed {
+                continue;
+            }
+            tried = Instant::now();
+            match self.cleaned(grace).await {
+                Ok(_) => self.rows_passed().await,
+                Err(error) => {
+                    tracing::warn!(tenant = %self.id, %error, "cleaning up beside a merge failed");
+                }
+            }
+        }
+    }
+
+    /// When the tenant was last cleaned up all through, or opened.
+    fn cleaned_at(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.cleaned_at.lock().expect("cleaned lock")
+    }
+
+    /// Forget the commits the tenant can no longer go back to, then merge
+    /// its segments and delete the files no restore within its window
+    /// needs, kept `grace` longer; then give any segment from before
+    /// curves the curve of its rows (recall note, R9.5). Cleaning up and
+    /// the curves go on beside the merges, should those take long; what
+    /// forgets commits comes first, and waits for the next round. Returns
+    /// how many files were deleted at the round's end.
+    async fn maintained(
+        &self,
+        coordinator: &dyn Coordinator,
+        default_window: Duration,
+        grace: Duration,
+    ) -> Result<usize> {
+        let window = restore_window(coordinator, &self.id, default_window).await?;
+        coordinator.forget_history(&key(&self.id), window).await?;
+        let grace = window.saturating_add(grace);
+        let merges_ended = tokio::sync::Notify::new();
+        let merged = async {
+            let merged = self.merged().await;
+            merges_ended.notify_one();
+            merged
+        };
+        // Joined: each runs to its end, a clean under way as the merges end
+        // included. Losing the hold aborts the task, and with it both.
+        let tidied = self.tidied_beside_merges(&merges_ended, grace);
+        let (merged, ()) = tokio::join!(merged, tidied);
+        merged?;
+        // The round ends here if cleaning up was left for a later round:
+        // the flush due goes first, and the rest is done then.
+        let flush_due = || self.flush_due();
+        let Some(deleted) = self.cleaned_unless(grace, &flush_due).await? else {
+            return Ok(0);
+        };
+        self.rows_passed().await;
+        Ok(deleted)
     }
 
     /// A failure of the writer's, as its caller should see it, noting
@@ -1153,7 +1600,7 @@ impl Tenant {
     /// that says it is closed is gone for good too.
     fn failed(&self, error: StorageError) -> NodeError {
         if self.writer.is_closed() || matches!(error.root(), StorageError::Closed) {
-            self.hold.lose();
+            self.hold.lose(Lost::Lease);
         }
         self.told(error)
     }
@@ -1179,6 +1626,24 @@ const RESTORE_WAITS: usize = 3;
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
 
+/// The least time from the start of one clean beside a tenant's merges to
+/// the start of the next, whatever [`Settings::clean_at_least_every`] says,
+/// and how often a lapsed hold is looked at meanwhile: of none at all, they
+/// would run back to back. One longer than this is followed at once.
+const TIDIED_AT_LEAST_APART: Duration = Duration::from_secs(1);
+
+/// The least time between sweeps that uses of tenants ask for (see
+/// `Inner::sweep_soon`). Over the budget every use asks for one, and with
+/// nothing to let go, coalesced, they would run back to back for as long
+/// as uses come, each taking the node's lock twice. A quarter of
+/// [`RESIDENT_AT_LEAST`]: a tenant used within that is kept whatever a
+/// sweep finds, so sweeping more often lets nothing more go, and four
+/// looks a second still answer an open that takes the node over its
+/// budget long before what it holds grows much further. The node's own
+/// sweeps, a second apart at the least, and [`Node::sweep_now`] are not
+/// held to it.
+pub const SWEEPS_SPACED: Duration = Duration::from_millis(250);
+
 /// A tenant written for or copied, as a sweep finds it.
 struct Held {
     id: TenantId,
@@ -1192,6 +1657,77 @@ struct Held {
 enum Kind {
     Writer(Opening, Arc<Tenant>),
     Copy(reading::Following, Arc<reading::Followed>),
+}
+
+/// What a sweep took out of what the node holds, and what it chose and
+/// could not.
+#[derive(Default)]
+struct Taken {
+    /// The tenants written for, taken out and still to be let go.
+    going: Vec<Arc<Tenant>>,
+    /// The tenants written for that something else held, left as they are,
+    /// with what each holds, in the order they were chosen.
+    kept: Vec<(Arc<Tenant>, usize)>,
+    /// How many chosen, written for or copied, something else held.
+    held_elsewhere: u64,
+    /// About how many bytes what was taken out held.
+    freed: usize,
+    /// How many were taken out for being idle, and for the budget.
+    idle: u64,
+    for_budget: u64,
+}
+
+impl Taken {
+    /// Take `held` out of `open` if it is still the one held and nobody but
+    /// the node and this sweep has it, nor is opening it, nor is in a round
+    /// of its tasks; else keep it. Counted as taken out for the budget, or
+    /// for being idle.
+    fn take(&mut self, open: &mut Open, held: &Held, for_budget: bool) {
+        if !self.taken(open, held) {
+            return;
+        }
+        match for_budget {
+            true => self.for_budget += 1,
+            false => self.idle += 1,
+        }
+    }
+
+    /// As [`Self::take`], saying whether it was taken out.
+    fn taken(&mut self, open: &mut Open, held: &Held) -> bool {
+        match &held.kind {
+            Kind::Writer(opening, tenant) => {
+                let same = open
+                    .tenants
+                    .get(&held.id)
+                    .is_some_and(|now| Arc::ptr_eq(now, opening));
+                let unheld = Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2;
+                if same && unheld && tenant.between_rounds() {
+                    open.tenants.remove(&held.id);
+                    self.going.push(tenant.clone());
+                    self.freed += held.size;
+                    return true;
+                } else if same {
+                    self.kept.push((tenant.clone(), held.size));
+                    self.held_elsewhere += 1;
+                }
+                false
+            }
+            Kind::Copy(following, copy) => {
+                let same = open
+                    .followers
+                    .get(&held.id)
+                    .is_some_and(|now| Arc::ptr_eq(now, following));
+                if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
+                    open.followers.remove(&held.id);
+                    self.freed += held.size;
+                    return true;
+                } else if same {
+                    self.held_elsewhere += 1;
+                }
+                false
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1234,6 +1770,46 @@ struct Inner {
     flushing: Arc<FlushCounts>,
     /// The warm list, and the warming that reads it.
     warm: warm::Warm,
+    /// The merge builds of every tenant this node writes for, taken in
+    /// turns, at most [`MERGE_BUILDS`] at once.
+    merge_builds: Arc<MergeBuilds>,
+    /// What the last sweep found the node holding: see [`Node::census`].
+    census: Mutex<Census>,
+    /// Held across a sweep, so that no two run at once: each would hold
+    /// what the other must find held by nothing else, and keep it.
+    sweeping: Arc<tokio::sync::Mutex<()>>,
+    /// A sweep was asked for while one ran: the one running sweeps once
+    /// more as it ends (see [`Inner::sweep_soon`]).
+    sweep_again: AtomicBool,
+    /// How many sweeps have begun.
+    sweeps_begun: AtomicU64,
+    /// When the last sweep began: those uses ask for are spaced from it.
+    /// Tokio's time, so that spacing follows `tokio::time::pause()`.
+    last_swept: Mutex<Option<Instant>>,
+    /// One waits to sweep, spaced, not yet holding [`Inner::sweeping`].
+    sweep_queued: AtomicBool,
+    /// The node's own sweep was asked for, not held to [`SWEEPS_SPACED`].
+    sweep_on_time: AtomicBool,
+    /// Where a test holds each sweep as it is about to take tenants out.
+    sweep_hold: Mutex<Option<Arc<SweepHold>>>,
+    /// When the node was made: how old its census is until its first sweep.
+    started: Instant,
+    /// How many tenants sweeps chose to let go but found something else
+    /// holding.
+    held_elsewhere: AtomicU64,
+    /// How many merges sweeps have stopped so that a tenant over the
+    /// budget could be let go.
+    stopped_for_budget: AtomicU64,
+    /// How many merges losing a hold on a tenant has stopped.
+    merges_stopped: Arc<StopCounts>,
+    /// How many tenants, written for or copied, sweeps have let go: those
+    /// idle, and those let go for the memory budget.
+    let_go_idle: AtomicU64,
+    let_go_for_budget: AtomicU64,
+    /// How many tenants were given up as their maintenance panicked.
+    given_up: Arc<AtomicU64>,
+    /// Where every writer this node opens times its background work.
+    timings: Arc<Timings>,
 }
 
 /// Flushes that failed, and writes refused while they did.
@@ -1243,6 +1819,10 @@ struct FlushCounts {
     backlogged: AtomicU64,
 }
 
+/// One pass making the curves of segments' rows at a time on this node:
+/// each is a pass over a segment's vectors, and after an upgrade every
+/// clustered segment of every tenant needs one.
+static ROWS_PASSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// The segments the tenants this node writes hold: those with an index file
 /// (a clustered vector index for at least one of their collections) and the
 /// rest, each with their rows as written: rows since replaced or deleted
@@ -1253,20 +1833,154 @@ pub struct Segments {
     pub clustered_rows: u64,
     pub plain: usize,
     pub plain_rows: u64,
+    /// Segments as flushes and restores wrote them, which no merge has
+    /// taken in yet, and their rows as written: the rows awaiting a merge.
+    pub unmerged: usize,
+    pub unmerged_rows: u64,
+    /// Where the clustered indexes' probes come from.
+    pub probes: Probes,
 }
 
+pub use vellev_storage::Probes;
+
 impl Segments {
-    fn add(&mut self, meta: &vellev_storage::format::SegmentMeta) {
-        match meta.index.is_some() {
-            true => {
-                self.clustered += 1;
-                self.clustered_rows += meta.rows;
+    fn add(&mut self, figures: &vellev_storage::Figures) {
+        self.clustered += figures.clustered;
+        self.clustered_rows += figures.clustered_rows;
+        self.plain += figures.plain;
+        self.plain_rows += figures.plain_rows;
+        self.unmerged += figures.unmerged;
+        self.unmerged_rows += figures.unmerged_rows;
+        self.probes += figures.probes;
+    }
+}
+
+/// The merges this node builds, as memory goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Merges {
+    /// About how many bytes merges stopped and not yet ended hold, and
+    /// what stores keep of those whose turns were let go: counted against
+    /// the memory budget.
+    pub draining: usize,
+    /// About how many bytes stores keep of stopped or failed merges whose
+    /// turns were let go for it, as the store held them too long.
+    pub abandoned: usize,
+    /// How many merge turns were let go so, since the node started.
+    pub held_let_go: u64,
+    /// How many merges sweeps have stopped since the node started, so that
+    /// a tenant over the memory budget could be let go: each once, and none
+    /// a stop came too late for, which goes on to commit. None is among
+    /// [`Self::stopped`].
+    pub stopped_for_budget: u64,
+    /// How many merges losing a hold on a tenant has stopped or cut off
+    /// since the node started, each once, by what first stopped it.
+    pub stopped: MergesStopped,
+    /// About how many bytes the largest merge build since the node started
+    /// was reckoned to hold at its peak.
+    pub largest: usize,
+    /// About how many bytes merges hold now that gave their turns back to
+    /// wait to commit: going on as any merge does, and so in no total a
+    /// sweep answers.
+    pub waiting_to_commit: usize,
+}
+
+/// How many merges losing a hold on a tenant has stopped, or cut off with
+/// their task past where a stop ends them, since the node started, by why
+/// the hold was lost: a sweep let the tenant go, its lease was lost or its
+/// writer can write no more, it was dropped, or the node shut down. A merge
+/// cut off in its commit may have landed all the same, and is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergesStopped {
+    pub let_go: u64,
+    pub lease: u64,
+    pub drop: u64,
+    pub shutdown: u64,
+}
+
+/// How many tenants sweeps have let go: those idle for
+/// [`Settings::tenant_idle`], and those let go for the memory budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LetGo {
+    pub idle: u64,
+    pub for_budget: u64,
+}
+
+/// What this node holds open, and what it reckons that holds in memory:
+/// the figures its memory budget is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Holding {
+    /// Tenants it holds open as their writer.
+    pub writers: usize,
+    /// Tenants it holds open as a copy to read from.
+    pub copies: usize,
+    /// About how many bytes they take in memory together, as
+    /// [`Node::resident`] reckons them.
+    pub resident: usize,
+    /// About how many bytes the one that takes the most takes.
+    pub largest: usize,
+}
+
+/// Where a test holds each sweep as it is about to take tenants out (see
+/// [`Node::holding_sweeps`]).
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct SweepHold {
+    reached: AtomicU64,
+    released: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+impl SweepHold {
+    /// How many sweeps have reached the hold.
+    pub fn reached(&self) -> u64 {
+        self.reached.load(Ordering::SeqCst)
+    }
+
+    /// Let every sweep held, and every one to come, go on.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+
+    async fn reached_here(&self) {
+        self.reached.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let released = self.release.notified();
+            if self.released.load(Ordering::SeqCst) {
+                return;
             }
-            false => {
-                self.plain += 1;
-                self.plain_rows += meta.rows;
+            released.await;
+        }
+    }
+}
+
+/// What a sweep found the node holding as it began, which is what it
+/// held to the memory budget: published by every sweep, so that reading
+/// it holds no tenant. A sweep lets a tenant go only if nothing else holds
+/// it, so whatever held the tenants to read them would keep them. What is
+/// not the sweep's own decision (what waits for a flush, the segments) is
+/// read as it is instead, from each tenant's published figures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Census {
+    /// The tenants held, and what they are reckoned to take.
+    pub holding: Holding,
+    /// When the sweep that took it began; none before the first.
+    pub swept_at: Option<Instant>,
+}
+
+impl Census {
+    /// Of the tenants and copies in `held`, read one at a time.
+    fn of(held: &[Held]) -> Self {
+        let mut census = Self::default();
+        for held in held {
+            census.holding.resident += held.size;
+            census.holding.largest = census.holding.largest.max(held.size);
+            match &held.kind {
+                Kind::Writer(..) => census.holding.writers += 1,
+                Kind::Copy(..) => census.holding.copies += 1,
             }
         }
+        census
     }
 }
 
@@ -1319,6 +2033,31 @@ impl Node {
             writes_format: Arc::new(AtomicU16::new(0)),
             flushing: Arc::default(),
             warm: warm::Warm::default(),
+            merge_builds: match settings.merge_pool {
+                MergePool::Global => MergeBuilds::new(MERGE_BUILDS),
+                MergePool::Own { threads, nice } => MergeBuilds::building_on(
+                    vellev_storage::merge_slots(MERGE_BUILDS, threads, nice)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect(),
+                ),
+            },
+            census: Mutex::default(),
+            sweeping: Arc::new(tokio::sync::Mutex::new(())),
+            sweep_again: AtomicBool::new(false),
+            sweeps_begun: AtomicU64::new(0),
+            last_swept: Mutex::new(None),
+            sweep_queued: AtomicBool::new(false),
+            sweep_on_time: AtomicBool::new(false),
+            sweep_hold: Mutex::default(),
+            started: Instant::now(),
+            held_elsewhere: AtomicU64::new(0),
+            stopped_for_budget: AtomicU64::new(0),
+            merges_stopped: Arc::default(),
+            let_go_idle: AtomicU64::new(0),
+            let_go_for_budget: AtomicU64::new(0),
+            given_up: Arc::default(),
+            timings: Arc::default(),
             limits: Arc::new(Limits::new(
                 settings.queries_per_second,
                 settings.writes_per_second,
@@ -1400,15 +2139,130 @@ impl Node {
     /// the next sweep: called as each tenant or copy is opened.
     pub(crate) fn bound(&self) {
         if self.0.settings.memory.is_some() {
-            let inner = self.0.clone();
-            tokio::spawn(async move { inner.sweep().await });
+            self.0.sweep_soon();
         }
     }
 
     /// About how many bytes the tenants and copies this node holds take
-    /// in memory together.
+    /// in memory together, as of now. Read under the node's own lock and
+    /// holding no tenant, as warming asks it before each copy it opens: a
+    /// sweep lets go only what nothing else holds, so asking must never
+    /// hold one. Each is a read of what its state counts as it changes.
     pub fn resident(&self) -> usize {
-        self.0.held_now().iter().map(|held| held.size).sum()
+        self.0.resident()
+    }
+
+    /// How long ago the last sweep took its census, or since the node was
+    /// made if none has: a sweep that has stopped, and with it the memory
+    /// budget, shows as this grows.
+    pub fn census_age(&self) -> Duration {
+        let swept = self.census().swept_at.unwrap_or(self.0.started);
+        swept.elapsed()
+    }
+
+    /// How many sweeps have begun since the node started.
+    pub fn sweeps(&self) -> u64 {
+        self.0.sweeps_begun.load(Ordering::Relaxed)
+    }
+
+    /// Hold each sweep from now on, as it is about to take tenants out,
+    /// until what is given back is released: for tests that a sweep does
+    /// not begin while another runs.
+    #[doc(hidden)]
+    pub fn holding_sweeps(&self) -> Arc<SweepHold> {
+        let hold = Arc::new(SweepHold::default());
+        *self.0.sweep_hold.lock().expect("sweep hold lock") = Some(hold.clone());
+        hold
+    }
+
+    /// How many tenants were given up as their maintenance panicked.
+    pub fn tenants_given_up(&self) -> u64 {
+        self.0.given_up.load(Ordering::Relaxed)
+    }
+
+    /// How many tenants sweeps chose to let go, for being idle or for the
+    /// memory budget, but found something else holding, as a request or a
+    /// merge does: let go at a later round.
+    pub fn tenants_kept_by_sweeps(&self) -> u64 {
+        self.0.held_elsewhere.load(Ordering::Relaxed)
+    }
+
+    /// What the last sweep found this node holding, as it began: what it
+    /// held to the memory budget. Read without holding any tenant, so that
+    /// reading it, as /metrics does, never keeps a tenant from being let
+    /// go. All zero until the first sweep.
+    pub fn census(&self) -> Census {
+        *self.0.census.lock().expect("census lock")
+    }
+
+    /// Sweep now, as the node does every so often: for a test that reads
+    /// what a sweep found.
+    #[doc(hidden)]
+    pub async fn sweep_now(&self) {
+        let sweeping = self.0.sweeping.clone().lock_owned().await;
+        self.0.sweep().await;
+        drop(sweeping);
+        // Any asked for meanwhile, as one that found it running would.
+        if self.0.sweep_again.load(Ordering::SeqCst) {
+            self.0.sweep_soon();
+        }
+    }
+
+    /// How many local embedding models are loaded, or loading.
+    pub fn local_models_loaded(&self) -> usize {
+        self.0.embedders.local_models_loaded()
+    }
+
+    /// The memory budget this node holds its tenants to, if it has one:
+    /// see [`Settings::memory`].
+    pub fn memory_budget(&self) -> Option<usize> {
+        self.0.settings.memory
+    }
+
+    /// The merges this node builds, as memory goes.
+    pub fn merges(&self) -> Merges {
+        let builds = &self.0.merge_builds;
+        Merges {
+            draining: builds.draining(),
+            abandoned: builds.abandoned(),
+            held_let_go: builds.held_let_go(),
+            stopped_for_budget: self.0.stopped_for_budget.load(Ordering::Relaxed),
+            stopped: self.0.merges_stopped.counted(),
+            largest: builds.largest_reckoned(),
+            waiting_to_commit: builds.waiting_to_commit(),
+        }
+    }
+
+    /// Where the writers this node opens time their background work: the
+    /// building lock by holder, merges by phase and by how they ended,
+    /// flushes from when they fell due, spells at the backlog, and the
+    /// flush made before a tenant is let go.
+    pub fn timings(&self) -> &Arc<Timings> {
+        &self.0.timings
+    }
+
+    /// How many tenants, written for or copied, sweeps have let go since
+    /// the node started.
+    pub fn let_go(&self) -> LetGo {
+        LetGo {
+            idle: self.0.let_go_idle.load(Ordering::Relaxed),
+            for_budget: self.0.let_go_for_budget.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Each tenant this node writes for, and what it comes to as it was
+    /// last changed: read as [`Self::segments`] reads them, holding none.
+    pub fn tenant_figures(&self) -> Vec<(TenantId, vellev_storage::Figures)> {
+        let mut figures = Vec::new();
+        self.0
+            .each_writer(|tenant| figures.push((tenant.id().clone(), tenant.figures())));
+        figures
+    }
+
+    /// The merge builds of the tenants this node writes for. For tests.
+    #[doc(hidden)]
+    pub fn merge_builds(&self) -> &Arc<MergeBuilds> {
+        &self.0.merge_builds
     }
 
     /// Whether this node serves `tenant`: see [`Settings::served`].
@@ -1427,7 +2281,9 @@ impl Node {
                     return;
                 }
                 inner.limits.forget_idle();
-                inner.sweep().await;
+                // Not held to the spacing of those uses ask for.
+                inner.sweep_on_time.store(true, Ordering::SeqCst);
+                inner.sweep_soon();
             }
         });
     }
@@ -1469,15 +2325,15 @@ impl Node {
     }
 
     /// What the tenants this node writes hold unflushed, and how many of
-    /// their flushes failed.
+    /// their flushes failed: as they are now, from each tenant's published
+    /// figures, holding none of them (see `Inner::each_writer`).
     pub fn flushing(&self) -> Flushing {
         let (mut rows, mut bytes) = (0, 0);
-        for held in self.0.held_now() {
-            if let Kind::Writer(_, tenant) = &held.kind {
-                rows += tenant.read(State::unflushed);
-                bytes += tenant.read(State::unflushed_bytes);
-            }
-        }
+        self.0.each_writer(|tenant| {
+            let figures = tenant.figures();
+            rows += figures.unflushed;
+            bytes += figures.unflushed_bytes;
+        });
         Flushing {
             failed: self.0.flushing.failed.load(Ordering::Relaxed),
             backlogged: self.0.flushing.backlogged.load(Ordering::Relaxed),
@@ -1487,25 +2343,39 @@ impl Node {
     }
 
     /// How many tenants this node writes for have a flush or merge due or
-    /// under way. A node with none has nothing left to do in the
-    /// background but clean up files past their grace.
+    /// under way, as they are now. A node with none has nothing left to do
+    /// in the background but clean up files past their grace.
     pub fn unsettled(&self) -> usize {
+        let mut unsettled = 0;
         self.0
-            .held_now()
-            .iter()
-            .filter(|held| matches!(&held.kind, Kind::Writer(_, tenant) if !tenant.settled()))
-            .count()
+            .each_writer(|tenant| unsettled += usize::from(!tenant.settled()));
+        unsettled
+    }
+
+    /// About how many bytes the tenants this node writes, and any it has
+    /// let go since, have taken out of their state and yet to free, as a
+    /// merge's commit does what it replaced. A figure of its own, for the eye: it goes by itself, so
+    /// neither a sweep nor warming acts on it, and [`Self::resident`] leaves
+    /// it out.
+    pub fn freeing(&self) -> usize {
+        self.0.timings.freeing()
+    }
+
+    /// The waits of the tenants this node writes for that no checkpoint
+    /// has ended. For a bench, as no event times them.
+    #[doc(hidden)]
+    pub fn waits_open(&self) -> Vec<vellev_storage::timings::OpenWaits> {
+        let mut open = Vec::new();
+        self.0
+            .each_writer(|tenant| open.push(tenant.work.writer.waits_open()));
+        open
     }
 
     /// The segments the tenants this node writes hold, by whether they
-    /// have a clustered index.
+    /// have a clustered index, as they are now.
     pub fn segments(&self) -> Segments {
         let mut segments = Segments::default();
-        for held in self.0.held_now() {
-            if let Kind::Writer(_, tenant) = &held.kind {
-                tenant.read(|state| state.segments().for_each(|meta| segments.add(meta)));
-            }
-        }
+        self.0.each_writer(|tenant| segments.add(&tenant.figures()));
         segments
     }
 
@@ -1539,7 +2409,7 @@ impl Node {
         self.0.opened().followers.remove(tenant);
         let opening = self.0.opened().tenants.remove(tenant);
         if let Some(opened) = opening.as_ref().and_then(|opening| opening.get()) {
-            opened.hold.lose();
+            opened.work.hold.lose(Lost::Dropped);
         }
         // What is left of its history is forgotten by its purge, under the
         // claim that purges it, a batch at a time.
@@ -1671,7 +2541,7 @@ impl Node {
                 .filter(|tenant| !tenant.held())
                 .cloned();
             if let Some(lost) = lost {
-                lost.hold.lose();
+                lost.work.hold.lose(Lost::Lease);
                 open.tenants.remove(tenant);
             }
             open.tenants.entry(tenant.clone()).or_default().clone()
@@ -1721,8 +2591,8 @@ impl Node {
         for opening in openings {
             let unopened = || async { Err(NodeError::Stopped) };
             if let Ok(tenant) = opening.get_or_try_init(unopened).await {
-                tenant.hold.lose();
-                self.0.release(tenant.writer.lease()).await;
+                tenant.work.hold.lose(Lost::Shutdown);
+                self.0.release(tenant.work.writer.lease()).await;
             }
         }
         if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
@@ -1777,48 +2647,177 @@ impl Inner {
     /// release its lease. None used within [`RESIDENT_AT_LEAST`] is let go,
     /// so that tenants in use are not opened over and over, and none a
     /// request holds or is opening.
+    ///
+    /// Over the budget, a tenant chosen that something else holds, as a
+    /// request or its maintenance does while it merges, has its merge
+    /// stopped, and is let go at a later round, once its build has ended
+    /// and nothing else holds it. What a stopped merge was reckoned to hold
+    /// counts against the budget until its work has ended (merge note,
+    /// §7.7).
     async fn sweep(&self) {
+        self.sweeps_begun.fetch_add(1, Ordering::Relaxed);
+        *self.last_swept.lock().expect("last swept lock") = Some(Instant::now());
         let held = self.held_now();
+        *self.census.lock().expect("census lock") = Census {
+            swept_at: Some(Instant::now()),
+            ..Census::of(&held)
+        };
         let (idle, recent) = (self.settings.tenant_idle, RESIDENT_AT_LEAST);
-        let mut total: usize = held.iter().map(|held| held.size).sum();
-        let mut chosen: Vec<&Held> = held
+        let draining = self.merge_builds.draining();
+        let total = held.iter().map(|held| held.size).sum::<usize>() + draining;
+        let mut idle: Vec<&Held> = held
             .iter()
             .filter(|held| matches!(held.kind, Kind::Writer(..)) && held.unused >= idle)
             .collect();
-        total -= chosen.iter().map(|held| held.size).sum::<usize>();
-        if let Some(budget) = self.settings.memory {
-            let mut older: Vec<&Held> = held
+        // The least recently used first, as the merges of those kept are
+        // stopped in this order.
+        idle.sort_by_key(|held| std::cmp::Reverse(held.unused));
+        let mut older: Vec<&Held> = match self.settings.memory {
+            Some(_) => held
                 .iter()
                 .filter(|held| {
-                    held.unused >= recent && !chosen.iter().any(|c| std::ptr::eq(*c, *held))
+                    held.unused >= recent && !idle.iter().any(|c| std::ptr::eq(*c, *held))
                 })
-                .collect();
-            // Copies warming opened that nobody has read go first.
-            older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
-            for held in older {
-                if total <= budget {
-                    break;
+                .collect(),
+            None => Vec::new(),
+        };
+        // Copies warming opened that nobody has read go first.
+        older.sort_by_key(|held| (!held.warmed, std::cmp::Reverse(held.unused)));
+        let hold = self.sweep_hold.lock().expect("sweep hold lock").clone();
+        if let Some(hold) = hold {
+            hold.reached_here().await;
+        }
+        let taken = self.taken_out(&idle, &older, total);
+        self.held_elsewhere
+            .fetch_add(taken.held_elsewhere, Ordering::Relaxed);
+        self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
+        self.let_go_for_budget
+            .fetch_add(taken.for_budget, Ordering::Relaxed);
+        if let Some(budget) = self.settings.memory {
+            // Only what was taken out comes off: what something else held
+            // is held still.
+            let left = total - taken.freed;
+            if left > budget {
+                // Still over with all that could go taken out: the merges of
+                // tenants chosen that something else holds are stopped, the
+                // least recently used first, as many as cover what is over,
+                // so that each can be let go at a later round. None is
+                // stopped while letting others go is enough.
+                let mut over = left - budget;
+                for (tenant, size) in &taken.kept {
+                    if over == 0 {
+                        break;
+                    }
+                    tracing::debug!(tenant = %tenant.id(), "over the memory budget: a merge is stopped so that the tenant can be let go");
+                    if tenant.work.writer.stop_merges_counted() {
+                        self.stopped_for_budget.fetch_add(1, Ordering::Relaxed);
+                    }
+                    over = over.saturating_sub(*size);
                 }
-                total -= held.size;
-                chosen.push(held);
-            }
-            if total > budget {
                 tracing::warn!(
                     budget,
-                    held = total,
-                    "over the memory budget with nothing unused to let go"
+                    held = left,
+                    draining,
+                    "over the memory budget with nothing more that can be let go now"
                 );
             }
         }
-        for tenant in self.taken_out(&chosen) {
+        for tenant in taken.going {
             if tenant.read(State::unflushed) > 0 {
-                if let Err(error) = tenant.flush().await {
-                    tracing::warn!(tenant = %tenant.id, %error, "flush before letting go failed");
+                if let Err(error) = tenant.work.flush_to_let_go().await {
+                    tracing::warn!(tenant = %tenant.id(), %error, "flush before letting go failed");
                 }
             }
-            tenant.hold.lose();
-            self.release(tenant.writer.lease()).await;
-            tracing::info!(tenant = %tenant.id, "let go of a tenant");
+            tenant.work.hold.lose(Lost::LetGo);
+            self.release(tenant.work.writer.lease()).await;
+            tracing::info!(tenant = %tenant.id(), "let go of a tenant");
+        }
+    }
+
+    /// Sweep soon, one at a time, so that each finds held only what
+    /// something else holds and publishes its census in turn; and those
+    /// asked for while one runs coalesced into one more, as it ends. Every
+    /// use of a tenant over the budget asks for one, and a sweep can wait
+    /// long on a flush or on releasing a lease: queued, they would be one
+    /// for each request, each holding the node. At most one runs and one
+    /// waits to, spaced from the last (see [`Self::spaced`]) before it takes
+    /// the lock, so that a sweep the lock is wanted for meanwhile, as
+    /// [`Node::sweep_now`]'s, never waits on the spacing.
+    ///
+    /// The ask is marked before the lock is tried, and the sweep running
+    /// looks for it again once it has let the lock go, so that none is
+    /// lost between its last look and its letting go.
+    fn sweep_soon(self: &Arc<Self>) {
+        self.sweep_again.store(true, Ordering::SeqCst);
+        // A sweep running looks for the ask once it has let the lock go.
+        if self.sweeping.try_lock().is_err() {
+            return;
+        }
+        // One waiting to sweep already, which will find the ask.
+        if self.sweep_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let inner = self.clone();
+        tokio::spawn(async move {
+            inner.spaced().await;
+            inner.sweep_queued.store(false, Ordering::SeqCst);
+            // Taken by a sweep meanwhile, which looks for the ask as it
+            // lets the lock go.
+            if let Ok(sweeping) = inner.sweeping.clone().try_lock_owned() {
+                inner.sweeping_while_asked(sweeping).await;
+            }
+        });
+    }
+
+    /// Sweep if a sweep is asked for, holding `sweeping`, and then let it
+    /// go; and ask once more, spaced, if one was asked for as it ran or as
+    /// it was let go.
+    async fn sweeping_while_asked(self: Arc<Self>, sweeping: tokio::sync::OwnedMutexGuard<()>) {
+        if self.sweep_again.swap(false, Ordering::SeqCst) {
+            self.sweep().await;
+        }
+        drop(sweeping);
+        if self.sweep_again.load(Ordering::SeqCst) {
+            self.sweep_soon();
+        }
+    }
+
+    /// Wait until [`SWEEPS_SPACED`] has passed since the last sweep began,
+    /// unless the node's own sweep is asked for, and give the worker up
+    /// either way, so that sweeps asked for without let-up never hold it.
+    async fn spaced(&self) {
+        let on_time = self.sweep_on_time.swap(false, Ordering::SeqCst);
+        let last = *self.last_swept.lock().expect("last swept lock");
+        if let Some(last) = last.filter(|_| !on_time) {
+            tokio::time::sleep_until(last + SWEEPS_SPACED).await;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    /// What the tenants and copies held take, read under the node's lock
+    /// from what each published as it last changed, holding none of them
+    /// and waiting on no lock of theirs: see [`Node::resident`].
+    fn resident(&self) -> usize {
+        let open = self.opened();
+        let writers: usize = (open.tenants.values())
+            .filter_map(|opening| opening.get())
+            .map(|tenant| tenant.figures().resident)
+            .sum();
+        let copies: usize = (open.followers.values())
+            .filter_map(|following| following.get())
+            .map(|copy| copy.resident())
+            .sum();
+        writers + copies
+    }
+
+    /// Call `f` with each tenant written for, under the node's lock and
+    /// holding none of them: a sweep lets a tenant go only if nothing but
+    /// the node holds it, so reading one must never hold it. `f` reads
+    /// what each published as it last changed, never waiting on its lock.
+    fn each_writer(&self, mut f: impl FnMut(&Tenant)) {
+        let open = self.opened();
+        for tenant in open.tenants.values().filter_map(|opening| opening.get()) {
+            f(tenant);
         }
     }
 
@@ -1839,7 +2838,7 @@ impl Inner {
         held.into_iter()
             .map(|(id, kind)| {
                 let (unused, size, warmed) = match &kind {
-                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.read(State::resident), false),
+                    Kind::Writer(_, tenant) => (tenant.idle(), tenant.figures().resident, false),
                     Kind::Copy(_, copy) => (copy.idle(), copy.resident(), copy.warmed().is_some()),
                 };
                 Held {
@@ -1853,36 +2852,26 @@ impl Inner {
             .collect()
     }
 
-    /// Take `chosen` out of what the node holds, each only if it is still
-    /// the one held and nobody but the node and this sweep has it, nor is
-    /// opening it. Returns the tenants written for, still to be let go.
-    fn taken_out(&self, chosen: &[&Held]) -> Vec<Arc<Tenant>> {
+    /// Take out of what the node holds each of `idle`, and then, while what
+    /// is left of `total` is over the budget, each of `older` in turn: each
+    /// only if [`Taken::take`] finds it free to go. Those something else
+    /// holds are kept, and the next is tried, so that what can go goes
+    /// first.
+    fn taken_out(&self, idle: &[&Held], older: &[&Held], total: usize) -> Taken {
         let mut open = self.opened();
-        let mut going = Vec::new();
-        for held in chosen {
-            match &held.kind {
-                Kind::Writer(opening, tenant) => {
-                    let same = open
-                        .tenants
-                        .get(&held.id)
-                        .is_some_and(|now| Arc::ptr_eq(now, opening));
-                    if same && Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2 {
-                        open.tenants.remove(&held.id);
-                        going.push(tenant.clone());
-                    }
+        let mut taken = Taken::default();
+        for held in idle {
+            taken.take(&mut open, held, false);
+        }
+        if let Some(budget) = self.settings.memory {
+            for held in older {
+                if total - taken.freed <= budget {
+                    break;
                 }
-                Kind::Copy(following, copy) => {
-                    let same = open
-                        .followers
-                        .get(&held.id)
-                        .is_some_and(|now| Arc::ptr_eq(now, following));
-                    if same && Arc::strong_count(following) == 2 && Arc::strong_count(copy) == 2 {
-                        open.followers.remove(&held.id);
-                    }
-                }
+                taken.take(&mut open, held, true);
             }
         }
-        going
+        taken
     }
 
     /// Refuse `tenant` if this node does not serve it, before anything is
@@ -1930,15 +2919,12 @@ impl Inner {
             }
             Err(error) => return Err(error.into()),
         };
-        let hold = Arc::new(Hold::default());
+        let hold = Arc::new(Hold {
+            stops: self.merges_stopped.clone(),
+            ..Hold::default()
+        });
         let deadline = Arc::new(Mutex::new(lease.deadline()));
-        let opened_writer = Arc::new(OnceLock::new());
-        self.renewing(
-            lease.clone(),
-            hold.clone(),
-            &deadline,
-            opened_writer.clone(),
-        );
+        self.renewing(lease.clone(), hold.clone(), &deadline);
         let opened = Writer::open(
             self.blobs.clone(),
             self.coordinator.clone(),
@@ -1955,6 +2941,9 @@ impl Inner {
                 Arc::new(
                     writer
                         .writing_format(self.writes_format.clone())
+                        .merging_among(self.merge_builds.clone())
+                        .measured_by(self.timings.clone())
+                        .flushing_due_at(*flush_rows, self.settings.backlog())
                         .embedding_with(documents)
                         .transferring(self.settings.transfers)
                         .timed_by(self.settings.clock.clone()),
@@ -1973,99 +2962,182 @@ impl Inner {
                 return Err(error.into());
             }
         };
-        opened_writer
-            .set(Arc::downgrade(&writer))
-            .expect("a tenant's writer is opened once");
         let (flushes, wanted) = mpsc::channel(1);
         let commits = GroupCommitter::spawn(writer.clone(), *group, *queue);
-        hold.commits
-            .set(commits.clone())
-            .expect("a tenant's writes are queued once");
-        let opened = Arc::new(Tenant {
+        hold.opened(&writer, &commits);
+        let work = Arc::new(TenantWork {
             id: tenant.clone(),
-            commits,
             writer,
-            embedders: self.embedders.clone(),
+            flushes,
             flush_rows: *flush_rows,
-            backlog_rows: self.settings.backlog(),
             flush_backoff: *flush_backoff,
+            clean_at_least_every: self.settings.clean_at_least_every,
+            cleaned_at: Mutex::new(Instant::now()),
             backoff: Mutex::new((0, None)),
             flushing: self.flushing.clone(),
-            flushes,
             settling: Settling::default(),
             hold,
             deadline,
+        });
+        let flushed = Arc::new(tokio::sync::Notify::new());
+        self.flushing(&work, wanted, flushed.clone());
+        self.maintaining(&work, flushed);
+        Ok(Arc::new(Tenant {
+            work,
+            commits,
+            embedders: self.embedders.clone(),
+            backlog_rows: self.settings.backlog(),
             used: Mutex::new(Instant::now()),
             limits: self.limits.clone(),
             running: Mutex::default(),
-        });
-        self.maintaining(&opened, wanted);
-        Ok(opened)
+        }))
     }
 
-    /// Flush the tenant when asked to and it is still due, and merge and
-    /// clean up its files after each flush and now and then regardless,
-    /// for as long as the tenant is open and held. The task holds no
-    /// reference of its own between rounds, so dropping the tenant ends
-    /// it, and losing the hold stops it wherever it is.
-    fn maintaining(&self, tenant: &Arc<Tenant>, mut wanted: mpsc::Receiver<()>) {
+    /// How often a tenant's tasks look at it unasked.
+    fn rounds_every(&self) -> Duration {
+        (self.settings.restore_window / 24)
+            .clamp(Duration::from_secs(60), Duration::from_secs(60 * 60))
+    }
+
+    /// Flush the tenant when asked to and it is still due, for as long as
+    /// the tenant is open and held, on a task of its own: so that no flush
+    /// is held behind its tenant's merges, for as long as they build, nor
+    /// by their turns (node memory note, M5). Each flush that goes through
+    /// is told to the tenant's maintenance, by `flushed`.
+    ///
+    /// The task holds no [`Tenant`], and its work only for a flush, so
+    /// dropping the tenant ends it, and losing the hold stops it wherever
+    /// it is. A hold that has run out is not lost: renewing goes on trying,
+    /// and may yet bring it back, so the task waits, looking as often as a
+    /// hold is renewed, and does then what it was asked to meanwhile. However
+    /// the task ends, as by a panic in a flush, the hold ends with it, so
+    /// that no tenant is left open and unflushed.
+    fn flushing(
+        &self,
+        work: &Arc<TenantWork>,
+        mut wanted: mpsc::Receiver<()>,
+        flushed: Arc<tokio::sync::Notify>,
+    ) {
+        let every = self.rounds_every();
+        let lapsed_every = self.settings.lease / 3;
+        let hold = work.hold.clone();
+        let ends = GivesUp {
+            hold: hold.clone(),
+            tenant: work.id.clone(),
+            task: "flush",
+            given_up: self.given_up.clone(),
+        };
+        let work = Arc::downgrade(work);
+        let flushing = tokio::spawn(async move {
+            let _ends = ends;
+            // A flush a write asked for, not yet looked at.
+            let mut asked = false;
+            loop {
+                // While flushes fail, the next is tried as soon as its
+                // backoff lets it, whether or not a write asks for it. Only
+                // while one is due: with too few rows to flush, nothing here
+                // would try one, and the wait would be over for good.
+                let wait = match work.upgrade() {
+                    Some(work) if !work.held() => lapsed_every,
+                    Some(work) => work.flush_wait().map_or(every, |wait| every.min(wait)),
+                    None => every,
+                };
+                asked |= match tokio::time::timeout(wait, wanted.recv()).await {
+                    Ok(Some(())) => true,
+                    Ok(None) => return,
+                    Err(_) => false,
+                };
+                let Some(work) = work.upgrade() else {
+                    return;
+                };
+                if work.hold.is_lost() {
+                    return;
+                }
+                if !work.held() {
+                    continue;
+                }
+                // One that failed is tried again on its own, if no write
+                // asks, but never sooner than its backoff lets it.
+                let due = std::mem::take(&mut asked) || work.flush_retried_at().is_some();
+                if due
+                    && work.read(State::unflushed) >= work.flush_rows
+                    && work.flush_may_be_tried()
+                {
+                    match work.flush_when_due().await {
+                        Ok(Some(_)) => flushed.notify_one(),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(tenant = %work.id, %error, "flush failed; rows wait in memory");
+                        }
+                    }
+                }
+            }
+        });
+        hold.stops(flushing.abort_handle());
+    }
+
+    /// Merge and clean up the tenant's files after each flush that goes
+    /// through, told by `flushed`, and now and then regardless, for as long
+    /// as the tenant is open and held. A flush that lands during a round
+    /// stays told, and has a round of its own. The task holds no [`Tenant`],
+    /// and its work only for a round, so dropping the tenant ends it, and
+    /// losing the hold stops it wherever it is. A hold that has run out is
+    /// not lost: the task waits, looking as often as a hold is renewed, and
+    /// runs a round once it is back. However the task ends, as by a panic in
+    /// a round, the hold ends with it, so that no tenant is left open with
+    /// nothing looking after it.
+    fn maintaining(&self, work: &Arc<TenantWork>, flushed: Arc<tokio::sync::Notify>) {
         let Settings {
             restore_window,
             grace,
             ..
         } = self.settings;
-        let every =
-            (restore_window / 24).clamp(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        let every = self.rounds_every();
+        let lapsed_every = self.settings.lease / 3;
         let coordinator = self.coordinator.clone();
-        let hold = tenant.hold.clone();
-        let tenant = Arc::downgrade(tenant);
+        let hold = work.hold.clone();
+        let ends = GivesUp {
+            hold: hold.clone(),
+            tenant: work.id.clone(),
+            task: "maintenance",
+            given_up: self.given_up.clone(),
+        };
+        let work = Arc::downgrade(work);
         let maintaining = tokio::spawn(async move {
+            let _ends = ends;
+            // A flush told of in a lapse, its round yet to run. A hold back
+            // by the next look would otherwise wait for `every`.
+            let mut told = false;
             loop {
-                // While flushes fail, the next is tried as soon as its
-                // backoff lets it, whether or not a write asks for it.
-                let retried_at = tenant
-                    .upgrade()
-                    .and_then(|tenant| tenant.flush_retried_at());
-                let wait = retried_at.map_or(every, |at| {
-                    every.min(at.saturating_duration_since(Instant::now()))
-                });
-                let flush = match tokio::time::timeout(wait, wanted.recv()).await {
-                    Ok(Some(())) => true,
-                    Ok(None) => return,
-                    Err(_) => false,
+                let wait = match work.upgrade() {
+                    Some(work) if !work.held() => lapsed_every,
+                    _ if told => Duration::ZERO,
+                    _ => every,
                 };
-                let Some(tenant) = tenant.upgrade() else {
+                // Told, or only time to look: either way a round is run.
+                told |= tokio::time::timeout(wait, flushed.notified()).await.is_ok();
+                let Some(work) = work.upgrade() else {
                     return;
                 };
-                if !tenant.held() {
+                if work.hold.is_lost() {
                     return;
                 }
-                // One that failed is tried again on its own, if no write
-                // asks, but never sooner than its backoff lets it. One put
-                // off for that still lets the tenant be looked after.
-                let due = flush || tenant.flush_retried_at().is_some();
-                if due
-                    && tenant.read(State::unflushed) >= tenant.flush_rows
-                    && tenant.flush_may_be_tried()
-                {
-                    if let Err(error) = tenant.flush().await {
-                        tracing::error!(tenant = %tenant.id, %error, "flush failed; rows wait in memory");
-                        continue;
-                    }
+                if !work.held() {
+                    continue;
                 }
-                let through = tenant.settling.flushed.load(Ordering::SeqCst);
-                let maintained = tenant.maintained(coordinator.as_ref(), restore_window, grace);
+                told = false;
+                let through = work.settling.flushed.load(Ordering::SeqCst);
+                let maintained = work.maintained(coordinator.as_ref(), restore_window, grace);
                 match maintained.await {
                     Ok(deleted) => {
-                        tenant
-                            .settling
+                        work.settling
                             .maintained
                             .fetch_max(through, Ordering::SeqCst);
                         if deleted > 0 {
-                            tracing::info!(tenant = %tenant.id, deleted, "cleaned up");
+                            tracing::info!(tenant = %work.id, deleted, "cleaned up");
                         }
                     }
-                    Err(error) => tracing::warn!(tenant = %tenant.id, %error, "compaction failed"),
+                    Err(error) => tracing::warn!(tenant = %work.id, %error, "compaction failed"),
                 }
             }
         });
@@ -2087,18 +3159,12 @@ impl Inner {
     /// renewal is timed from when the one before was asked for, so a slow
     /// answer does not let the hold run out.
     ///
-    /// The hold is given up once `writer`, when it is open, is closed, as
+    /// The hold is given up once its writer, when it is open, is closed, as
     /// by an attempt that failed or a caller that stopped waiting part way,
     /// or has been publishing a commit for longer than its bounds allow:
     /// a writer that can write no more would otherwise keep the tenant
     /// from every other node.
-    fn renewing(
-        &self,
-        lease: Lease,
-        hold: Arc<Hold>,
-        deadline: &Arc<Mutex<Instant>>,
-        writer: Arc<OnceLock<Weak<Writer>>>,
-    ) {
+    fn renewing(&self, lease: Lease, hold: Arc<Hold>, deadline: &Arc<Mutex<Instant>>) {
         let coordinator = self.coordinator.clone();
         let ttl = self.settings.lease;
         let every = ttl / 3;
@@ -2113,13 +3179,14 @@ impl Inner {
                 if hold.is_lost() {
                     return;
                 }
-                let unusable = writer
+                let unusable = hold
+                    .writer
                     .get()
                     .and_then(Weak::upgrade)
                     .is_some_and(|writer| writer.is_closed() || writer.stalled());
                 if unusable {
                     tracing::warn!(partition = %lease.key, "the writer is closed or stuck; the hold on the tenant is given up");
-                    hold.lose();
+                    hold.lose(Lost::Lease);
                     return;
                 }
                 let asked = Instant::now();
@@ -2130,7 +3197,7 @@ impl Inner {
                     }
                     Ok(Err(error)) if !error.is_retryable() => {
                         tracing::warn!(partition = %lease.key, %error, "hold on the tenant lost");
-                        hold.lose();
+                        hold.lose(Lost::Lease);
                         return;
                     }
                     Ok(Err(error)) => {
@@ -2188,22 +3255,31 @@ mod segment_tests {
     use super::*;
     use vellev_storage::format::SegmentMeta;
 
-    fn meta(rows: u64, clustered: bool) -> SegmentMeta {
+    fn meta(rows: u64, clustered: bool, merged: bool) -> SegmentMeta {
+        let marker = if merged { "-merged" } else { "" };
         SegmentMeta {
-            key: format!("segment-{rows}"),
+            key: format!("segment/{rows}{marker}.segment"),
             rows,
             tombstones: 0,
             index: clustered.then(|| format!("index-{rows}")),
             vectors: Some(format!("vectors-{rows}")),
+            probes: vec![],
         }
     }
 
+    /// A segment with an index file is counted as clustered, and one no
+    /// merge wrote as awaiting a merge, whichever it is.
     #[test]
     fn a_segment_with_an_index_file_is_counted_as_clustered() {
-        let mut segments = Segments::default();
-        for (rows, clustered) in [(800_000, true), (200_000, false), (50_000, false)] {
-            segments.add(&meta(rows, clustered));
+        // Two tenants' figures, the first of two segments, added up.
+        let (mut first, mut second) = (vellev_storage::Figures::default(), Default::default());
+        for (rows, clustered, merged) in [(800_000, true, true), (200_000, false, false)] {
+            first.count(&meta(rows, clustered, merged));
         }
+        vellev_storage::Figures::count(&mut second, &meta(50_000, false, false));
+        let mut segments = Segments::default();
+        segments.add(&first);
+        segments.add(&second);
         assert_eq!(
             segments,
             Segments {
@@ -2211,6 +3287,9 @@ mod segment_tests {
                 clustered_rows: 800_000,
                 plain: 2,
                 plain_rows: 250_000,
+                unmerged: 2,
+                unmerged_rows: 250_000,
+                probes: Probes::default(),
             }
         );
     }

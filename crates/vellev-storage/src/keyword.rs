@@ -208,7 +208,7 @@ impl State {
                             _ => {
                                 let read = cursor.len();
                                 let live = cursor
-                                    .filter(|posting| !layer.dead[posting.row as usize])
+                                    .filter(|posting| !layer.dead.holds(posting.row))
                                     .count();
                                 (live, read)
                             }
@@ -421,7 +421,7 @@ fn top<'a>(
                 .for_each(|walk| walk.cursor.seek(next));
             continue;
         }
-        if !layer.dead[row as usize] {
+        if !layer.dead.holds(row) {
             work.keyword_rows += 1;
             walks[..at].sort_by_key(|walk| walk.clause);
             let score = walks[..at]

@@ -23,23 +23,96 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use vellev_core::Distance;
 
+use crate::curve::{Curve, Source};
+use crate::fastscan::{chosen, Blocks, Tables, BLOCK};
+use crate::pool::{CallersPool, Passes};
 use crate::rotation::{Random, Rotation};
+use crate::stop::{Stage, Stop, Stopped};
 use crate::vector::{
     allowed, as_far_from_every_vector, dot, in_row_order, measurable, nearest, normalised,
-    or_farthest, short_enough, squared_l2, Scorer, Ties, VectorIndex,
+    or_farthest, short_enough, squared_l2, Scorer, Skipped, Ties, VectorIndex,
 };
 
-/// The share of the true nearest ten that the clusters scanned must hold,
-/// over sample queries, when the index is built.
-pub const RECALL_FLOOR: f64 = 0.97;
 /// How many bits the query is quantized to for the scan.
 const QUERY_BITS: u32 = 4;
-const TUNING_QUERIES: usize = 100;
+/// How many of its own rows an index is tuned on when built: each asks
+/// for its nearest [`TUNING_NEIGHBOURS`], and the clusters they lie in make
+/// the index's curve of its rows (recall note, R6.3 and R7).
+const TUNING_QUERIES: usize = 400;
+/// How many rows a block of the one pass tuning makes over the rows holds:
+/// small in tests, so that their rows span many blocks and the blocks'
+/// shortlists are merged.
+const TUNING_BLOCK: usize = if cfg!(test) { 64 } else { 4096 };
 const TUNING_NEIGHBOURS: usize = 10;
 const ITERATIONS: usize = 8;
 const MOST_CLUSTERS: usize = 4096;
 /// How many vectors per cluster k-means is trained on, at most.
 const TRAINING_PER_CLUSTER: usize = 64;
+
+/// How a scan of clusters goes: how many clusters it probes at least, and
+/// into how many runs it may be split on the read pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probing {
+    /// The clusters it scans at least: as a segment's probe curve says, or
+    /// as the index was built to ([`ClusteredIndex::probes`]).
+    pub probes: usize,
+    /// The runs it may be split into; 1 scans on the calling thread.
+    pub parts: usize,
+}
+
+/// How far apart, at most, an index's rows may lie for a table to find
+/// their places: the table is SPREAD entries a row at most, 16 bytes.
+const SPREAD: u64 = 4;
+
+/// In a table of places, a row the index does not hold.
+const NOWHERE: u32 = u32::MAX;
+
+/// Where a row's place among an index's rows is found.
+#[derive(Debug, Clone)]
+enum Places {
+    /// A table from the first row to the last, of each row's place or
+    /// NOWHERE: one lookup, where a search of the rows takes a score of
+    /// cache misses a row. Kept when the rows span at most SPREAD times
+    /// their count, as a segment's rows of one collection mostly do, so
+    /// that it costs memory by the rows held, not by the highest.
+    Table { first: u32, places: Vec<u32> },
+    /// A search of the rows, for rows spread wider.
+    Search,
+}
+
+impl Places {
+    /// The places of `rows`, ascending and each once.
+    fn of(rows: &[u32]) -> Self {
+        let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+            return Self::Search;
+        };
+        let span = u64::from(last.saturating_sub(first)) + 1;
+        if span > SPREAD * rows.len() as u64 {
+            return Self::Search;
+        }
+        let mut places = vec![NOWHERE; span as usize];
+        for (place, row) in rows.iter().enumerate() {
+            // Rows out of order would be found wrongly by a search too;
+            // here they are not put in the table.
+            match row
+                .checked_sub(first)
+                .and_then(|at| places.get_mut(at as usize))
+            {
+                Some(slot) => *slot = place as u32,
+                None => return Self::Search,
+            }
+        }
+        Self::Table { first, places }
+    }
+
+    /// About how many bytes the table takes in memory.
+    fn resident(&self) -> usize {
+        match self {
+            Self::Table { places, .. } => places.capacity() * std::mem::size_of::<u32>(),
+            Self::Search => 0,
+        }
+    }
+}
 
 /// In what an index is not one of the vectors it is asked to stand for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -66,11 +139,16 @@ pub struct ClusteredIndex {
     /// its place in it; both follow from the clusters.
     rows: Vec<u32>,
     at: Vec<(u32, u32)>,
+    /// Where a row's place in `rows` is found; follows from `rows`.
+    places: Places,
     /// The rows with no estimate, in ascending order; they follow from the
     /// clusters too.
     unmeasured: Vec<u32>,
     /// How many clusters a query scans.
     probes: usize,
+    /// The curve of the rows the index was tuned on when built: kept with
+    /// the segment by the storage layer, and not in the index's file.
+    curve: Option<Curve>,
 }
 
 impl fmt::Debug for ClusteredIndex {
@@ -89,7 +167,8 @@ impl fmt::Debug for ClusteredIndex {
 #[serde(try_from = "ClusterWire", into = "ClusterWire")]
 struct Cluster {
     rows: Vec<u32>,
-    codes: Vec<u64>,
+    /// The rows' codes, laid out in blocks for the scan.
+    blocks: Blocks,
     factors: Vec<Factor>,
 }
 
@@ -189,7 +268,7 @@ impl Wire {
         }
         self.clusters
             .iter()
-            .position(|cluster| cluster.codes.len() != cluster.rows.len() * (width / 64))
+            .position(|cluster| !cluster.rows.is_empty() && cluster.blocks.words() != width / 64)
             .map(|cluster| format!("cluster {cluster}'s codes are not {width} bits a row"))
     }
 }
@@ -214,7 +293,10 @@ impl TryFrom<Wire> for ClusteredIndex {
             })
             .collect();
         rows.sort_unstable();
-        let (rows, at) = rows.into_iter().unzip();
+        if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("a row in two clusters".to_string());
+        }
+        let (rows, at): (Vec<u32>, Vec<(u32, u32)>) = rows.into_iter().unzip();
         Ok(Self {
             metric: wire.metric,
             dimensions: wire.dimensions,
@@ -222,9 +304,11 @@ impl TryFrom<Wire> for ClusteredIndex {
             rotation: wire.rotation,
             centroids: wire.centroids,
             clusters: wire.clusters,
+            places: Places::of(&rows),
             rows,
             at,
             probes: wire.probes,
+            curve: None,
         })
     }
 }
@@ -270,8 +354,8 @@ struct ClusterWire {
 impl From<Cluster> for ClusterWire {
     fn from(cluster: Cluster) -> Self {
         Self {
+            codes: cluster.blocks.codes(),
             rows: cluster.rows,
-            codes: cluster.codes,
             norms: cluster.factors.iter().map(|f| f.norm).collect(),
             aligns: cluster.factors.iter().map(|f| f.align).collect(),
             alongs: cluster.factors.iter().map(|f| f.along).collect(),
@@ -288,6 +372,13 @@ impl TryFrom<ClusterWire> for Cluster {
         if [wire.norms.len(), wire.aligns.len(), wire.alongs.len()] != [rows; 3] {
             return Err(format!("a cluster of {rows} rows without factors for each"));
         }
+        let words = wire.codes.len().checked_div(rows).unwrap_or(0);
+        if words * rows != wire.codes.len() {
+            return Err(format!(
+                "a cluster of {rows} rows with {} code words, not whole codes",
+                wire.codes.len()
+            ));
+        }
         let factors = wire
             .norms
             .into_iter()
@@ -296,8 +387,8 @@ impl TryFrom<ClusterWire> for Cluster {
             .map(|((norm, align), along)| Factor { norm, align, along })
             .collect();
         Ok(Self {
+            blocks: Blocks::new(&wire.codes, words),
             rows: wire.rows,
-            codes: wire.codes,
             factors,
         })
     }
@@ -306,11 +397,12 @@ impl TryFrom<ClusterWire> for Cluster {
 /// A query made ready for one cluster: its difference from the centroid,
 /// quantized to [`QUERY_BITS`] bit planes, with what the estimate needs.
 struct Probe {
+    /// The levels bit by bit, a plane a bit, as a code was first counted
+    /// against them: what the tests hold the tables to.
+    #[cfg(test)]
     planes: Vec<u64>,
+    #[cfg(test)]
     words: usize,
-    /// How this machine counts a code's bits against the planes: with its
-    /// popcount instruction where it has one.
-    counted: Counted,
     lower: f32,
     delta: f32,
     sum: f32,
@@ -319,44 +411,240 @@ struct Probe {
     scale: f32,
 }
 
-impl Probe {
-    fn new(query: &[f32], centroid: &[f32]) -> Self {
-        let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
+/// A residual's level from its distance above the lowest in steps, `x`:
+/// `x.round().clamp(0.0, 15.0)` as an integer, without a call to round
+/// where the machine has no instruction for it. `x` is never below zero,
+/// as the lowest is subtracted; for such an `x` rounding half away from
+/// zero is its whole part, plus one if what is left is a half or more,
+/// and both are exact in `f32`. Not a number gives 0 and infinity 15, as
+/// before.
+#[inline(always)]
+fn level_of(x: f32) -> u8 {
+    let whole = x as u32;
+    let up = u32::from(x - whole as f32 >= 0.5);
+    whole.saturating_add(up).min((1 << QUERY_BITS) - 1) as u8
+}
+
+/// Readying a query for a cluster: its difference from the centroid, the
+/// lowest and the step between levels, and each dimension's level, in
+/// each way this machine can run it, every way giving the portable way's
+/// result to the last bit.
+mod readying {
+    use super::{level_of, Readying, QUERY_BITS};
+
+    /// Fill `space` with the residual of `query` from `centroid` and its
+    /// levels; give the lowest residual and the step between levels.
+    pub(super) type Ready = fn(&[f32], &[f32], &mut Readying) -> (f32, f32);
+
+    /// The portable way, which every other is held to.
+    pub(super) fn portably(query: &[f32], centroid: &[f32], space: &mut Readying) -> (f32, f32) {
+        space.residual.clear();
+        space
+            .residual
+            .extend(query.iter().zip(centroid).map(|(q, c)| q - c));
+        let residual = &space.residual;
         let (mut lower, mut upper) = (f32::INFINITY, f32::NEG_INFINITY);
-        for value in &residual {
+        for value in residual {
             lower = lower.min(*value);
             upper = upper.max(*value);
         }
+        levelled(space, lower, upper)
+    }
+
+    /// The step between levels from `lower` and `upper`, and the levels.
+    fn levelled(space: &mut Readying, lower: f32, upper: f32) -> (f32, f32) {
         let levels = ((1u32 << QUERY_BITS) - 1) as f32;
         let delta = (upper - lower) / levels;
-        let words = residual.len() / 64;
-        debug_assert_eq!(residual.len() % 64, 0, "a rotation's width is whole words");
-        let mut planes = vec![0u64; words * QUERY_BITS as usize];
-        // A word of each plane at a time, each value's level taken as
-        // before and its bits laid into the words without a branch: the
-        // same planes, readied several times as fast.
+        debug_assert_eq!(
+            space.residual.len() % 64,
+            0,
+            "a rotation's width is whole words"
+        );
+        space.levels.clear();
+        space.levels.resize(space.residual.len(), 0);
         if delta > 0.0 {
-            for (word, chunk) in residual.chunks_exact(64).enumerate() {
-                let mut bits = [0u64; QUERY_BITS as usize];
-                for (at, value) in chunk.iter().enumerate() {
-                    let level = ((value - lower) / delta).round().clamp(0.0, levels) as u64;
-                    for (bit, plane) in bits.iter_mut().enumerate() {
-                        *plane |= (level >> bit & 1) << at;
-                    }
-                }
-                for (bit, plane) in bits.into_iter().enumerate() {
-                    planes[bit * words + word] = plane;
-                }
+            for (level, value) in space.levels.iter_mut().zip(&space.residual) {
+                *level = level_of((value - lower) / delta);
             }
         }
+        (lower, delta)
+    }
+
+    /// Every way this machine can run, by name, the portable first.
+    pub(super) fn ways_here() -> Vec<(&'static str, Ready)> {
+        #[allow(unused_mut)]
+        let mut ways: Vec<(&'static str, Ready)> = vec![("portable", portably)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: handed out only where the CPU has just said it has
+            // AVX2, which is all it asks.
+            ways.push(("avx2", |query, centroid, space| unsafe {
+                avx2::ready(query, centroid, space)
+            }));
+        }
+        ways
+    }
+
+    /// The way chosen for this machine: the widest. Decided once a
+    /// process.
+    pub(super) fn chosen() -> Ready {
+        static CHOSEN: std::sync::OnceLock<Ready> = std::sync::OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            ways_here()
+                .last()
+                .expect("the portable way is always here")
+                .1
+        })
+    }
+
+    /// In AVX2: the residual and its bounds eight dimensions at a time,
+    /// and the levels so too. The bounds are taken this way only where
+    /// they are the portable way's beyond doubt: with no residual not a
+    /// number, and neither bound a zero, whose sign the two ways might
+    /// tell apart; else the portable way is used whole.
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use std::arch::x86_64::*;
+
+        use super::{portably, Readying, QUERY_BITS};
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn ready(query: &[f32], centroid: &[f32], space: &mut Readying) -> (f32, f32) {
+            let width = query.len().min(centroid.len());
+            if !width.is_multiple_of(8) {
+                return portably(query, centroid, space);
+            }
+            space.residual.clear();
+            space.residual.resize(width, 0.0);
+            let (mut low, mut high) = (
+                _mm256_set1_ps(f32::INFINITY),
+                _mm256_set1_ps(f32::NEG_INFINITY),
+            );
+            let mut odd = _mm256_setzero_ps();
+            let out = space.residual.as_mut_ptr();
+            for at in (0..width).step_by(8) {
+                // SAFETY: `at + 8 <= width`, which no slice here is
+                // shorter than; nothing asks alignment.
+                let residual = unsafe {
+                    let residual = _mm256_sub_ps(
+                        _mm256_loadu_ps(query.as_ptr().add(at)),
+                        _mm256_loadu_ps(centroid.as_ptr().add(at)),
+                    );
+                    _mm256_storeu_ps(out.add(at), residual);
+                    residual
+                };
+                low = _mm256_min_ps(low, residual);
+                high = _mm256_max_ps(high, residual);
+                odd = _mm256_or_ps(odd, _mm256_cmp_ps::<_CMP_UNORD_Q>(residual, residual));
+            }
+            let (mut lows, mut highs) = ([0.0f32; 8], [0.0f32; 8]);
+            // SAFETY: each holds eight values.
+            unsafe {
+                _mm256_storeu_ps(lows.as_mut_ptr(), low);
+                _mm256_storeu_ps(highs.as_mut_ptr(), high);
+            }
+            let lower = lows.iter().fold(f32::INFINITY, |a, b| a.min(*b));
+            let upper = highs.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b));
+            if _mm256_movemask_ps(odd) != 0 || lower == 0.0 || upper == 0.0 {
+                return portably(query, centroid, space);
+            }
+            let levels = ((1u32 << QUERY_BITS) - 1) as f32;
+            let delta = (upper - lower) / levels;
+            space.levels.clear();
+            space.levels.resize(width, 0);
+            if delta > 0.0 {
+                let (lowest, step) = (_mm256_set1_ps(lower), _mm256_set1_ps(delta));
+                let (half, most) = (_mm256_set1_ps(0.5), _mm256_set1_epi32(levels as i32));
+                let one = _mm256_set1_epi32(1);
+                let mut got = [0i32; 8];
+                for at in (0..width).step_by(8) {
+                    // SAFETY: `at + 8 <= width`, the residual's length.
+                    let value = unsafe { _mm256_loadu_ps(space.residual.as_ptr().add(at)) };
+                    // As `level_of`: the whole part, plus one for a half or
+                    // more, at most the top level. `x` is never below zero.
+                    // It can pass the top level: with a subnormal step,
+                    // rounded, up to about 22, which the clamp below takes
+                    // back to 15, as `level_of`'s does. An infinite residual
+                    // makes `x` not a number, which converts to `i32::MIN`,
+                    // is clamped and cast to 0, as `level_of` gives 0. The
+                    // conversion truncates whatever the rounding mode
+                    // (MXCSR) is set to, as `as u32` does, so no setting of
+                    // it can change a level.
+                    let x = _mm256_div_ps(_mm256_sub_ps(value, lowest), step);
+                    let whole = _mm256_cvttps_epi32(x);
+                    let up = _mm256_cmp_ps::<_CMP_GE_OQ>(
+                        _mm256_sub_ps(x, _mm256_cvtepi32_ps(whole)),
+                        half,
+                    );
+                    let level = _mm256_min_epi32(
+                        _mm256_add_epi32(whole, _mm256_and_si256(_mm256_castps_si256(up), one)),
+                        most,
+                    );
+                    // SAFETY: `got` holds eight values.
+                    unsafe { _mm256_storeu_si256(got.as_mut_ptr().cast(), level) };
+                    for (into, level) in space.levels[at..at + 8].iter_mut().zip(got) {
+                        *into = level as u8;
+                    }
+                }
+            }
+            (lower, delta)
+        }
+    }
+}
+
+/// The levels bit by bit, a plane a bit, `words` words a plane: as a code
+/// was first counted against the query.
+#[cfg(test)]
+fn planes_of(levels: &[u8], words: usize) -> Vec<u64> {
+    let mut planes = vec![0u64; words * QUERY_BITS as usize];
+    for (word, chunk) in levels.chunks_exact(64).enumerate() {
+        let mut bits = [0u64; QUERY_BITS as usize];
+        for (at, level) in chunk.iter().enumerate() {
+            let level = u64::from(*level);
+            for (bit, plane) in bits.iter_mut().enumerate() {
+                *plane |= (level >> bit & 1) << at;
+            }
+        }
+        for (bit, plane) in bits.into_iter().enumerate() {
+            planes[bit * words + word] = plane;
+        }
+    }
+    planes
+}
+
+/// What readying the query for one cluster after another reuses.
+#[derive(Default)]
+struct Readying {
+    residual: Vec<f32>,
+    levels: Vec<u8>,
+}
+
+impl Probe {
+    #[cfg(test)]
+    fn new(query: &[f32], centroid: &[f32]) -> Self {
+        Self::readied(query, centroid, &mut Readying::default())
+    }
+
+    /// The query readied for the cluster whose centroid is `centroid`: each
+    /// dimension's level into `space.levels`, where a scan of blocks makes
+    /// its tables from them.
+    fn readied(query: &[f32], centroid: &[f32], space: &mut Readying) -> Self {
+        let (lower, delta) = (readying::chosen())(query, centroid, space);
+        let residual = &space.residual;
+        #[cfg(test)]
+        let (planes, words) = (
+            planes_of(&space.levels, residual.len() / 64),
+            residual.len() / 64,
+        );
         Self {
+            #[cfg(test)]
             planes,
+            #[cfg(test)]
             words,
-            counted: counter(),
             lower,
             delta,
             sum: residual.iter().sum(),
-            norm_squared: dot(&residual, &residual),
+            norm_squared: dot(residual, residual),
             centroid_dot: dot(query, centroid),
             scale: 1.0 / (residual.len() as f32).sqrt(),
         }
@@ -364,14 +652,30 @@ impl Probe {
 
     /// The inner product of the direction a code stands for with the
     /// query's difference from the centroid.
+    #[cfg(test)]
     fn inner(&self, code: &[u64], factor: &Factor) -> f32 {
-        let (ones, weighted) = (self.counted)(code, &self.planes, self.words);
+        let (ones, weighted) = counted_in_one_pass(code, &self.planes, self.words);
+        self.inner_of(ones, weighted, factor)
+    }
+
+    /// As [`Self::inner`], from a code's counts: its set bits, and the sum
+    /// of the query's levels over them.
+    #[inline(always)]
+    fn inner_of(&self, ones: u32, weighted: u32, factor: &Factor) -> f32 {
         let set = self.lower * ones as f32 + self.delta * weighted as f32;
         (2.0 * set - self.sum) * self.scale / factor.align
     }
 
+    #[cfg(test)]
     fn distance(&self, metric: Distance, code: &[u64], factor: &Factor) -> f32 {
-        let inner = self.inner(code, factor);
+        let (ones, weighted) = counted_in_one_pass(code, &self.planes, self.words);
+        self.distance_of(metric, ones, weighted, factor)
+    }
+
+    /// As [`Self::distance`], from a code's counts.
+    #[inline(always)]
+    fn distance_of(&self, metric: Distance, ones: u32, weighted: u32, factor: &Factor) -> f32 {
+        let inner = self.inner_of(ones, weighted, factor);
         match metric {
             Distance::L2 => {
                 factor.norm * factor.norm + self.norm_squared - 2.0 * factor.norm * inner
@@ -383,16 +687,16 @@ impl Probe {
     }
 }
 
-/// A code's set bits, and its bits set in each of the query's planes
-/// weighted by the plane's place: `(ones, weighted)`.
-type Counted = fn(&[u64], &[u64], usize) -> (u32, u32);
-
 const _: () = assert!(QUERY_BITS == 4, "the scan counts four planes");
 
-/// Every count of a code in one pass over its words, rather than one pass
-/// for its bits and one for each plane: the same integers, so the same
-/// estimate to the bit.
+/// Every count of a code in one pass over its words: its set bits, and
+/// its bits set in each of the query's planes weighted by the plane's
+/// place, `(ones, weighted)`. How codes were counted before they were laid
+/// out in blocks, and what the tests hold the tables to; the scan itself
+/// no longer counts this way, so the popcount dispatch step E chose it by
+/// is gone.
 #[inline(always)]
+#[cfg(test)]
 fn counted_in_one_pass(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
     let code = &code[..words];
     let (p0, rest) = planes.split_at(words);
@@ -409,31 +713,6 @@ fn counted_in_one_pass(code: &[u64], planes: &[u64], words: usize) -> (u32, u32)
         w3 += (c & p3[i]).count_ones();
     }
     (ones, w0 + (w1 << 1) + (w2 << 2) + (w3 << 3))
-}
-
-fn counted_portably(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
-    counted_in_one_pass(code, planes, words)
-}
-
-/// As [`counted_portably`], compiled to use the popcount instruction.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "popcnt")]
-fn counted_with_popcount(code: &[u64], planes: &[u64], words: usize) -> (u32, u32) {
-    counted_in_one_pass(code, planes, words)
-}
-
-/// The counter for this machine: decided once per process.
-fn counter() -> Counted {
-    static COUNTER: std::sync::OnceLock<Counted> = std::sync::OnceLock::new();
-    *COUNTER.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("popcnt") {
-            // SAFETY: called only where the CPU has just said it has
-            // popcount, which is all the function asks.
-            return |code, planes, words| unsafe { counted_with_popcount(code, planes, words) };
-        }
-        counted_portably
-    })
 }
 
 #[derive(PartialEq)]
@@ -528,6 +807,19 @@ impl<'a> Nearest<'a> {
         self.heap.len() >= self.count
     }
 
+    /// Whether [`Self::offer`] would turn `distance` away at a look: the
+    /// shortlist full and `distance` farther than the farthest kept. A long
+    /// scan asks this of most rows, inline, before offering any.
+    #[inline(always)]
+    fn turns_away(&self, distance: f32) -> bool {
+        let distance = or_farthest(distance);
+        self.heap.len() >= self.count
+            && self
+                .heap
+                .peek()
+                .is_some_and(|worst| distance.total_cmp(&worst.distance).is_gt())
+    }
+
     /// The nearest `count`, those as far as the farthest of them taken in
     /// `ties` order.
     fn estimates(self) -> Vec<(f32, u32)> {
@@ -552,6 +844,14 @@ impl<'a> Nearest<'a> {
     }
 }
 
+/// Where a curve is worked out: on the tuning pool, in turn, for a build
+/// that may be stopped, or on the passes' pool for a rows pass.
+#[derive(Clone, Copy)]
+enum Tuned<'a> {
+    Building(&'a Stop),
+    Passing,
+}
+
 fn clusters_for(count: usize) -> usize {
     ((count as f64).sqrt() as usize).clamp(1, MOST_CLUSTERS.min(count))
 }
@@ -569,7 +869,16 @@ fn nearest_centroid(centroids: &[f32], width: usize, vector: &[f32]) -> usize {
 
 /// Lloyd's k-means over `training`, seeded with `k` of them spread evenly
 /// through the sample, which is in row order.
-fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) -> Vec<f32> {
+/// Asks `stop` at each iteration, and as each row of the sample is
+/// assigned: one iteration at a million rows is seconds on a small box.
+fn kmeans(
+    training: &[Vec<f32>],
+    k: usize,
+    width: usize,
+    random: &mut Random,
+    stop: &Stop,
+    on: impl Passes,
+) -> Result<Vec<f32>, Stopped> {
     let mut centroids: Vec<f32> = training
         .iter()
         .step_by(training.len() / k)
@@ -578,10 +887,17 @@ fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) ->
         .collect();
     let mut assigned = vec![usize::MAX; training.len()];
     for _ in 0..ITERATIONS {
-        let next: Vec<usize> = training
-            .par_iter()
-            .map(|vector| nearest_centroid(&centroids, width, vector))
-            .collect();
+        stop.check(Stage::Clustering)?;
+        let next: Vec<usize> = on.pass("clustering", || {
+            training
+                .par_iter()
+                .map(|vector| match stop.check(Stage::Clustering) {
+                    Ok(()) => nearest_centroid(&centroids, width, vector),
+                    Err(Stopped) => 0,
+                })
+                .collect()
+        });
+        stop.passed()?;
         if next == assigned {
             break;
         }
@@ -606,7 +922,7 @@ fn kmeans(training: &[Vec<f32>], k: usize, width: usize, random: &mut Random) ->
             }
         }
     }
-    centroids
+    Ok(centroids)
 }
 
 impl ClusteredIndex {
@@ -616,7 +932,37 @@ impl ClusteredIndex {
     /// settles how many clusters a query scans; it takes a while for many
     /// vectors and is meant for a background thread.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        match Self::build_stopping(metric, vectors, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
+    }
+
+    /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
+    /// stopped: asked as each row is sampled, clustered and coded, at each
+    /// clustering iteration, while the build waits its turn to tune, and at
+    /// each block of rows tuning goes through.
+    pub fn build_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+    ) -> Result<Option<Self>, Stopped> {
+        Self::build_stopping_on(metric, vectors, stop, CallersPool)
+    }
+
+    /// As [`Self::build_stopping`], each parallel pass where `on` says:
+    /// sampling, each iteration of clustering, and coding. The rest, the
+    /// serial work between them and the turn to tune, stays on the calling
+    /// thread, which must be on no pool that builds: see [`crate::pool::tune`].
+    pub fn build_stopping_on(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+        on: impl Passes,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         // Clusters, and how many a query scans, are drawn from the rows that
@@ -635,69 +981,89 @@ impl ClusteredIndex {
         let rotated = |vector: &[f32]| rotation.apply(&normalised(metric, vector));
 
         let k = clusters_for(measured.len().max(1));
-        let training: Vec<Vec<f32>> = random
-            .sample(measured.len(), k * TRAINING_PER_CLUSTER)
-            .into_par_iter()
-            .map(|at| rotated(measured[at].1))
-            .collect();
+        let sample = random.sample(measured.len(), k * TRAINING_PER_CLUSTER);
+        let training: Vec<Vec<f32>> = on.pass("sampling", || {
+            sample
+                .into_par_iter()
+                .map(|at| match stop.check(Stage::Sampling) {
+                    Ok(()) => rotated(measured[at].1),
+                    Err(Stopped) => Vec::new(),
+                })
+                .collect()
+        });
+        stop.passed()?;
         let centroids = match training.is_empty() {
             true => vec![0.0; k * width],
-            false => kmeans(&training, k, width, &mut random),
+            false => kmeans(&training, k, width, &mut random, stop, on)?,
         };
 
         let scale = 1.0 / (width as f32).sqrt();
-        let coded: Vec<(usize, Vec<u64>, Factor)> = vectors
-            .par_iter()
-            .map(|(_, vector)| {
-                // Defence in depth: its length, worked out again from its
-                // factors, would set such a row apart even if it were coded.
-                if !measurable(metric, vector) {
-                    return (0, vec![0; width / 64], Factor::UNMEASURED);
-                }
-                let rotated = rotated(vector);
-                let cluster = nearest_centroid(&centroids, width, &rotated);
-                let centroid = &centroids[cluster * width..][..width];
-                let residual: Vec<f32> = rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
-                let norm = dot(&residual, &residual).sqrt();
-                let code: Vec<u64> = residual
-                    .chunks_exact(64)
-                    .map(|values| {
-                        values.iter().enumerate().fold(0u64, |word, (bit, value)| {
-                            word | (u64::from(*value > 0.0) << bit)
+        let coded: Vec<(usize, Vec<u64>, Factor)> = on.pass("coding", || {
+            vectors
+                .par_iter()
+                .map(|(_, vector)| {
+                    // Given up: nothing is made of the rows left, and the build
+                    // gives up once the pass is through them.
+                    if stop.check(Stage::Coding).is_err() {
+                        return (0, Vec::new(), Factor::UNMEASURED);
+                    }
+                    // Defence in depth: its length, worked out again from its
+                    // factors, would set such a row apart even if it were coded.
+                    if !measurable(metric, vector) {
+                        return (0, vec![0; width / 64], Factor::UNMEASURED);
+                    }
+                    let rotated = rotated(vector);
+                    let cluster = nearest_centroid(&centroids, width, &rotated);
+                    let centroid = &centroids[cluster * width..][..width];
+                    let residual: Vec<f32> =
+                        rotated.iter().zip(centroid).map(|(v, c)| v - c).collect();
+                    let norm = dot(&residual, &residual).sqrt();
+                    let code: Vec<u64> = residual
+                        .chunks_exact(64)
+                        .map(|values| {
+                            values.iter().enumerate().fold(0u64, |word, (bit, value)| {
+                                word | (u64::from(*value > 0.0) << bit)
+                            })
                         })
-                    })
-                    .collect();
-                let factor = match norm > 0.0 {
-                    true => Factor {
-                        norm,
-                        align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale / norm,
-                        along: dot(&residual, centroid) / norm,
-                    },
-                    false => Factor {
-                        norm: 0.0,
-                        align: 1.0,
-                        along: 0.0,
-                    },
-                };
-                (cluster, code, factor)
-            })
-            .collect();
+                        .collect();
+                    let factor = match norm > 0.0 {
+                        true => Factor {
+                            norm,
+                            align: residual.iter().map(|value| value.abs()).sum::<f32>() * scale
+                                / norm,
+                            along: dot(&residual, centroid) / norm,
+                        },
+                        false => Factor {
+                            norm: 0.0,
+                            align: 1.0,
+                            along: 0.0,
+                        },
+                    };
+                    (cluster, code, factor)
+                })
+                .collect()
+        });
+        stop.passed()?;
 
-        let mut clusters: Vec<Cluster> = (0..k)
-            .map(|_| Cluster {
-                rows: Vec::new(),
-                codes: Vec::new(),
-                factors: Vec::new(),
-            })
-            .collect();
+        let mut members: Vec<(Vec<u32>, Vec<u64>, Vec<Factor>)> =
+            (0..k).map(|_| Default::default()).collect();
         let mut at = Vec::with_capacity(vectors.len());
         for ((row, _), (cluster, code, factor)) in vectors.iter().zip(coded) {
-            let members = &mut clusters[cluster];
-            at.push((cluster as u32, members.rows.len() as u32));
-            members.rows.push(*row);
-            members.codes.extend(code);
-            members.factors.push(factor);
+            let (rows, codes, factors) = &mut members[cluster];
+            at.push((cluster as u32, rows.len() as u32));
+            rows.push(*row);
+            codes.extend(code);
+            factors.push(factor);
         }
+        let clusters: Vec<Cluster> = members
+            .into_iter()
+            .map(|(rows, codes, factors)| Cluster {
+                rows,
+                blocks: Blocks::new(&codes, width / 64),
+                factors,
+            })
+            .collect();
+        let rows: Vec<u32> = vectors.iter().map(|(row, _)| *row).collect();
         let mut index = Self {
             metric,
             dimensions,
@@ -705,12 +1071,17 @@ impl ClusteredIndex {
             rotation,
             centroids,
             clusters,
-            rows: vectors.iter().map(|(row, _)| *row).collect(),
+            places: Places::of(&rows),
+            rows,
             at,
             probes: 1,
+            curve: None,
         };
-        index.probes = index.tuned(&measured, &mut random);
-        Some(index)
+        index.curve = index.curve_of_measured(&measured, Tuned::Building(stop))?;
+        // Every cluster a sample's nearest rows lay in, as the curve says;
+        // also what a node that knows nothing of curves scans.
+        index.probes = index.curve.as_ref().map_or(1, Curve::probes);
+        Ok(Some(index))
     }
 
     /// How many clusters a query scans.
@@ -742,52 +1113,168 @@ impl ClusteredIndex {
         self.clusters.len()
     }
 
-    /// The fewest clusters whose scan holds [`RECALL_FLOOR`] of the true
-    /// nearest [`TUNING_NEIGHBOURS`] of sample queries drawn at random from
-    /// `vectors` themselves, each left out of its own neighbours: the rows
-    /// that can be measured, as no other is ever offered.
-    fn tuned(&self, vectors: &[(u32, &[f32])], random: &mut Random) -> usize {
-        let ranks: Vec<usize> = random
-            .sample(vectors.len(), TUNING_QUERIES)
-            .into_par_iter()
-            .map(|at| &vectors[at])
-            .flat_map_iter(|(row, query)| {
-                let scorer = Scorer::new(self.metric, query);
-                let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
-                for (other, vector) in vectors {
-                    if other != row {
-                        nearest.offer(scorer.distance(vector), *other);
+    /// The curve of the rows the index was tuned on when it was built:
+    /// none for an index read back from a file, whose curve the segment
+    /// keeps.
+    pub fn rows_curve(&self) -> Option<Curve> {
+        self.curve.clone()
+    }
+
+    /// The curve of the rows of `vectors`, as the build of an index of
+    /// them makes it: for an index read back from its file, whose curve is
+    /// not in it, from the vectors it indexes, in ascending row order. The
+    /// same rows give the same curve, whenever it is made.
+    pub fn curve_of_rows(&self, vectors: &[(u32, &[f32])]) -> Option<Curve> {
+        let measured: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .copied()
+            .filter(|(_, vector)| measurable(self.metric, vector))
+            .collect();
+        match self.curve_of_measured(&measured, Tuned::Passing) {
+            Ok(curve) => curve,
+            Err(Stopped) => unreachable!("a rows pass has no stop"),
+        }
+    }
+
+    /// As [`Self::curve_of_rows`], of rows already found measurable: its
+    /// samples drawn by a generator of their own, seeded by how many rows
+    /// there are and their dimensions alone, and worked out on the tuning
+    /// pool, in turn, for a build, or the passes' pool for a rows pass.
+    fn curve_of_measured(
+        &self,
+        measured: &[(u32, &[f32])],
+        tuned: Tuned<'_>,
+    ) -> Result<Option<Curve>, Stopped> {
+        let mut random = Random(
+            (measured.len() as u64 ^ ((self.dimensions as u64) << 32)) ^ 0x7465_6e65_645f_7631,
+        );
+        let samples = random.sample(measured.len(), TUNING_QUERIES);
+        let ranks = match tuned {
+            Tuned::Building(stop) => {
+                crate::pool::tune(stop, || self.ranks_on_this_pool(measured, &samples, stop))??
+            }
+            Tuned::Passing => crate::pool::passes()
+                .install(|| self.ranks_on_this_pool(measured, &samples, &Stop::new()))?,
+        };
+        Ok(Curve::of(
+            Source::Rows,
+            samples.len() as u32,
+            self.clusters.len() as u32,
+            ranks,
+        ))
+    }
+
+    /// Each of `samples`' nearest [`TUNING_NEIGHBOURS`] of `vectors`, the
+    /// sample itself left out, ties in row order: in one pass over the
+    /// rows for all samples at once, block by block on the rayon pool, so
+    /// that the rows are read once however many samples there are.
+    /// `stop` is asked at each block.
+    fn nearest_of_samples(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        stop: &Stop,
+    ) -> Result<Vec<Vec<u32>>, Stopped> {
+        let asked: Vec<(u32, Scorer<'_>)> = samples
+            .iter()
+            .map(|at| (vectors[*at].0, Scorer::new(self.metric, vectors[*at].1)))
+            .collect();
+        let shortlists = |block: &[(u32, &[f32])]| -> Vec<Vec<(f32, u32)>> {
+            let mut nearest: Vec<Nearest<'_>> = asked
+                .iter()
+                .map(|_| Nearest::new(TUNING_NEIGHBOURS, &in_row_order))
+                .collect();
+            for (row, vector) in block {
+                for ((sample, scorer), nearest) in asked.iter().zip(&mut nearest) {
+                    if row != sample {
+                        let distance = scorer.distance(vector);
+                        if !nearest.turns_away(distance) {
+                            nearest.offer(distance, *row);
+                        }
                     }
                 }
-                let order = self.order(&self.prepared(query));
-                let rank_of = move |cluster: u32| {
-                    order
-                        .iter()
-                        .position(|(_, candidate)| *candidate == cluster as usize)
-                        .unwrap_or(order.len())
-                };
-                nearest
-                    .estimates()
+            }
+            nearest.into_iter().map(Nearest::estimates).collect()
+        };
+        let merged = vectors
+            .par_chunks(TUNING_BLOCK)
+            .map(|block| {
+                stop.check(Stage::Tuning)?;
+                Ok(shortlists(block))
+            })
+            .try_reduce(
+                || vec![Vec::new(); asked.len()],
+                |a, b| {
+                    Ok(a.into_iter()
+                        .zip(b)
+                        .map(|(a, b)| {
+                            let mut nearest = Nearest::new(TUNING_NEIGHBOURS, &in_row_order);
+                            for (distance, row) in a.into_iter().chain(b) {
+                                nearest.offer(distance, row);
+                            }
+                            nearest.estimates()
+                        })
+                        .collect())
+                },
+            )?;
+        Ok(merged
+            .into_iter()
+            .map(|mut found| {
+                found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                found.truncate(TUNING_NEIGHBOURS);
+                found.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect())
+    }
+
+    /// The rank, in each sample's order of clusters, of the cluster each of
+    /// its nearest rows lies in: worked out on `pool`, the tuning pool or
+    /// the passes', each one thread of its own ([`crate::pool`]).
+    #[cfg(test)]
+    fn sample_ranks(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        pool: &rayon::ThreadPool,
+    ) -> Vec<u32> {
+        match pool.install(|| self.ranks_on_this_pool(vectors, samples, &Stop::new())) {
+            Ok(ranks) => ranks,
+            Err(Stopped) => unreachable!("never stopped"),
+        }
+    }
+
+    /// As [`Self::sample_ranks`], on whatever pool the caller is on,
+    /// asking `stop` at each block of rows and each sample.
+    fn ranks_on_this_pool(
+        &self,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+        stop: &Stop,
+    ) -> Result<Vec<u32>, Stopped> {
+        let nearest = self.nearest_of_samples(vectors, samples, stop)?;
+        let ranks = samples
+            .par_iter()
+            .zip(nearest)
+            .flat_map_iter(|(at, rows)| {
+                if stop.check(Stage::Ranking).is_err() {
+                    return Vec::new();
+                }
+                let mut rank = vec![0u32; self.clusters.len()];
+                for (place, (_, cluster)) in self
+                    .order(&self.prepared(vectors[*at].1))
                     .into_iter()
-                    .map(move |(_, row)| rank_of(self.at[self.position(row).unwrap()].0))
+                    .enumerate()
+                {
+                    rank[cluster] = place as u32;
+                }
+                rows.into_iter()
+                    .filter_map(|row| self.position(row))
+                    .map(|position| rank[self.at[position].0 as usize])
+                    .collect::<Vec<_>>()
             })
             .collect();
-        if ranks.is_empty() {
-            return 1;
-        }
-        let mut found = vec![0usize; self.clusters.len() + 1];
-        for rank in &ranks {
-            found[*rank] += 1;
-        }
-        let wanted = (ranks.len() as f64 * RECALL_FLOOR).ceil() as usize;
-        let mut seen = 0;
-        for (rank, count) in found.iter().enumerate().take(self.clusters.len()) {
-            seen += count;
-            if seen >= wanted {
-                return rank + 1;
-            }
-        }
-        self.clusters.len()
+        stop.passed()?;
+        Ok(ranks)
     }
 
     fn prepared(&self, query: &[f32]) -> Vec<f32> {
@@ -818,16 +1305,39 @@ impl ClusteredIndex {
     }
 
     fn position(&self, row: u32) -> Option<usize> {
-        self.rows.binary_search(&row).ok()
+        match &self.places {
+            Places::Table { first, places } => {
+                let place = *places.get(row.checked_sub(*first)? as usize)?;
+                (place != NOWHERE).then_some(place as usize)
+            }
+            Places::Search => self.rows.binary_search(&row).ok(),
+        }
+    }
+
+    /// About how many bytes the index takes in memory: its codes and
+    /// their counts, the factors, the rows and their places, the centroids
+    /// and the rows it has no estimate for.
+    pub fn resident(&self) -> usize {
+        use std::mem::size_of;
+        let clusters: usize = self
+            .clusters
+            .iter()
+            .map(|cluster| {
+                cluster.rows.capacity() * size_of::<u32>()
+                    + cluster.blocks.resident()
+                    + cluster.factors.capacity() * size_of::<Factor>()
+            })
+            .sum();
+        clusters
+            + self.rows.capacity() * size_of::<u32>()
+            + self.at.capacity() * size_of::<(u32, u32)>()
+            + self.places.resident()
+            + self.centroids.capacity() * size_of::<f32>()
+            + self.unmeasured.capacity() * size_of::<u32>()
     }
 
     fn centroid(&self, cluster: usize) -> &[f32] {
         &self.centroids[cluster * self.rotation.width..][..self.rotation.width]
-    }
-
-    fn code<'a>(&self, cluster: &'a Cluster, index: usize) -> &'a [u64] {
-        let words = self.rotation.width / 64;
-        &cluster.codes[index * words..][..words]
     }
 }
 
@@ -837,7 +1347,7 @@ impl VectorIndex for ClusteredIndex {
     }
 
     fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
-        allowed(&self.unmeasured, only, skipped)
+        self.unmeasured_skipping(only, Skipped::Bytes(skipped))
     }
 
     /// Each estimate is a distance under the index's metric, comparable
@@ -851,14 +1361,61 @@ impl VectorIndex for ClusteredIndex {
         skipped: &[bool],
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
+        let probing = Probing {
+            probes: self.probes,
+            parts: 1,
+        };
+        self.estimates_split(query, count, only, skipped, ties, probing)
+    }
+}
+
+impl ClusteredIndex {
+    /// As [`VectorIndex::estimates`], scanning at least `probes` clusters
+    /// rather than the count the index was built with (a segment's probe
+    /// curve says how many: see [`crate::curve`]), the scan split into up
+    /// to `parts` runs on the rayon pool: the same nearest `count`,
+    /// whatever `parts` is, as [`Self::scanned`] says.
+    pub fn estimates_split(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        ties: Ties<'_>,
+        probing: Probing,
+    ) -> Vec<(f32, u32)> {
+        self.estimates_marked(query, count, only, Skipped::Bytes(skipped), ties, probing)
+    }
+
+    /// As [`VectorIndex::unmeasured`], the rows skipped given as either kind
+    /// of [`Skipped`].
+    pub fn unmeasured_skipping(
+        &self,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+    ) -> Vec<u32> {
+        allowed(&self.unmeasured, only, skipped)
+    }
+
+    /// As [`Self::estimates_split`], the rows skipped given as either kind
+    /// of [`Skipped`]: a scan of the clusters reads bits a word at a time,
+    /// where a byte a row read at random across the rows costs it dearly
+    /// (x86 profile).
+    pub fn estimates_marked(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+        ties: Ties<'_>,
+        probing: Probing,
+    ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
         if count == 0 || query.len() != self.dimensions {
             return Vec::new();
         }
         // A row with no estimate is never offered: the caller scores it.
-        let kept = |row: u32| {
-            !skipped.get(row as usize).copied().unwrap_or(false)
-                && self.unmeasured.binary_search(&row).is_err()
-        };
+        let kept = |row: u32| !skipped.holds(row) && self.unmeasured.binary_search(&row).is_err();
         let mut nearest = Nearest::new(count, ties);
         // A query as far from every row is estimated alike for each, in
         // whatever cluster, and the caller's order decides.
@@ -879,48 +1436,372 @@ impl VectorIndex for ClusteredIndex {
             return nearest.estimates();
         }
         let query = self.prepared(query);
-        let per_probe = self.rows.len().div_ceil(self.clusters.len()) * self.probes;
+        let probes = probes.clamp(1, self.clusters.len());
+        let per_probe = self.rows.len().div_ceil(self.clusters.len()) * probes;
         match only {
-            // Fewer rows allowed than a scan would visit: visit just those,
-            // readying the query for each cluster met.
+            // Fewer rows allowed than a scan would visit: visit just those.
             Some(only) if (only.len() as usize) <= per_probe => {
-                let mut probes: Vec<Option<Probe>> = std::iter::repeat_with(|| None)
-                    .take(self.clusters.len())
-                    .collect();
-                for row in only.iter().filter(|row| kept(*row)) {
-                    let Some(position) = self.position(row) else {
-                        continue;
-                    };
-                    let (cluster, index) = self.at[position];
-                    let probe = probes[cluster as usize]
-                        .get_or_insert_with(|| Probe::new(&query, self.centroid(cluster as usize)));
-                    let members = &self.clusters[cluster as usize];
-                    let code = self.code(members, index as usize);
-                    let distance =
-                        probe.distance(self.metric, code, &members.factors[index as usize]);
-                    nearest.offer(distance, row);
-                }
+                self.visited(&query, count, only, skipped, ties)
             }
-            _ => {
-                let allowed = |row: u32| kept(row) && only.is_none_or(|only| only.contains(row));
-                for (probed, (_, cluster)) in self.order(&query).into_iter().enumerate() {
-                    if probed >= self.probes && nearest.is_full() {
-                        break;
-                    }
-                    let probe = Probe::new(&query, self.centroid(cluster));
-                    let members = &self.clusters[cluster];
-                    for (index, row) in members.rows.iter().enumerate() {
-                        if allowed(*row) {
-                            let code = self.code(members, index);
-                            let distance =
-                                probe.distance(self.metric, code, &members.factors[index]);
-                            nearest.offer(distance, *row);
-                        }
-                    }
+            _ => self.scanned(
+                &query,
+                count,
+                only,
+                skipped,
+                ties,
+                Probing { probes, parts },
+            ),
+        }
+    }
+
+    /// Whether `row` may be offered: not skipped, and with an estimate.
+    fn kept(&self, row: u32, skipped: Skipped<'_>) -> bool {
+        !skipped.holds(row) && self.unmeasured.binary_search(&row).is_err()
+    }
+
+    /// The `count` nearest of the rows `only` allows, estimated a cluster
+    /// at a time: each cluster met readied once, and each block holding
+    /// an allowed row weighed whole, as a scan weighs it, reading its
+    /// bytes in order rather than each row's across the block. `query` is
+    /// prepared. The rows are offered by cluster rather than in row order,
+    /// so the nearest `count` are the same and only offers' order differs.
+    fn visited(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: &RoaringBitmap,
+        skipped: Skipped<'_>,
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
+        let mut nearest = Nearest::new(count, ties);
+        // The allowed rows' places, sorted by cluster by counting, each
+        // cluster's kept in the order they were met.
+        let mut met: Vec<(u32, u32, u32)> = Vec::new();
+        let mut starts = vec![0usize; self.clusters.len() + 1];
+        for row in only.iter().filter(|row| self.kept(*row, skipped)) {
+            let Some(position) = self.position(row) else {
+                continue;
+            };
+            let (cluster, index) = self.at[position];
+            starts[cluster as usize + 1] += 1;
+            met.push((cluster, index, row));
+        }
+        for cluster in 0..self.clusters.len() {
+            starts[cluster + 1] += starts[cluster];
+        }
+        let mut sorted = vec![(0u32, 0u32); met.len()];
+        let mut next = starts.clone();
+        for (cluster, index, row) in met {
+            sorted[next[cluster as usize]] = (index, row);
+            next[cluster as usize] += 1;
+        }
+        let weigh = chosen().1;
+        let mut weighed = [0u32; BLOCK];
+        let mut space = Readying::default();
+        let mut tables = Tables::default();
+        for cluster in 0..self.clusters.len() {
+            let rows = &sorted[starts[cluster]..starts[cluster + 1]];
+            if rows.is_empty() {
+                continue;
+            }
+            let probe = Probe::readied(query, self.centroid(cluster), &mut space);
+            tables.fill(&space.levels);
+            let members = &self.clusters[cluster];
+            let mut weighed_block = usize::MAX;
+            for (index, row) in rows {
+                let index = *index as usize;
+                if index / BLOCK != weighed_block {
+                    weighed_block = index / BLOCK;
+                    weigh(members.blocks.block(weighed_block), &tables, &mut weighed);
+                }
+                let distance = probe.distance_of(
+                    self.metric,
+                    members.blocks.ones(index),
+                    weighed[index % BLOCK],
+                    &members.factors[index],
+                );
+                if !nearest.turns_away(distance) {
+                    nearest.offer(distance, *row);
                 }
             }
         }
         nearest.estimates()
+    }
+
+    /// The `count` nearest allowed rows of the clusters nearest the query,
+    /// at least [`Self::probes`] of them and more while too few are found,
+    /// a block of rows weighed at a time. `query` is prepared. With more
+    /// than one of `parts`, the clusters it must probe are split into as
+    /// many runs, scanned on the read pool ([`crate::pool::reads`]) each
+    /// with its own shortlist,
+    /// and the shortlists merged; what it finds is the same nearest
+    /// `count`, as the rows offered are, and only offers' order differs.
+    fn scanned(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+        ties: Ties<'_>,
+        probing: Probing,
+    ) -> Vec<(f32, u32)> {
+        let Probing { probes, parts } = probing;
+        let order = self.order(query);
+        let probes = probes.min(order.len());
+        let mut scan = Scan::new(self, query, only, skipped);
+        let mut nearest = Nearest::new(count, ties);
+        let runs = parts.min(probes);
+        if runs > 1 {
+            let scan_run = |run: usize| {
+                let clusters = &order[probes * run / runs..probes * (run + 1) / runs];
+                let mut scan = Scan::new(self, query, only, skipped);
+                let mut nearest = Nearest::new(count, ties);
+                for (_, cluster) in clusters {
+                    scan.cluster(*cluster, &mut nearest);
+                }
+                nearest.estimates()
+            };
+            let shortlists: Vec<Vec<(f32, u32)>> =
+                crate::pool::reads().install(|| (0..runs).into_par_iter().map(scan_run).collect());
+            for (distance, row) in shortlists.into_iter().flatten() {
+                if !nearest.turns_away(distance) {
+                    nearest.offer(distance, row);
+                }
+            }
+        } else {
+            for (_, cluster) in &order[..probes] {
+                scan.cluster(*cluster, &mut nearest);
+            }
+        }
+        // On past the clusters it must probe, one at a time, while too few
+        // rows are found.
+        for (_, cluster) in &order[probes..] {
+            if nearest.is_full() {
+                break;
+            }
+            scan.cluster(*cluster, &mut nearest);
+        }
+        nearest.estimates()
+    }
+}
+
+/// One scan's way through clusters: what it reuses from one to the next.
+struct Scan<'a> {
+    index: &'a ClusteredIndex,
+    query: &'a [f32],
+    only: Option<&'a RoaringBitmap>,
+    skipped: Skipped<'a>,
+    weigh: crate::fastscan::Weigh,
+    weighed: [u32; BLOCK],
+    estimate: estimating::Estimate,
+    estimated: [f32; BLOCK],
+    offered: [bool; BLOCK],
+    space: Readying,
+    tables: Tables,
+}
+
+impl<'a> Scan<'a> {
+    fn new(
+        index: &'a ClusteredIndex,
+        query: &'a [f32],
+        only: Option<&'a RoaringBitmap>,
+        skipped: Skipped<'a>,
+    ) -> Self {
+        Self {
+            index,
+            query,
+            only,
+            skipped,
+            weigh: chosen().1,
+            weighed: [0; BLOCK],
+            estimate: estimating::chosen(),
+            estimated: [0.0; BLOCK],
+            offered: [false; BLOCK],
+            space: Readying::default(),
+            tables: Tables::default(),
+        }
+    }
+
+    /// Every allowed row of `cluster` estimated and offered to `nearest`,
+    /// a block at a time, in the cluster's order.
+    fn cluster(&mut self, cluster: usize, nearest: &mut Nearest<'_>) {
+        let index = self.index;
+        let probe = Probe::readied(self.query, index.centroid(cluster), &mut self.space);
+        self.tables.fill(&self.space.levels);
+        let members = &index.clusters[cluster];
+        for block in 0..members.blocks.count() {
+            let rows = &members.rows[block * BLOCK..members.rows.len().min((block + 1) * BLOCK)];
+            let mut any = false;
+            for (offer, row) in self.offered.iter_mut().zip(rows) {
+                *offer = !self.skipped.holds(*row)
+                    && index.unmeasured.binary_search(row).is_err()
+                    && self.only.is_none_or(|only| only.contains(*row));
+                any |= *offer;
+            }
+            if !any {
+                continue;
+            }
+            (self.weigh)(members.blocks.block(block), &self.tables, &mut self.weighed);
+            // The block's estimates at once, then offered in lane order as
+            // before (x86 profile, fix 4).
+            let lanes = rows.len();
+            (self.estimate)(
+                &probe,
+                index.metric,
+                members.blocks.ones_of_block(block),
+                &self.weighed[..lanes],
+                &members.factors[block * BLOCK..][..lanes],
+                &mut self.estimated[..lanes],
+            );
+            for (lane, row) in rows.iter().enumerate() {
+                if self.offered[lane] {
+                    let distance = self.estimated[lane];
+                    if !nearest.turns_away(distance) {
+                        nearest.offer(distance, *row);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A block's estimates at once, in each way this machine can run them,
+/// every way giving the portable way's estimates to the last bit: each
+/// lane the same operations as [`Probe::distance_of`], in the same order,
+/// rounding after each, and no fused multiply-adds.
+mod estimating {
+    use super::{Distance, Factor, Probe};
+
+    /// Estimate each row of a block from its set bits, its weighed sum and
+    /// its factor, into `into`.
+    pub(super) type Estimate = fn(&Probe, Distance, &[u16], &[u32], &[Factor], &mut [f32]);
+
+    /// The portable way, which every other is held to.
+    pub(super) fn portably(
+        probe: &Probe,
+        metric: Distance,
+        ones: &[u16],
+        weighed: &[u32],
+        factors: &[Factor],
+        into: &mut [f32],
+    ) {
+        for (((into, ones), weighed), factor) in into.iter_mut().zip(ones).zip(weighed).zip(factors)
+        {
+            *into = probe.distance_of(metric, u32::from(*ones), *weighed, factor);
+        }
+    }
+
+    /// Every way this machine can run, by name, the portable first.
+    pub(super) fn ways_here() -> Vec<(&'static str, Estimate)> {
+        #[allow(unused_mut)]
+        let mut ways: Vec<(&'static str, Estimate)> = vec![("portable", portably)];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: handed out only where the CPU has just said it has
+            // AVX2, which is all it asks.
+            ways.push((
+                "avx2",
+                |probe, metric, ones, weighed, factors, into| unsafe {
+                    avx2::estimate(probe, metric, ones, weighed, factors, into)
+                },
+            ));
+        }
+        ways
+    }
+
+    /// The way chosen for this machine: the widest. Decided once a
+    /// process.
+    pub(super) fn chosen() -> Estimate {
+        static CHOSEN: std::sync::OnceLock<Estimate> = std::sync::OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            ways_here()
+                .last()
+                .expect("the portable way is always here")
+                .1
+        })
+    }
+
+    /// In AVX2, eight rows at a time; the rows past the last eight as the
+    /// portable way estimates them.
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use std::arch::x86_64::*;
+
+        use super::{portably, Distance, Factor, Probe};
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn estimate(
+            probe: &Probe,
+            metric: Distance,
+            ones: &[u16],
+            weighed: &[u32],
+            factors: &[Factor],
+            into: &mut [f32],
+        ) {
+            let lanes = into
+                .len()
+                .min(ones.len())
+                .min(weighed.len())
+                .min(factors.len());
+            let whole = lanes / 8 * 8;
+            let lower = _mm256_set1_ps(probe.lower);
+            let delta = _mm256_set1_ps(probe.delta);
+            let sum = _mm256_set1_ps(probe.sum);
+            let scale = _mm256_set1_ps(probe.scale);
+            let two = _mm256_set1_ps(2.0);
+            let (mut norm, mut align, mut along) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+            let mut counts = [0i32; 8];
+            for at in (0..whole).step_by(8) {
+                for lane in 0..8 {
+                    let factor = &factors[at + lane];
+                    (norm[lane], align[lane], along[lane]) =
+                        (factor.norm, factor.align, factor.along);
+                    counts[lane] = i32::from(ones[at + lane]);
+                }
+                // SAFETY: each array holds eight values, and `weighed` at
+                // least `at + 8`; nothing asks alignment.
+                let (n, a, l, o, w) = unsafe {
+                    (
+                        _mm256_loadu_ps(norm.as_ptr()),
+                        _mm256_loadu_ps(align.as_ptr()),
+                        _mm256_loadu_ps(along.as_ptr()),
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(counts.as_ptr().cast())),
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(weighed.as_ptr().add(at).cast())),
+                    )
+                };
+                // As `inner_of`: ((2 (lower ones + delta weighed) - sum)
+                // scale) / align.
+                let set = _mm256_add_ps(_mm256_mul_ps(lower, o), _mm256_mul_ps(delta, w));
+                let inner = _mm256_div_ps(
+                    _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(two, set), sum), scale),
+                    a,
+                );
+                // As `distance_of`.
+                let distance = match metric {
+                    Distance::L2 => _mm256_sub_ps(
+                        _mm256_add_ps(_mm256_mul_ps(n, n), _mm256_set1_ps(probe.norm_squared)),
+                        _mm256_mul_ps(_mm256_mul_ps(two, n), inner),
+                    ),
+                    Distance::Dot | Distance::Cosine => _mm256_xor_ps(
+                        _mm256_add_ps(
+                            _mm256_set1_ps(probe.centroid_dot),
+                            _mm256_mul_ps(n, _mm256_add_ps(inner, l)),
+                        ),
+                        _mm256_set1_ps(-0.0),
+                    ),
+                };
+                // SAFETY: `into` holds at least `at + 8`.
+                unsafe { _mm256_storeu_ps(into.as_mut_ptr().add(at), distance) };
+            }
+            portably(
+                probe,
+                metric,
+                &ones[whole..lanes],
+                &weighed[whole..lanes],
+                &factors[whole..lanes],
+                &mut into[whole..lanes],
+            );
+        }
     }
 }
 
@@ -1027,31 +1908,6 @@ mod tests {
         (planes, scalars)
     }
 
-    /// Both ways of counting, called directly on the same words: CI's
-    /// machines all have popcount, so the portable count would otherwise
-    /// never be run there.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn the_portable_count_and_the_popcount_count_agree() {
-        if !std::is_x86_feature_detected!("popcnt") {
-            return;
-        }
-        let mut random = Random(91);
-        for words in [1usize, 7, 12, 16, 32, 48] {
-            for _ in 0..64 {
-                let code: Vec<u64> = (0..words).map(|_| random.next()).collect();
-                let planes: Vec<u64> = (0..words * 4).map(|_| random.next()).collect();
-                // SAFETY: the CPU has just said it has popcount.
-                let fast = unsafe { counted_with_popcount(&code, &planes, words) };
-                assert_eq!(
-                    counted_portably(&code, &planes, words),
-                    fast,
-                    "{words} words"
-                );
-            }
-        }
-    }
-
     proptest::proptest! {
         /// A query is readied for each cluster as it was, to the bit.
         #[test]
@@ -1105,6 +1961,717 @@ mod tests {
                 let fast = probe.inner(&code, &factor);
                 let first = inner_as_first_written(&probe, &code, &factor);
                 proptest::prop_assert_eq!(fast.to_bits(), first.to_bits());
+            }
+        }
+    }
+
+    /// The scan as it was before codes were laid out in blocks: every
+    /// cluster's rows estimated code by code, in the same order. What the
+    /// scan of blocks must equal, estimate for estimate and in order.
+    fn estimates_code_by_code(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && index.unmeasured.binary_search(&row).is_err()
+        };
+        let mut nearest = Nearest::new(count, &in_row_order);
+        let query = index.prepared(query);
+        let words = index.rotation.width / 64;
+        let mut code = vec![0u64; words];
+        let allowed = |row: u32| kept(row) && only.is_none_or(|only| only.contains(row));
+        for (probed, (_, cluster)) in index.order(&query).into_iter().enumerate() {
+            if probed >= index.probes && nearest.is_full() {
+                break;
+            }
+            let probe = Probe::new(&query, index.centroid(cluster));
+            let members = &index.clusters[cluster];
+            for (at, row) in members.rows.iter().enumerate() {
+                if allowed(*row) {
+                    members.blocks.code(at, &mut code);
+                    nearest.offer(
+                        probe.distance(index.metric, &code, &members.factors[at]),
+                        *row,
+                    );
+                }
+            }
+        }
+        nearest.estimates()
+    }
+
+    /// A level is what rounding gave, for every distance a residual can be
+    /// above the lowest: each `f32` from 0 to past 16 near a half step, and
+    /// the edges.
+    #[test]
+    fn a_level_is_the_rounded_distance_as_first_written() {
+        let first = |x: f32| x.round().clamp(0.0, 15.0) as u8;
+        let mut x = 0.0f32;
+        while x < 17.0 {
+            assert_eq!(level_of(x), first(x), "{x}");
+            for near in [
+                x.next_down(),
+                x.next_up(),
+                x + 0.5,
+                (x + 0.5).next_down(),
+                (x + 0.5).next_up(),
+            ] {
+                if near >= 0.0 {
+                    assert_eq!(level_of(near), first(near), "{near}");
+                }
+            }
+            x += 1.0 / 64.0;
+        }
+        for edge in [
+            0.0,
+            f32::MIN_POSITIVE,
+            0.49999997,
+            0.5,
+            14.5,
+            15.0,
+            15.000001,
+            1e9,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            assert_eq!(level_of(edge), first(edge), "{edge}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// A row's place in the index is found as a search of the sorted
+        /// rows finds it, for rows indexed, rows between them, before the
+        /// first and past the last, built or read back, whether the rows lie
+        /// close enough together for a table or not.
+        #[test]
+        fn a_rows_place_is_found_as_by_searching_the_rows(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..900,
+            dimensions in 2usize..40,
+            spread in 1u32..9,
+            first in 0u32..100_000,
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(n, v)| (first + n as u32 * spread, v.as_slice()))
+                .collect();
+            let built = ClusteredIndex::build(Distance::Cosine, &numbered).unwrap();
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            let last = first + (rows as u32 - 1) * spread;
+            for index in [&built, &read] {
+                proptest::prop_assert_eq!(
+                    matches!(index.places, Places::Table { .. }),
+                    u64::from(last - first) < SPREAD * rows as u64
+                );
+                for row in first.saturating_sub(9)..last + 9 {
+                    proptest::prop_assert_eq!(index.position(row), index.rows.binary_search(&row).ok());
+                }
+                proptest::prop_assert_eq!(index.position(u32::MAX), None);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// What a shortlist keeps, as every caller cuts it, does not depend
+        /// on the order rows are offered in: the nearest `count`, those
+        /// alike in row order, whether they come in row order, the reverse
+        /// or shuffled, and however many tie. The scan, the visit and a
+        /// split scan each offer rows in their own order and rely on it.
+        #[test]
+        fn a_shortlists_cut_is_the_same_whatever_order_rows_come_in(
+            seed in 1u64..u64::MAX,
+            rows in 1usize..400,
+            distinct in 1u64..12,
+            count in 1usize..60,
+        ) {
+            let mut noise = Noise(seed);
+            let offered: Vec<(f32, u32)> = (0..rows as u32)
+                .map(|row| (((noise.unit() + 0.5) * distinct as f32).floor(), row))
+                .collect();
+            let mut want = offered.clone();
+            want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            want.truncate(count);
+            let want: Vec<(u32, u32)> = want.iter().map(|(d, row)| (d.to_bits(), *row)).collect();
+            let mut shuffled = offered.clone();
+            for at in (1..shuffled.len()).rev() {
+                let other = ((noise.unit() + 0.5) * (at + 1) as f32) as usize;
+                shuffled.swap(at, other.min(at));
+            }
+            let reversed: Vec<(f32, u32)> = offered.iter().rev().copied().collect();
+            for (how, order) in [("in row order", &offered), ("reversed", &reversed), ("shuffled", &shuffled)] {
+                let mut nearest = Nearest::new(count, &in_row_order);
+                for (distance, row) in order {
+                    nearest.offer(*distance, *row);
+                }
+                proptest::prop_assert_eq!(cut(nearest.estimates(), count), want.clone(), "{}", how);
+            }
+        }
+    }
+
+    /// What finds a row's place costs memory by the rows the index holds,
+    /// not by the highest row: an index of a few thousand rows spread over
+    /// ten million, as one collection's rows lie in a segment of many, takes
+    /// little more than one of the same rows packed together. And what an
+    /// index holds is counted: codes, factors, rows, places and centroids.
+    #[test]
+    fn an_index_costs_memory_by_its_rows_not_by_the_highest_row() {
+        let vectors = grouped(9, 3_000, 16, 12, 0.3);
+        let at = |spread: u32| -> ClusteredIndex {
+            let rows: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * spread, v.as_slice()))
+                .collect();
+            ClusteredIndex::build(Distance::Cosine, &rows).unwrap()
+        };
+        let (packed, spread) = (at(1), at(3_333));
+        assert!(
+            packed.resident() > 3_000 * (16 + 12 + 4),
+            "codes, factors and rows are counted: {}",
+            packed.resident()
+        );
+        assert!(
+            spread.resident() < packed.resident() + 64 * 1024,
+            "{} spread against {} packed",
+            spread.resident(),
+            packed.resident()
+        );
+    }
+
+    /// What a shortlist of `count` says, as every caller reads it: its
+    /// nearest `count` by estimate, those alike in row order.
+    fn cut(mut found: Vec<(f32, u32)>, count: usize) -> Vec<(u32, u32)> {
+        found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        found.truncate(count);
+        found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
+    }
+
+    /// The visit of allowed rows as it was: each estimated from its code.
+    fn visited_code_by_code(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: &RoaringBitmap,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        let kept = |row: u32| {
+            !skipped.get(row as usize).copied().unwrap_or(false)
+                && index.unmeasured.binary_search(&row).is_err()
+        };
+        let mut nearest = Nearest::new(count, &in_row_order);
+        let query = index.prepared(query);
+        let mut code = vec![0u64; index.rotation.width / 64];
+        for row in only.iter().filter(|row| kept(*row)) {
+            let Some(position) = index.position(row) else {
+                continue;
+            };
+            let (cluster, at) = index.at[position];
+            let probe = Probe::new(&query, index.centroid(cluster as usize));
+            let members = &index.clusters[cluster as usize];
+            members.blocks.code(at as usize, &mut code);
+            nearest.offer(
+                probe.distance(index.metric, &code, &members.factors[at as usize]),
+                row,
+            );
+        }
+        nearest.estimates()
+    }
+
+    /// The scan of the clusters a query probes, whatever share of rows is
+    /// allowed.
+    fn scan_only(
+        index: &ClusteredIndex,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+    ) -> Vec<(f32, u32)> {
+        index.scanned(
+            &index.prepared(query),
+            count,
+            only,
+            Skipped::Bytes(skipped),
+            &in_row_order,
+            Probing {
+                probes: index.probes,
+                parts: 1,
+            },
+        )
+    }
+
+    /// Each sample row's nearest rows, the row itself left out, found
+    /// sample by sample over every row as tuning first found them: what the
+    /// one pass over the rows for all samples at once must equal.
+    fn neighbours_sample_by_sample(
+        index: &ClusteredIndex,
+        vectors: &[(u32, &[f32])],
+        samples: &[usize],
+    ) -> Vec<Vec<u32>> {
+        samples
+            .iter()
+            .map(|at| {
+                let (row, query) = vectors[*at];
+                let scorer = Scorer::new(index.metric, query);
+                let mut all: Vec<(f32, u32)> = vectors
+                    .iter()
+                    .filter(|(other, _)| *other != row)
+                    .map(|(other, vector)| (scorer.distance(vector), *other))
+                    .collect();
+                all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                all.truncate(TUNING_NEIGHBOURS);
+                all.into_iter().map(|(_, row)| row).collect()
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// Every way of readying a query for a cluster this machine runs
+        /// gives the portable way's residual, lowest, step and levels to
+        /// the last bit: widths of one to nineteen words, as a rotation's
+        /// width is whole words, values of every size,
+        /// zeros and a lowest or highest of zero, and now and then a value
+        /// not finite.
+        #[test]
+        fn every_way_of_readying_gives_the_portable_way_to_the_last_bit(
+            seed in 1u64..u64::MAX,
+            words in 1usize..20,
+            scale in -40i32..40,
+            odd in 0u8..30,
+        ) {
+            let width = words * 64;
+            let mut noise = Noise(seed);
+            let value = |noise: &mut Noise| match (noise.unit() * 1000.0) as i32 {
+                0 if odd == 0 => f32::NAN,
+                1 if odd == 1 => f32::INFINITY,
+                2 if odd == 2 => f32::NEG_INFINITY,
+                3..=6 => 0.0,
+                7 => -0.0,
+                8 => f32::MIN_POSITIVE / 3.0,
+                _ => (noise.unit() * 2.0 - 1.0) * 2f32.powi(scale),
+            };
+            let query: Vec<f32> = (0..width).map(|_| value(&mut noise)).collect();
+            let mut centroid: Vec<f32> = (0..width).map(|_| value(&mut noise)).collect();
+            if odd == 3 {
+                // Every residual at or above zero, so the lowest is zero.
+                centroid.clone_from(&query);
+                centroid[0] = query[0] + 1.0;
+            }
+            let mut want = Readying::default();
+            let (lower, delta) = readying::portably(&query, &centroid, &mut want);
+            for (name, ready) in readying::ways_here() {
+                let mut got = Readying::default();
+                let (l, d) = ready(&query, &centroid, &mut got);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                proptest::prop_assert_eq!(bits(&got.residual), bits(&want.residual), "{} residual", name);
+                proptest::prop_assert_eq!(l.to_bits(), lower.to_bits(), "{} lowest", name);
+                proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
+                proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// So too where a residual lies exactly half a step between two
+        /// levels, or within a few units in the last place of that, where
+        /// any other rounding than the portable way's, a step multiplied
+        /// by its reciprocal or a half rounded to even, would give another
+        /// level. The step is an odd multiple of a power of two, so its
+        /// reciprocal is not exact, and the lowest and highest residuals
+        /// are set so that the step comes out exact.
+        #[test]
+        fn readying_rounds_as_the_portable_way_at_half_steps(
+            seed in 1u64..u64::MAX,
+            odd in 0u32..64,
+            power in -20i32..20,
+        ) {
+            let step = (2 * odd + 3) as f32 * 2f32.powi(power);
+            let lower = -8.0 * step;
+            let mut noise = Noise(seed);
+            let mut query: Vec<f32> = (0..256)
+                .map(|_| {
+                    let k = (noise.unit() * 15.0) as u32 as f32;
+                    let at = lower + (k + 0.5) * step;
+                    let nudge = (noise.unit() * 7.0) as i32 - 3;
+                    f32::from_bits((at.to_bits() as i32 + nudge) as u32)
+                })
+                .collect();
+            query[0] = lower;
+            query[1] = lower + 15.0 * step;
+            let centroid = vec![0.0f32; query.len()];
+            let mut want = Readying::default();
+            let (lower, delta) = readying::portably(&query, &centroid, &mut want);
+            for (name, ready) in readying::ways_here() {
+                let mut got = Readying::default();
+                let (l, d) = ready(&query, &centroid, &mut got);
+                proptest::prop_assert_eq!(l.to_bits(), lower.to_bits(), "{} lowest", name);
+                proptest::prop_assert_eq!(d.to_bits(), delta.to_bits(), "{} step", name);
+                proptest::prop_assert_eq!(&got.levels, &want.levels, "{} levels", name);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// Every way of estimating a block's rows at once gives what each
+        /// row's estimate is alone to the last bit, or not a number for
+        /// both: for every metric, blocks of one to thirty-two rows, and
+        /// probes and factors of every size, zero, negative zero, and now
+        /// and then not finite. A way that fused a multiply-add, or took
+        /// the sums in another order, would not.
+        #[test]
+        fn every_way_of_estimating_a_block_gives_each_rows_estimate_to_the_last_bit(
+            seed in 1u64..u64::MAX,
+            lanes in 1usize..=32,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            scale in -30i32..30,
+            odd in 0u8..20,
+        ) {
+            let mut noise = Noise(seed);
+            let value = |noise: &mut Noise| match (noise.unit() * 500.0) as i32 {
+                0 if odd == 0 => f32::NAN,
+                1 if odd == 1 => f32::INFINITY,
+                2 => 0.0,
+                3 => -0.0,
+                _ => (noise.unit() * 2.0 - 1.0) * 2f32.powi(scale),
+            };
+            let probe = Probe {
+                planes: Vec::new(),
+                words: 0,
+                lower: value(&mut noise),
+                delta: value(&mut noise).abs(),
+                sum: value(&mut noise),
+                norm_squared: value(&mut noise).abs(),
+                centroid_dot: value(&mut noise),
+                scale: value(&mut noise).abs(),
+            };
+            let ones: Vec<u16> = (0..lanes).map(|_| (noise.unit() * 1025.0) as u16).collect();
+            let weighed: Vec<u32> = (0..lanes).map(|_| (noise.unit() * 15_361.0) as u32).collect();
+            let factors: Vec<Factor> = (0..lanes)
+                .map(|_| Factor {
+                    norm: value(&mut noise).abs(),
+                    align: value(&mut noise),
+                    along: value(&mut noise),
+                })
+                .collect();
+            let want: Vec<f32> = (0..lanes)
+                .map(|lane| probe.distance_of(metric, u32::from(ones[lane]), weighed[lane], &factors[lane]))
+                .collect();
+            for (name, estimate) in estimating::ways_here() {
+                let mut got = vec![0.0f32; lanes];
+                estimate(&probe, metric, &ones, &weighed, &factors, &mut got);
+                for (lane, (g, w)) in got.iter().zip(&want).enumerate() {
+                    proptest::prop_assert!(
+                        g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+                        "{} lane {}: {} against {}", name, lane, g, w
+                    );
+                }
+            }
+        }
+    }
+
+    /// A block is estimated the widest way this machine has.
+    #[test]
+    fn the_way_of_estimating_chosen_is_the_widest_this_machine_has() {
+        let chosen = estimating::chosen() as usize;
+        assert_eq!(chosen, estimating::ways_here().last().unwrap().1 as usize);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(estimating::ways_here().last().unwrap().0, "avx2");
+        }
+    }
+
+    /// A query is readied the widest way this machine has.
+    #[test]
+    fn the_way_of_readying_chosen_is_the_widest_this_machine_has() {
+        let chosen = readying::chosen() as usize;
+        let widest = readying::ways_here().last().unwrap().1 as usize;
+        assert_eq!(chosen, widest);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(readying::ways_here().last().unwrap().0, "avx2");
+        }
+    }
+
+    /// Tuning runs on a pool of one thread of its own, apart from rayon's
+    /// global pool, where flushes and merges build and where it would take
+    /// every core for tens of seconds a segment: it finishes while every
+    /// global thread is held busy (recall note, R2.6 and R9.5).
+    #[test]
+    fn tuning_runs_on_one_thread_of_its_own() {
+        assert_eq!(crate::pool::tuning().current_num_threads(), 1);
+        let vectors = grouped(5, 3_000, 16, 12, 0.3);
+        let index = indexed(Distance::Cosine, &vectors);
+        let numbered: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+            .collect();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+        let (started, busy) = std::sync::mpsc::channel::<()>();
+        for _ in 0..rayon::current_num_threads() {
+            let (held, started) = (held.clone(), started.clone());
+            rayon::spawn(move || {
+                started.send(()).unwrap();
+                let _ = held.lock().unwrap().recv();
+            });
+        }
+        for _ in 0..rayon::current_num_threads() {
+            busy.recv().unwrap();
+        }
+        let samples: Vec<usize> = (0..3_000).step_by(11).collect();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                done.send(
+                    index
+                        .sample_ranks(&numbered, &samples, crate::pool::tuning())
+                        .len(),
+                )
+                .unwrap()
+            });
+            let answer = finished.recv_timeout(std::time::Duration::from_secs(30));
+            for _ in 0..rayon::current_num_threads() {
+                release.send(()).unwrap();
+            }
+            assert_eq!(answer, Ok(samples.len() * TUNING_NEIGHBOURS));
+        });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+        /// An index read back from its file has no curve of its rows, and a
+        /// pass over the rows it indexes gives the very curve its build
+        /// gave: a segment built before curves gets the one it would have.
+        #[test]
+        fn a_rows_pass_over_an_index_read_back_gives_the_curve_its_build_gave(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1200,
+            dimensions in 2usize..40,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let built = indexed(metric, &vectors);
+            let read: ClusteredIndex =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
+            proptest::prop_assert_eq!(read.rows_curve(), None);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// Tuning finds each sample row's nearest rows in one pass over the
+        /// rows for all samples at once, as a pass for each sample finds
+        /// them, ties in row order; and a built index's curve is of their
+        /// clusters' ranks, from its rows, scanning every cluster any of
+        /// them lay in, as the index's own count does.
+        #[test]
+        fn one_pass_finds_every_samples_nearest_rows_and_the_curve_holds_them_all(
+            seed in 1u64..u64::MAX,
+            rows in 30usize..1500,
+            dimensions in 2usize..48,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..4],
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let numbered: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
+                .collect();
+            let samples: Vec<usize> = (0..rows).step_by(7).collect();
+            let found = index.nearest_of_samples(&numbered, &samples, &Stop::new()).unwrap();
+            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
+
+            let curve = index.rows_curve().expect("a built index has a curve of its rows");
+            proptest::prop_assert_eq!(curve.source, crate::curve::Source::Rows);
+            proptest::prop_assert_eq!(curve.clusters as usize, index.clusters.len());
+            proptest::prop_assert_eq!(curve.samples as usize, rows.min(TUNING_QUERIES));
+            proptest::prop_assert_eq!(curve.probes(), index.probes(), "the index scans as its curve says");
+            // Built twice from the same rows, the same curve.
+            proptest::prop_assert_eq!(indexed(metric, &vectors).rows_curve(), Some(curve));
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        /// Probes given, as a segment's curve gives them, scan as an index
+        /// built to scan that many does, clamped to one and to every
+        /// cluster.
+        #[test]
+        fn probes_given_scan_as_an_index_built_with_them(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1200,
+            dimensions in 2usize..64,
+            count in 1usize..200,
+            probes in 0usize..80,
+            share in proptest::option::of(1u32..100),
+        ) {
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                (0..rows).map(|_| noise.vector(dimensions)).collect()
+            };
+            let index = indexed(Distance::Cosine, &vectors);
+            let built = ClusteredIndex {
+                probes: probes.clamp(1, index.clusters.len()),
+                ..index.clone()
+            };
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let mut noise = Noise(seed.rotate_left(9) | 1);
+            for _ in 0..4 {
+                let query = noise.vector(dimensions);
+                let given = index.estimates_split(&query, count, only.as_ref(), &[], &in_row_order, Probing { probes, parts: 1 });
+                let as_built = built.estimates(&query, count, only.as_ref(), &[], &in_row_order);
+                proptest::prop_assert_eq!(cut(given, count), cut(as_built, count));
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        /// A scan split into parts across threads finds what one scan
+        /// finds: the same nearest `count`, to the bit, for any number of
+        /// parts, filtered or not, and when too few rows are allowed in the
+        /// clusters it must probe and it scans on past them.
+        #[test]
+        fn a_scan_split_finds_what_one_scan_finds(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1500,
+            dimensions in 2usize..96,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            count in 1usize..300,
+            share in proptest::option::of(proptest::prop_oneof![1u32..5, 5u32..100]),
+            parts in 2usize..9,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..6],
+        ) {
+            // With copies, rows of one vector tie, across the runs' merge.
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let mut noise = Noise(seed.rotate_left(17) | 1);
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let skipped: Vec<bool> = (0..rows * 2).map(|row| row % 11 == 5).collect();
+            for _ in 0..4 {
+                let query = index.prepared(&noise.vector(dimensions));
+                let one = index.scanned(&query, count, only.as_ref(), Skipped::Bytes(&skipped), &in_row_order, Probing { probes: index.probes, parts: 1 });
+                let split = index.scanned(&query, count, only.as_ref(), Skipped::Bytes(&skipped), &in_row_order, Probing { probes: index.probes, parts });
+                proptest::prop_assert_eq!(cut(split, count), cut(one, count));
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        /// Laying the codes out in blocks changes no estimate: a scan of
+        /// every cluster it probes gives the estimates the code-by-code
+        /// scan gives, to the bit and in the same order, filtered or not,
+        /// with rows skipped or not, for every metric, and with rows of
+        /// one vector tied.
+        #[test]
+        fn the_scan_of_blocks_estimates_as_code_by_code(
+            seed in 1u64..u64::MAX,
+            rows in 40usize..1500,
+            dimensions in 2usize..160,
+            metric in proptest::sample::select(vec![Distance::Cosine, Distance::L2, Distance::Dot]),
+            count in 1usize..300,
+            share in proptest::option::of(1u32..100),
+            skip in proptest::bool::ANY,
+            copies in proptest::prop_oneof![3 => proptest::strategy::Just(1usize), 1 => 2usize..6],
+        ) {
+            // With copies, rows of one vector are estimated alike, so that
+            // ties at the shortlist's cut go through the visit's order of
+            // offers, by cluster, against the code-by-code row order.
+            let vectors: Vec<Vec<f32>> = {
+                let mut noise = Noise(seed);
+                let distinct: Vec<Vec<f32>> =
+                    (0..rows.div_ceil(copies)).map(|_| noise.vector(dimensions)).collect();
+                (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
+            };
+            let index = indexed(metric, &vectors);
+            let mut noise = Noise(seed.rotate_left(17) | 1);
+            // `indexed` numbers the rows 0, 2, 4, ...
+            let only: Option<RoaringBitmap> = share.map(|share| {
+                (0..rows as u32 * 2)
+                    .filter(|row| (row.wrapping_mul(2_654_435_761) >> 7) % 100 < share)
+                    .collect()
+            });
+            let skipped: Vec<bool> = (0..rows * 2)
+                .map(|row| skip && row % 7 == 3)
+                .collect();
+            for _ in 0..4 {
+                let query = noise.vector(dimensions);
+                let got = scan_only(&index, &query, count, only.as_ref(), &skipped);
+                // The same, the rows skipped read from their bits.
+                let bits: Vec<u64> = skipped
+                    .chunks(64)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |word, (at, skip)| word | (u64::from(*skip) << at))
+                    })
+                    .collect();
+                let by_bits = index.scanned(
+                    &index.prepared(&query),
+                    count,
+                    only.as_ref(),
+                    Skipped::Bits(&bits),
+                    &in_row_order,
+                    Probing { probes: index.probes, parts: 1 },
+                );
+                proptest::prop_assert_eq!(&by_bits, &got);
+                let want = estimates_code_by_code(&index, &query, count, only.as_ref(), &skipped);
+                let bits = |found: &[(f32, u32)]| -> Vec<(u32, u32)> {
+                    found.iter().map(|(d, row)| (d.to_bits(), *row)).collect()
+                };
+                proptest::prop_assert_eq!(bits(&got), bits(&want));
+                if let Some(only) = &only {
+                    // Offered by cluster, not in row order: the same
+                    // nearest `count`, as every caller reads them.
+                    let got = index.visited(&index.prepared(&query), count, only, Skipped::Bytes(&skipped), &in_row_order);
+                    let want = visited_code_by_code(&index, &query, count, only, &skipped);
+                    proptest::prop_assert_eq!(cut(got, count), cut(want, count));
+                }
             }
         }
     }
@@ -1257,7 +2824,9 @@ mod tests {
                     continue;
                 }
                 let exact = f64::from(dot(&from, &residual) / norm);
-                let estimated = f64::from(probe.inner(index.code(members, i), &members.factors[i]));
+                let mut code = vec![0u64; members.blocks.words()];
+                members.blocks.code(i, &mut code);
+                let estimated = f64::from(probe.inner(&code, &members.factors[i]));
                 cross += estimated * exact;
                 square += exact * exact;
                 error += (estimated - exact) * (estimated - exact);
@@ -1640,7 +3209,7 @@ mod tests {
             rmp_serde::from_slice::<ClusteredIndex>(&bytes).map(|index| index.len())
         };
         assert_eq!(reread(|_| {}).unwrap(), 1000);
-        let corruptions: [(&str, Corrupt); 11] = [
+        let corruptions: [(&str, Corrupt); 13] = [
             ("no clusters to scan", |wire| wire.probes = 0),
             ("more clusters to scan than there are", |wire| {
                 wire.probes = usize::MAX
@@ -1661,11 +3230,26 @@ mod tests {
             ("a centroid cut short", |wire| {
                 wire.centroids.pop();
             }),
-            ("a code cut short", |wire| {
-                wire.clusters[0].codes.pop();
+            ("codes cut short", |wire| {
+                let blocks = &wire.clusters[0].blocks;
+                let words = blocks.words();
+                let shorter: Vec<u64> = blocks
+                    .codes()
+                    .chunks_exact(words)
+                    .flat_map(|code| code[..words - 1].to_vec())
+                    .collect();
+                wire.clusters[0].blocks = Blocks::new(&shorter, words - 1);
+            }),
+            ("codes that are not whole rows", |wire| {
+                wire.clusters[0].rows.pop();
+                wire.clusters[0].factors.pop();
             }),
             ("a row without factors", |wire| {
                 wire.clusters[0].factors.pop();
+            }),
+            ("a row in two clusters", |wire| {
+                let row = wire.clusters[0].rows[0];
+                wire.clusters[1].rows[0] = row;
             }),
             ("no clusters", |wire| {
                 wire.clusters.clear();

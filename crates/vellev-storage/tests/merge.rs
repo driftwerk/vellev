@@ -977,3 +977,228 @@ async fn a_writer_whose_lease_was_taken_since_cleans_nothing_up() {
     );
     assert_eq!(files(&cluster).await, before);
 }
+
+/// A writer whose merges fold two segments, with two segments of notes
+/// flushed: a merge to be had.
+async fn two_segments(cluster: &Cluster) -> Writer {
+    let writer = cluster.writer().await.merging_with(Merging {
+        fanout: 2,
+        ..Merging::default()
+    });
+    writer
+        .commit(vec![create("notes"), upsert("notes", 1, 1)])
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer.commit(vec![upsert("notes", 2, 2)]).await.unwrap();
+    writer.flush().await.unwrap();
+    writer
+}
+
+/// A merge's commit moves the writer's epoch on; a flush, a commit of
+/// curves and writes do not, as none of them can leave a merge planned
+/// before it describing rows that are not there.
+#[tokio::test]
+async fn a_merge_moves_the_epoch_on_and_flushes_curves_and_writes_do_not() {
+    let cluster = Cluster::new().await;
+    let writer = two_segments(&cluster).await;
+    let at = writer.epoch();
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    writer.commit(vec![delete("notes", 1)]).await.unwrap();
+    writer.flush().await.unwrap();
+    let key = segments_of(&cluster).await[0].key.clone();
+    assert!(
+        writer
+            .commit_curves(vec![(key, curve_for(0))])
+            .await
+            .is_err(),
+        "a curve for no index is refused, and moves nothing"
+    );
+    assert_eq!(writer.epoch(), at, "writes, flushes and curves");
+    assert!(writer.merge().await.unwrap().is_some());
+    assert_eq!(writer.epoch(), at + 1, "a merge");
+}
+
+/// A curve for a collection with no clustered index in the segment, for
+/// the commit above to refuse.
+fn curve_for(collection: u64) -> vellev_storage::format::SegmentCurve {
+    use vellev_storage::curve::{Curve, Source};
+    vellev_storage::format::SegmentCurve {
+        collection: vellev_storage::format::CollectionId(collection),
+        band: 0,
+        curve: Curve::of(Source::Rows, 1, 10, vec![3]).unwrap(),
+    }
+}
+
+/// A merge is committed only at the epoch it was planned at: one planned
+/// at another commits nothing, and leaves the partition as it was for a
+/// merge planned now.
+#[tokio::test]
+async fn a_merge_planned_at_another_epoch_commits_nothing() {
+    let cluster = Cluster::new().await;
+    let writer = two_segments(&cluster).await;
+    let head = cluster.committed().await;
+    let segments = segments_of(&cluster).await;
+    let stale = writer.epoch() + 1;
+    assert_eq!(writer.merge_planned_at(Some(stale)).await.unwrap(), None);
+    assert_eq!(cluster.committed().await.manifest, head.manifest);
+    assert_eq!(segments_of(&cluster).await, segments);
+    assert_eq!(writer.epoch(), stale - 1);
+    assert!(
+        writer.merge().await.unwrap().is_some(),
+        "planned now, it is"
+    );
+    let ids = writer
+        .partition()
+        .read(|state| ids(state.list(&name("notes"), None, None, 10).unwrap()));
+    assert_eq!(
+        ids,
+        [
+            ObjectId(uuid::Uuid::from_u128(1)),
+            ObjectId(uuid::Uuid::from_u128(2))
+        ]
+    );
+}
+
+/// A merge's build runs with no lock a flush needs: a flush made while a
+/// merge waits between its build and its commit goes through at once, and
+/// the merge then commits too, every row where it should be.
+#[tokio::test]
+async fn a_flush_is_never_held_for_a_merge_builds_length() {
+    let cluster = Cluster::new().await;
+    let writer = Arc::new(two_segments(&cluster).await);
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    gate.reached.notified().await;
+    assert!(
+        writer.kept_while_merging() > 0,
+        "its uploads are kept meanwhile"
+    );
+    writer.commit(vec![upsert("notes", 3, 3)]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), writer.flush())
+        .await
+        .expect("the flush is not held for the merge")
+        .unwrap();
+    gate.release.notify_one();
+    assert!(merging.await.unwrap().unwrap().is_some());
+    assert_eq!(writer.kept_while_merging(), 0);
+    let follower = cluster.open().await;
+    for note in 1..=3u8 {
+        assert_eq!(
+            n_of(&follower.partition().read(|s| s.clone()), "notes", note),
+            Some(i64::from(note))
+        );
+    }
+}
+
+/// A restore between a merge's plan and its commit drops the merge, though
+/// it brings back the very segments the merge was planned over: a row dead
+/// when it was planned, and so not in what it built, is live again, and is
+/// found.
+#[tokio::test]
+async fn a_restore_between_a_merges_plan_and_its_commit_drops_it_even_with_the_same_keys() {
+    let cluster = Cluster::new().await;
+    let writer = Arc::new(two_segments(&cluster).await);
+    let committed = cluster.committed().await;
+    let (head, position) = (committed.manifest.unwrap(), committed.log_position);
+    writer.commit(vec![delete("notes", 1)]).await.unwrap();
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    gate.reached.notified().await;
+    writer.restore(Some(&head), position).await.unwrap();
+    let restored = cluster.committed().await;
+    gate.release.notify_one();
+    assert_eq!(
+        merging.await.unwrap().unwrap(),
+        None,
+        "the merge is dropped"
+    );
+    assert_eq!(writer.kept_while_merging(), 0, "and keeps nothing");
+    assert_eq!(cluster.committed().await.manifest, restored.manifest);
+    let both = |s: &State| (n_of(s, "notes", 1), n_of(s, "notes", 2));
+    assert_eq!(writer.partition().read(both), (Some(1), Some(2)));
+    let follower = cluster.open().await;
+    assert_eq!(follower.partition().read(both), (Some(1), Some(2)));
+}
+
+/// Cleaning up while a merge waits between its build and its commit
+/// deletes nothing the merge has uploaded, however short the grace: the
+/// merge then commits, and a fresh copy reads it.
+#[tokio::test]
+async fn cleaning_up_during_a_merge_deletes_nothing_it_has_uploaded() {
+    let cluster = Cluster::new().await;
+    let writer = Arc::new(two_segments(&cluster).await);
+    let gate = writer.hold_merges_before_commit();
+    let merging = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.merge().await }
+    });
+    gate.reached.notified().await;
+    // Flushes moving the base past the merge's position, so that its files
+    // lie below what cleaning up may reach.
+    for note in 3..6u8 {
+        writer
+            .commit(vec![upsert("notes", note, i64::from(note))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    writer.clean(Duration::ZERO).await.unwrap();
+    gate.release.notify_one();
+    assert!(merging.await.unwrap().unwrap().is_some());
+    let follower = cluster.open().await;
+    let read = follower
+        .partition()
+        .read(|s| (1..6u8).map(|n| n_of(s, "notes", n)).collect::<Vec<_>>());
+    assert_eq!(read, (1..6).map(Some).collect::<Vec<_>>());
+}
+
+/// Rows of a merge's run deleted and changed while the merge waits between
+/// its build and its commit are dead and changed after it, with a flush
+/// between and without one, in the writer and in a copy loaded afresh.
+#[tokio::test]
+async fn rows_deleted_and_changed_during_a_merge_stay_so_after_it() {
+    for flushed in [false, true] {
+        let cluster = Cluster::new().await;
+        let writer = Arc::new(two_segments(&cluster).await);
+        let gate = writer.hold_merges_before_commit();
+        let merging = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.merge().await }
+        });
+        gate.reached.notified().await;
+        writer.commit(vec![delete("notes", 1)]).await.unwrap();
+        writer.commit(vec![upsert("notes", 2, 20)]).await.unwrap();
+        if flushed {
+            writer.flush().await.unwrap();
+        }
+        writer.stop_holding_merges();
+        gate.release.notify_one();
+        assert!(
+            merging.await.unwrap().unwrap().is_some(),
+            "flushed {flushed}"
+        );
+        // Read by id, and as a walk over the collection finds them.
+        let both = |s: &State| {
+            let listed = ids(s.list(&name("notes"), None, None, 10).unwrap());
+            (n_of(s, "notes", 1), n_of(s, "notes", 2), listed)
+        };
+        let want = (None, Some(20), vec![id(2)]);
+        assert_eq!(writer.partition().read(both), want, "flushed {flushed}");
+        let fresh = cluster.open().await;
+        assert_eq!(fresh.partition().read(both), want, "flushed {flushed}");
+        // And the writer's segments have the very rows dead a copy loaded
+        // afresh works out from what was committed.
+        assert_eq!(
+            writer.partition().read(State::dead_rows),
+            fresh.partition().read(State::dead_rows),
+            "flushed {flushed}"
+        );
+    }
+}

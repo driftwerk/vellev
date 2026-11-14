@@ -85,6 +85,21 @@ jobs:
       # it depends on, built without debug info, and its timings printed.
       - name: Index tests, optimised
         run: cargo test --release --locked -p vellev-index --lib -- --nocapture
+      # What a merge reckons it holds, held to what a counting allocator
+      # measures over a score of merges, and what a merge's, a flush's and an
+      # open's whole build holds tokenized in chunks, weighed against every
+      # row tokenized at once, up to 200,000 rows: built for debugging they
+      # take far too long, so the rules are left out above and run here.
+      - name: Merge reckoning and tokenizing, optimised
+        run: |
+          cargo test --release --locked -p vellev-storage --test flush_memory -- \
+            --ignored --nocapture --exact \
+            a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent \
+            a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for_it \
+            a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them \
+            | tee reckoning.log
+          # The rules ran, all three: not left out by their names or their ignore.
+          grep -q "test result: ok. 3 passed" reckoning.log
 
   # The benchmark fixture's tools, on tiny hand-made data.
   fixture-scripts:
@@ -97,6 +112,15 @@ jobs:
           python-version: '3.12'
       - run: pip install numpy==2.3.3
       - run: python -W error::ResourceWarning -m unittest discover -s scripts/bench-fixture -p 'test_*.py'
+
+  # The ONNX Runtime the image links: pinned as the locked ort-sys's own,
+  # and fetched, checked and unpacked as the rules say.
+  onnxruntime:
+    name: ONNX Runtime pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/deps/onnxruntime.test.sh
 
   deny:
     name: Licences
@@ -192,7 +216,7 @@ jobs:
   push-image:
     name: Push image
     if: github.event_name == 'push'
-    needs: [fmt, package, publish-script, clippy, test, deny, image, weaviate]
+    needs: [fmt, package, publish-script, clippy, test, onnxruntime, deny, image, weaviate]
     runs-on: ubuntu-latest
     env:
       IMAGE: ${{ vars.IMAGE_REPOSITORY || 'kingsleyh/vellev' }}

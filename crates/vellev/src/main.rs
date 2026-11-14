@@ -31,6 +31,11 @@ struct Serve {
     /// metrics; they are never served on the API's address.
     #[arg(long, env = "VELLEV_METRICS_LISTEN")]
     metrics_listen: Option<SocketAddr>,
+    /// A descriptor a supervisor handed this node its database URL and
+    /// admin keys on, in place of the environment: see
+    /// [`vellev::inherited`].
+    #[arg(long, hide = true)]
+    secrets_fd: Option<i32>,
     #[command(flatten)]
     config: Config,
 }
@@ -324,12 +329,18 @@ async fn main() -> Result<ExitCode> {
             let Serve {
                 listen,
                 metrics_listen,
-                config,
+                secrets_fd,
+                mut config,
             } = *serve;
             tracing_subscriber::fmt().json().init();
+            if let Some(fd) = secrets_fd {
+                vellev::inherited::Inherited::from_descriptor(fd)?.apply(&mut config);
+            }
             let (limits, store) = config.checked()?;
             let trusted = vellev::identity::IdentityKeys::parse(&config.identity_keys)?;
-            let app = App::new(config.keys()?, limits).trusting(trusted);
+            let app = App::new(config.keys()?, limits)
+                .trusting(trusted)
+                .running_on(&GLOBAL);
             let listener = TcpListener::bind(listen).await?;
             tracing::info!(%listen, version = env!("CARGO_PKG_VERSION"), "vellev listening");
             let port = listener.local_addr()?.port();
@@ -644,6 +655,26 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// A supervisor names the pipe it hands the database and keys over on;
+    /// the node then needs neither on its command line or environment. A
+    /// node too old to know the flag refuses it at once.
+    #[test]
+    fn a_node_takes_its_secrets_from_a_named_pipe() {
+        let cli = Cli::try_parse_from([
+            "vellev",
+            "serve",
+            "--store",
+            "memory://",
+            "--secrets-fd",
+            "3",
+        ])
+        .unwrap();
+        let Command::Serve(serve) = cli.command else {
+            panic!("not serve")
+        };
+        assert_eq!(serve.secrets_fd, Some(3));
     }
 
     #[test]

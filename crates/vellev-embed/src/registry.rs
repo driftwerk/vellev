@@ -629,6 +629,15 @@ impl Embedders {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many local models are loaded, or loading, each taking memory
+    /// of its own: none where local models are not built in.
+    pub fn local_models_loaded(&self) -> usize {
+        #[cfg(feature = "local")]
+        return self.room.count();
+        #[cfg(not(feature = "local"))]
+        0
+    }
+
     /// How many models have what their embedders share held.
     pub fn held(&self) -> usize {
         self.models.lock().expect("models lock").held.len()

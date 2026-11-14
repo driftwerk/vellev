@@ -498,6 +498,11 @@ async fn a_restore_into_a_partition_that_never_committed_rests_on_nothing() {
     let restored = restored_from(&target, &writer, &frozen).await.unwrap();
 
     assert_eq!(restored, frozen.at.next().unwrap());
+    // What the partition publishes of itself is what it now holds (delta
+    // review of #165): the segments put back.
+    let partition = writer.partition();
+    assert_eq!(partition.figures(), partition.read(State::figures));
+    assert!(partition.figures().plain + partition.figures().clustered > 0);
     let head = target.committed().await.manifest.unwrap().0;
     let manifest = read_manifest(&*target.blobs, &head).await;
     assert_eq!(manifest.position, restored);
@@ -2215,4 +2220,16 @@ async fn a_restore_of_an_unstored_property_into_format_1_is_refused() {
         before,
         "nothing built is kept"
     );
+}
+
+/// A restore from another store moves the writer's epoch on, as one in
+/// place does.
+#[tokio::test]
+async fn a_restore_from_a_source_moves_the_epoch_on() {
+    let cluster = Cluster::new().await;
+    let writer = lived_in(&cluster).await;
+    let frozen = frozen(&cluster).await;
+    let at = writer.epoch();
+    restored_from(&cluster, &writer, &frozen).await.unwrap();
+    assert_eq!(writer.epoch(), at + 1);
 }

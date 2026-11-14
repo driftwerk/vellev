@@ -42,6 +42,11 @@ enum Fault {
     NeverAnswers,
     /// Each write waits for a permit from [`Store::gate`], then goes right.
     Gated,
+    /// The next write panics, and then they go right again.
+    Panics,
+    /// The next write waits for a permit from [`Store::gate`] and fails,
+    /// and then they go right again.
+    GatedFailsOnce,
 }
 
 /// Object storage whose writes can be made to fail.
@@ -64,6 +69,13 @@ struct Store {
     vectors_written: std::sync::Mutex<Vec<tokio::time::Instant>>,
     /// Permits for [`Fault::Gated`] writes, none to begin with.
     gate: tokio::sync::Semaphore,
+    /// Whether the next write of a file of a merge's panics.
+    merged_panics: AtomicBool,
+    /// How many writes of a segment were asked for, right or wrong: as a
+    /// flush comes to them once its vectors are up.
+    segments_written: AtomicUsize,
+    /// How many listings were asked for: cleaning up lists the tenant.
+    listings: AtomicUsize,
 }
 
 impl Store {
@@ -81,23 +93,34 @@ impl Store {
                 .unwrap()
                 .push(tokio::time::Instant::now());
         }
+        if key.ends_with(".segment") {
+            self.segments_written.fetch_add(1, Ordering::SeqCst);
+        }
         let fault = {
             let mut faulty = self.faulty.lock().unwrap();
             let fault = faulty
                 .filter(|(kind, _)| key.ends_with(&format!(".{kind}")))
                 .map(|(_, fault)| fault);
-            if let Some(Fault::FailsOnce) = fault {
+            if let Some(Fault::FailsOnce | Fault::Panics | Fault::GatedFailsOnce) = fault {
                 *faulty = None;
             }
             fault
         };
+        assert!(
+            !(key.contains("-merged") && self.merged_panics.swap(false, Ordering::SeqCst)),
+            "a merge's write panics, as a test asks"
+        );
+        assert!(
+            !matches!(fault, Some(Fault::Panics)),
+            "a write panics, as a test asks"
+        );
         if let Some(Fault::NeverAnswers) = fault {
             std::future::pending::<()>().await;
         }
-        if let Some(Fault::Gated) = fault {
+        if let Some(Fault::Gated | Fault::GatedFailsOnce) = fault {
             self.gate.acquire().await.expect("gate open").forget();
         }
-        let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated));
+        let failed = fault.is_some_and(|fault| !matches!(fault, Fault::Gated | Fault::Panics));
         if self.failing.load(Ordering::SeqCst) || failed {
             return Err(StorageError::Blob {
                 key: key.into(),
@@ -138,6 +161,7 @@ impl Blobs for Store {
         self.inner.get(key).await
     }
     async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
         if self.unreadable.load(Ordering::SeqCst) {
             return Err(StorageError::Blob {
                 key: prefix.into(),
@@ -180,6 +204,9 @@ impl Cluster {
                 forgotten: std::sync::Mutex::default(),
                 vectors_written: std::sync::Mutex::default(),
                 gate: tokio::sync::Semaphore::new(0),
+                merged_panics: AtomicBool::new(false),
+                segments_written: AtomicUsize::new(0),
+                listings: AtomicUsize::new(0),
             }),
         }
     }
@@ -1116,6 +1143,785 @@ async fn a_restore_that_fails_as_it_commits_has_the_tenant_opened_afresh() {
     assert_eq!(reopened.read(count), 3);
 }
 
+/// `acme` on `node` that may be restored for an hour back, with a merge a
+/// request makes held where it builds: the tenant, the receipt of its first
+/// write, and the request.
+async fn merged_by_a_request(
+    node: &Node,
+    acme: &TenantId,
+) -> (
+    Arc<Tenant>,
+    vellev_storage::Receipt,
+    tokio::task::JoinHandle<()>,
+) {
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    let kept = restorable(node, acme).await;
+    let opened = node.tenant(acme).await.unwrap();
+    for n in 3..7 {
+        opened.write(vec![note(n, "owl", None)]).await.unwrap();
+        opened.flush().await.unwrap();
+    }
+    let request = tokio::spawn({
+        let opened = opened.clone();
+        async move {
+            // Whatever it answers once the merge is stopped: it answers.
+            let _ = opened.compact(Duration::from_secs(60 * 60)).await;
+        }
+    });
+    let begun = async {
+        while builds.held() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), begun)
+        .await
+        .expect("the request's merge came to build");
+    (opened, kept, request)
+}
+
+/// Let a merge held by [`merged_by_a_request`] end.
+async fn ended(node: &Node, request: tokio::task::JoinHandle<()>) {
+    node.merge_builds().hold(None);
+    tokio::time::timeout(Duration::from_secs(30), request)
+        .await
+        .expect("the request ended")
+        .unwrap();
+}
+
+const LEASE_LOST: vellev_node::MergesStopped = vellev_node::MergesStopped {
+    let_go: 0,
+    lease: 1,
+    drop: 0,
+    shutdown: 0,
+};
+
+/// A write that fails closes the writer, and the hold goes with it, as the
+/// write learns: a merge under way is stopped, and counted as a lease lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_by_a_write_that_closed_the_writer_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let (opened, _, request) = merged_by_a_request(&node, &tenant("acme")).await;
+    cluster.store.fault(Some(("log", Fault::Fails)));
+    assert!(opened.write(vec![note(7, "owl", None)]).await.is_err());
+    cluster.store.fault(None);
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A restore that fails as it commits closes the writer, and the hold goes
+/// with it as the restore's task ends: the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_by_a_restore_that_closed_the_writer_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let (_opened, kept, request) = merged_by_a_request(&node, &acme).await;
+    cluster.store.fault(Some(("manifest", Fault::Fails)));
+    assert!(node
+        .restore(&acme, Point::Position(kept.position), RequestId::generate())
+        .await
+        .is_err());
+    cluster.store.fault(None);
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A hold run out, with renewals failing but not refused, is lost only as
+/// the tenant is next asked for: the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_as_a_tenant_whose_hold_ran_out_is_asked_for_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_millis(500);
+    let node = node_leasing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    let (_opened, _, request) = merged_by_a_request(&node, &acme).await;
+    coordinator.failing.store(true, Ordering::SeqCst);
+    tokio::time::sleep(lease * 2).await;
+    assert_eq!(node.merges().stopped, Default::default(), "lost by itself");
+    let _ = node.tenant(&acme).await;
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    ended(&node, request).await;
+}
+
+/// A writer stuck in a commit is given up as the hold is next renewed: the
+/// same, with no failure for anything else to learn of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_stopped_as_a_stuck_writer_is_given_up_is_counted_as_the_lease() {
+    let cluster = Cluster::new();
+    // How long a commit may be held comes of the store's bounds.
+    let node = cluster.node_from(Settings {
+        lease: Duration::from_millis(600),
+        transfers: Transfers {
+            request_within: Duration::from_millis(100),
+            ..Transfers::default()
+        },
+        ..cluster.settings()
+    });
+    let (opened, _, request) = merged_by_a_request(&node, &tenant("acme")).await;
+    cluster.store.fault(Some(("log", Fault::NeverAnswers)));
+    let stuck = tokio::spawn(async move { opened.write(vec![note(7, "owl", None)]).await });
+    let given_up = async {
+        while node.merges().stopped == Default::default() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(120), given_up)
+        .await
+        .expect("the stuck writer was given up");
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    cluster.store.fault(None);
+    ended(&node, request).await;
+    stuck.abort();
+}
+
+/// A node on `coordinator`, leasing for `lease`, flushing at ten rows, with
+/// a failed flush put off for a hundredth of a second.
+fn node_flushing(cluster: &Cluster, coordinator: Arc<Unrenewing>, lease: Duration) -> Node {
+    Node::new(
+        coordinator,
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            flush_rows: 10,
+            flush_backoff: Duration::from_millis(10),
+            ..cluster.settings()
+        },
+    )
+}
+
+/// Ten notes, numbered from `from`: a flush's worth on [`node_flushing`].
+fn ten_notes(from: u64) -> Vec<Mutation> {
+    (from..from + 10).map(|n| note(n, "owl", None)).collect()
+}
+
+/// As [`ten_notes`], with vectors: their flush writes a vectors file, and
+/// then its segment.
+fn ten_with_vectors(from: u64) -> Vec<Mutation> {
+    (from..from + 10)
+        .map(|n| note(n, "owl", Some(vec![n as f32, 1.0])))
+        .collect()
+}
+
+/// A hold that lapses, as renewals go unanswered for longer than the lease,
+/// is not a hold lost: renewing goes on, and once one is answered the tenant
+/// is held again, and is the one requests are handed. Its maintenance is
+/// still there for it: what a write asked for during the lapse is done, and
+/// so is what is asked for after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_hold_lapsed_and_was_renewed_goes_on_being_looked_after() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    // Long enough that once held again, no stall of a loaded machine lets
+    // the hold run out before the rule has looked.
+    let lease = Duration::from_secs(3);
+    let node = node_flushing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    // Asks for a flush, which finds the hold lapsed: no work is done on a
+    // hold that may be lost, as much as none is forgotten.
+    held.write(ten_notes(0)).await.unwrap();
+    tokio::time::sleep(lease / 2).await;
+    assert_eq!(held.read(State::unflushed), 10, "flushed through the lapse");
+
+    coordinator.failing.store(false, Ordering::SeqCst);
+    let flushed = async {
+        while tokio::time::Instant::now() >= held.held_until() || held.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), flushed)
+        .await
+        .expect("what a write asked for during the lapse was done after it");
+    assert!(
+        Arc::ptr_eq(&held, &node.tenant(&acme).await.unwrap()),
+        "opened afresh: the rule is of a tenant kept"
+    );
+    held.write(ten_notes(10)).await.unwrap();
+    let flushed = async {
+        while held.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), flushed)
+        .await
+        .expect("what is asked for after the lapse is done");
+}
+
+/// Wait until the hold on `held`, unrenewed, has run out.
+async fn until_lapsed(held: &Tenant) {
+    let lapsed = async {
+        while tokio::time::Instant::now() < held.held_until() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), lapsed)
+        .await
+        .expect("the hold lapsed");
+}
+
+/// A lapse may end the other way: another node has taken the tenant, and the
+/// next renewal is refused. The hold is lost then, and no round ever ran on
+/// it, though a write asked for a flush all through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapse_that_ends_in_a_refusal_loses_the_hold_with_no_round_run_on_it() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(1);
+    let node = node_flushing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
+    held.write(ten_notes(0)).await.unwrap();
+    // Time for what was asked to be done, were it to be. With the tenant
+    // taken over at once, any flush would be refused, and show nothing.
+    tokio::time::sleep(lease / 2).await;
+    cluster.clock.advance(lease * 2);
+    cluster.node().tenant(&acme).await.unwrap();
+    coordinator.failing.store(false, Ordering::SeqCst);
+    // Asking for the tenant would lose the hold itself, and show nothing:
+    // that renewing has stopped asking is what says it was refused.
+    let renewals = || coordinator.lease_renewals.load(Ordering::SeqCst);
+    let refused = async {
+        let mut asked = renewals();
+        loop {
+            tokio::time::sleep(lease).await;
+            if renewals() == asked {
+                return;
+            }
+            asked = renewals();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), refused)
+        .await
+        .expect("renewing went on, refused");
+    assert_eq!(
+        coordinator.history_forgotten.load(Ordering::SeqCst),
+        rounds,
+        "a round ran on a hold that was lapsed, and then lost"
+    );
+    assert_eq!(held.read(State::unflushed), 10, "flushed on a lost hold");
+    assert_eq!(node.tenants_given_up(), 0, "nothing panicked");
+}
+
+/// `work`, on a runtime of its own with time paused, given a minute of real
+/// time. Paused time moves only while the runtime has nothing to do, so a
+/// task that spins holds it still, and `work` never ends.
+fn ends_unless_something_spins<F>(work: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let (ended, ends) = std::sync::mpsc::channel();
+    let running = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(work());
+        ended.send(()).unwrap();
+    });
+    match ends.recv_timeout(Duration::from_secs(60)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a task spun, and time stood still")
+        }
+        // Ended without a word: what it failed on is the failure.
+        Ok(()) | Err(_) => {
+            if let Err(failed) = running.join() {
+                std::panic::resume_unwind(failed);
+            }
+        }
+    }
+}
+
+/// Through a lapse, a task that waits for its hold looks at it as often as
+/// it is renewed, not all the time, even with a failed flush whose backoff
+/// is long past, which on its own would have it wake at once.
+#[test]
+fn a_hold_lapsed_with_a_failed_flush_due_keeps_nothing_busy() {
+    ends_unless_something_spins(|| async {
+        let cluster = Cluster::new();
+        let coordinator = Arc::new(Unrenewing::slow(
+            cluster.coordinator.clone(),
+            Duration::ZERO,
+        ));
+        let lease = Duration::from_millis(600);
+        let node = node_flushing(&cluster, coordinator.clone(), lease);
+        let acme = tenant("acme");
+        node.create_tenant(&acme).await.unwrap();
+        let held = node.tenant(&acme).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        cluster.store.fault(Some(("segment", Fault::Fails)));
+        held.write(ten_notes(0)).await.unwrap();
+        coordinator.failing.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        cluster.store.fault(None);
+        coordinator.failing.store(false, Ordering::SeqCst);
+        tokio::time::sleep(lease * 2).await;
+        assert_eq!(held.read(State::unflushed), 0, "flushed after the lapse");
+    });
+}
+
+/// A flush can panic: an upload that panics is raised again where the flush
+/// waits for it. Its task is gone with it, and a tenant that lived on would
+/// never be flushed again, with nothing to say so:
+/// so the tenant is given up, and opened afresh for the next caller, as one
+/// whose writer closed. Its rows are in the log, and flushed there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_flush_panicked_is_given_up() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let node = node_flushing(&cluster, coordinator, LEASE);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("segment", Fault::Panics)));
+    held.write(ten_notes(0)).await.unwrap();
+    let given_up = async {
+        while Arc::ptr_eq(&held, &node.tenant(&acme).await.unwrap()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), given_up)
+        .await
+        .expect("a tenant whose flush panicked lived on");
+    assert_eq!(node.tenants_given_up(), 1, "given up with nothing to show");
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 10, "its rows were lost");
+    opened.write(ten_notes(10)).await.unwrap();
+    let flushed = async {
+        while opened.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), flushed)
+        .await
+        .expect("flushed by the tenant opened afresh");
+}
+
+/// A round of maintenance can panic too, on its own task: a merge's upload
+/// that panics is raised again where the merge waits for it. That task has
+/// its own hold on the tenant's fate: the tenant is given up, and counted
+/// once, its flush task with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_merge_panicked_is_given_up() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let node = node_flushing(&cluster, coordinator, LEASE);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.merged_panics.store(true, Ordering::SeqCst);
+    for flush in 0..4 {
+        held.write(ten_notes(flush * 10)).await.unwrap();
+        let flushed = async {
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), flushed)
+            .await
+            .expect("the tenant was flushed");
+    }
+    let given_up = async {
+        while Arc::ptr_eq(&held, &node.tenant(&acme).await.unwrap()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), given_up)
+        .await
+        .expect("a tenant whose merge panicked lived on");
+    assert!(
+        !cluster.store.merged_panics.load(Ordering::SeqCst),
+        "no merge's write panicked: the rule is of a merge that did"
+    );
+    assert_eq!(node.tenants_given_up(), 1, "given up with nothing to show");
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 40, "its rows were lost");
+}
+
+/// A flush that lands during a lapse asks for a round, and a round is no more
+/// to be run on a hold that may be lost than a flush begun: it comes once
+/// the hold is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_landing_in_a_lapse_has_its_round_after_it() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(3);
+    let node = node_flushing(&cluster, coordinator.clone(), lease);
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    held.write(ten_with_vectors(0)).await.unwrap();
+    let began = async {
+        while cluster.store.vectors_written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), began)
+        .await
+        .expect("the flush began");
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let flushed = async {
+        while held.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), flushed)
+        .await
+        .expect("the flush landed");
+    tokio::time::sleep(lease / 2).await;
+    assert_eq!(
+        coordinator.history_forgotten.load(Ordering::SeqCst),
+        rounds,
+        "a round ran through the lapse"
+    );
+    coordinator.failing.store(false, Ordering::SeqCst);
+    let followed = async {
+        while coordinator.history_forgotten.load(Ordering::SeqCst) == rounds {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), followed)
+        .await
+        .expect("no round followed the flush once the hold was back");
+    assert_eq!(node.tenants_given_up(), 0, "nothing panicked");
+}
+
+/// What a round does beside its merges is under #174's rule as a round is:
+/// nothing on a hold that may be lost. A clean falling due in a lapse waits
+/// for the hold to come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_clean_beside_a_merge_runs_through_a_lapse() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let lease = Duration::from_secs(2);
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            lease,
+            flush_rows: 10,
+            clean_at_least_every: Duration::from_secs(1),
+            ..cluster.settings()
+        },
+    );
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilLetGo));
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let wrote = async {
+        for flush in 0..4 {
+            held.write(ten_notes(flush * 10)).await.unwrap();
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        while builds.held() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wrote)
+        .await
+        .expect("the tenant's merge never came to build");
+    coordinator.failing.store(true, Ordering::SeqCst);
+    until_lapsed(&held).await;
+    let listed = cluster.store.listings.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        cluster.store.listings.load(Ordering::SeqCst),
+        listed,
+        "a clean ran through a lapse"
+    );
+    coordinator.failing.store(false, Ordering::SeqCst);
+    let cleaned = async {
+        while cluster.store.listings.load(Ordering::SeqCst) == listed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), cleaned)
+        .await
+        .expect("no clean came once the hold was back");
+    builds.hold(None);
+}
+
+/// A tenant with ten notes, a flush's worth on [`node_flushing`], and its
+/// flush held part way, its vectors going up and its segment not yet.
+async fn a_flush_held_part_way(cluster: &Cluster, node: &Node, tenant: &TenantId) -> Arc<Tenant> {
+    node.create_tenant(tenant).await.unwrap();
+    let held = node.tenant(tenant).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    held.write(ten_with_vectors(0)).await.unwrap();
+    let began = async {
+        while cluster.store.vectors_written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), began)
+        .await
+        .expect("the flush began");
+    held
+}
+
+/// The flush held by [`a_flush_held_part_way`] let go: nothing more of it
+/// goes up, as the hold ended it.
+async fn no_flush_goes_on(cluster: &Cluster) {
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cluster.store.segments_written.load(Ordering::SeqCst),
+        0,
+        "a flush went on past the hold"
+    );
+}
+
+/// M5-R4: dropping a tenant ends its flush, wherever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_dropped_flushes_no_more() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    let acme = tenant("acme");
+    let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    let dropped = tokio::time::timeout(Duration::from_secs(10), node.drop_tenant(&acme));
+    assert!(dropped.await.expect("the drop never ended").unwrap());
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: a hold lost ends its tenant's flush, wherever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_whose_lease_was_lost_flushes_no_more() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::slow(
+        cluster.coordinator.clone(),
+        Duration::ZERO,
+    ));
+    let node = node_flushing(&cluster, coordinator, Duration::from_secs(1));
+    let acme = tenant("acme");
+    let held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    let other = cluster.node();
+    let dropped = tokio::time::timeout(Duration::from_secs(10), other.drop_tenant(&acme));
+    assert!(dropped.await.expect("the drop never ended").unwrap());
+    let lost = async {
+        while held.write(vec![note(99, "owl", None)]).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), lost)
+        .await
+        .expect("the hold was never lost");
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: shutting down ends a flush under way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_shut_down_flushes_no_more() {
+    let cluster = Cluster::new();
+    let node = cluster.node_with(10);
+    let acme = tenant("acme");
+    let _held = a_flush_held_part_way(&cluster, &node, &acme).await;
+    tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+        .await
+        .expect("the shutdown never ended");
+    no_flush_goes_on(&cluster).await;
+}
+
+/// M5-R4: a tenant is let go between rounds, so no flush of its is under way;
+/// but its flush task may come to one as it goes, a failed flush being tried
+/// again behind the flush before letting go. Should that fail too, the rows
+/// are left for the next opener, and the flush behind it, which holds no
+/// tenant, must not go on: no flush runs after the hold is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_let_go_flushes_no_more() {
+    let cluster = Cluster::new();
+    let idle = Duration::from_millis(300);
+    let backoff = Duration::from_secs(3);
+    let node = cluster.node_from(Settings {
+        flush_rows: 10,
+        flush_backoff: backoff,
+        tenant_idle: idle,
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    cluster.store.fault(Some(("vectors", Fault::Fails)));
+    held.write(ten_with_vectors(0)).await.unwrap();
+    let failed = async {
+        while node.flushing().failed == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), failed)
+        .await
+        .expect("the flush failed");
+    let retried_at = tokio::time::Instant::now() + backoff;
+    let asked = cluster.store.vectors_written.lock().unwrap().len();
+    cluster
+        .store
+        .fault(Some(("vectors", Fault::GatedFailsOnce)));
+    drop(held);
+    tokio::time::sleep(idle + Duration::from_millis(100)).await;
+    let segments = cluster.store.segments_written.load(Ordering::SeqCst);
+    let letting_go = async {
+        while cluster.store.vectors_written.lock().unwrap().len() == asked {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Its flush task's next try comes, and waits behind this flush.
+        tokio::time::sleep_until(retried_at + Duration::from_millis(300)).await;
+        cluster.store.gate.add_permits(1);
+    };
+    let swept = async { tokio::join!(node.sweep_now(), letting_go) };
+    tokio::time::timeout(Duration::from_secs(20), swept)
+        .await
+        .expect("the tenant was let go");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(node.resident(), 0, "not let go");
+    assert_eq!(
+        cluster.store.segments_written.load(Ordering::SeqCst),
+        segments,
+        "a flush went on past the hold"
+    );
+    let opened = node.tenant(&acme).await.unwrap();
+    assert_eq!(opened.read(count), 10, "its rows were lost");
+}
+
+/// A flush under way keeps its tenant, as a round does: a sweep takes out
+/// only a tenant between rounds, and letting go of one mid-flush would wait
+/// for it with no bound (node memory note, M7b).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_is_kept_while_its_flush_is_under_way() {
+    let cluster = Cluster::new();
+    let idle = Duration::from_millis(200);
+    let node = cluster.node_from(Settings {
+        flush_rows: 10,
+        tenant_idle: idle,
+        ..cluster.settings()
+    });
+    let acme = tenant("acme");
+    drop(a_flush_held_part_way(&cluster, &node, &acme).await);
+    tokio::time::sleep(idle + Duration::from_millis(100)).await;
+    // The census is taken as a sweep begins: a second one finds what the
+    // first let go. One let go mid-flush would wait for that flush, which
+    // waits for this rule.
+    let swept = async {
+        node.sweep_now().await;
+        node.sweep_now().await;
+    };
+    tokio::time::timeout(Duration::from_secs(5), swept)
+        .await
+        .expect("a sweep waited for a flush under way: let go mid-flush");
+    assert_eq!(node.census().holding.writers, 1, "let go mid-flush");
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    // Bounded with the rest, as a sweep may wait for a flush.
+    let let_go = async {
+        while node.resident() > 0 {
+            node.sweep_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), let_go)
+        .await
+        .expect("the tenant was never let go once its flush ended");
+    assert_eq!(cluster.store.segments_written.load(Ordering::SeqCst), 1);
+}
+
+/// L5: a flush that failed leaves its backoff set, and maintenance, which
+/// tries again as soon as that lets it, waits for it. With too few rows for
+/// it to flush, as after a flush a request asked for, it never tries: its
+/// wait would be over for good from its next round on, and round would
+/// follow round with nothing between them.
+#[test]
+fn a_flush_failed_with_too_few_rows_to_try_again_keeps_nothing_busy() {
+    ends_unless_something_spins(|| async {
+        let cluster = Cluster::new();
+        let coordinator = Arc::new(Unrenewing::slow(
+            cluster.coordinator.clone(),
+            Duration::ZERO,
+        ));
+        let node = node_flushing(&cluster, coordinator.clone(), LEASE);
+        let acme = tenant("acme");
+        node.create_tenant(&acme).await.unwrap();
+        let held = node.tenant(&acme).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+            .await
+            .unwrap();
+        cluster.store.fault(Some(("segment", Fault::Fails)));
+        assert!(held.flush().await.is_err());
+        cluster.store.fault(None);
+        // Rounds a minute apart, as the node's settings have them.
+        tokio::time::sleep(Duration::from_secs(5 * 60 + 1)).await;
+        let rounds = coordinator.history_forgotten.load(Ordering::SeqCst);
+        assert!(rounds <= 6, "{rounds} rounds in five minutes");
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_tenant_is_held_while_its_node_lives_and_passes_to_another_when_it_dies() {
     let cluster = Cluster::new();
@@ -1223,6 +2029,9 @@ struct Unrenewing {
     failing_forgets: AtomicBool,
     /// How many times forgetting it was asked for.
     forgets: AtomicUsize,
+    /// How many times forgetting a tenant's old commits was asked for: once
+    /// a round of its maintenance.
+    history_forgotten: AtomicUsize,
     /// How many commits land with their answers lost.
     lose_answers: AtomicUsize,
     /// How many renewals of leases were asked for.
@@ -1314,6 +2123,7 @@ impl Unrenewing {
         Self {
             inner,
             failing: AtomicBool::new(false),
+            history_forgotten: AtomicUsize::new(0),
             slowly: Duration::ZERO,
             losing_claim: AtomicBool::new(false),
             claims_slowly: Duration::ZERO,
@@ -1656,6 +2466,7 @@ impl Coordinator for Unrenewing {
         key: &PartitionKey,
         window: Duration,
     ) -> Result<u64, CoordinatorError> {
+        self.history_forgotten.fetch_add(1, Ordering::SeqCst);
         self.inner.forget_history(key, window).await
     }
 
@@ -4130,6 +4941,60 @@ fn a_grace_below_fifteen_minutes_or_three_requests_to_the_store_is_refused() {
     let refused = refusal(both.check());
     assert!(refused.contains("a grace of 0ns"), "{refused}");
     assert!(!refused.contains("backup claim"), "{refused}");
+}
+
+/// A merge pool too small to give each build a thread could build nothing
+/// on some slot, and a negative nice would ask for a priority above the
+/// process's, which the image's user may not take and which a merge never
+/// needs; a nice past 19 is lower than any there is (merge note, §9.2).
+/// All are refused by the settings' check, saying why, not left to panic
+/// as the node starts, and what the bench asks is the same.
+#[test]
+fn a_merge_pool_that_cannot_run_is_refused() {
+    use vellev_node::MergePool;
+    use vellev_storage::MERGE_BUILDS;
+    let pooled = |merge_pool| {
+        Settings {
+            merge_pool,
+            ..Settings::new(NodeId::generate("node"))
+        }
+        .check()
+    };
+    let refusal = |checked: Result<(), NodeError>| match checked {
+        Err(NodeError::Settings(problem)) => problem,
+        other => panic!("not refused for its settings: {other:?}"),
+    };
+    pooled(MergePool::Global).unwrap();
+    for (threads, nice) in [(MERGE_BUILDS, 0), (MERGE_BUILDS, 19), (16, 5), (16, 10)] {
+        pooled(MergePool::Own { threads, nice }).unwrap();
+    }
+    for threads in 0..MERGE_BUILDS {
+        let refused = refusal(pooled(MergePool::Own { threads, nice: 0 }));
+        assert!(refused.contains(&format!("{threads} threads")), "{refused}");
+        assert!(
+            refused.contains(&format!("{MERGE_BUILDS} builds")),
+            "{refused}"
+        );
+    }
+    for nice in [-1, -20] {
+        let refused = refusal(pooled(MergePool::Own { threads: 16, nice }));
+        assert!(refused.contains(&format!("a nice of {nice}")), "{refused}");
+        assert!(refused.contains("above the process's"), "{refused}");
+    }
+    let refused = refusal(pooled(MergePool::Own {
+        threads: 16,
+        nice: 20,
+    }));
+    assert!(refused.contains("a nice of 20"), "{refused}");
+    assert!(refused.contains("past 19"), "{refused}");
+    assert!(!refused.contains("above"), "{refused}");
+    // The count a node starts with decides, whatever derived it.
+    let one_build = MergePool::Own {
+        threads: 1,
+        nice: 0,
+    };
+    assert_eq!(one_build.problem(1), None);
+    assert!(one_build.problem(2).is_some());
 }
 
 #[test]
@@ -8652,7 +9517,17 @@ async fn writes_are_refused_while_four_flushes_of_rows_wait_and_taken_once_one_g
         40,
         "nothing taken past the backlog"
     );
-    assert!(node.flushing().failed >= 1);
+    // The flush that failed is counted by the tenant's maintenance, on a
+    // task of its own: once it has been tried, not by the time the backlog
+    // refuses a write, which a busy machine can reach first.
+    let counted = std::time::Instant::now() + Duration::from_secs(10);
+    while node.flushing().failed == 0 {
+        assert!(
+            std::time::Instant::now() < counted,
+            "no failed flush counted within 10 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(node.flushing().unflushed_rows, 40);
     assert!(node.flushing().unflushed_bytes > 0);
 

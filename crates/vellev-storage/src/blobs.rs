@@ -274,6 +274,13 @@ pub(crate) fn named_as_checkpoint(key: &str) -> bool {
     key.ends_with(".manifest")
 }
 
+/// Whether `key` names a segment file a merge wrote, `-merged` as
+/// [`Layout::nonced`] marks it, rather than a flush or a restore.
+pub(crate) fn merged_segment(key: &str) -> bool {
+    key.strip_suffix(".segment")
+        .is_some_and(|stem| stem.ends_with("-merged"))
+}
+
 /// Where a partition's files live.
 #[derive(Debug, Clone, Copy)]
 pub struct Layout<'a>(pub &'a PartitionKey);
@@ -568,6 +575,9 @@ pub struct Disk {
     moved: Arc<AtomicU64>,
     /// How many turns are had now, and how often that has changed.
     loads: Arc<Loads>,
+    /// How long each piece a step tells of takes at the least: none but
+    /// for tests (see [`Self::each_piece_taking`]).
+    piece_takes: Duration,
 }
 
 /// How many turns at a large file are had on a disk, and how many times
@@ -680,11 +690,14 @@ const LOADING_STILL_BEYOND: Duration = Duration::from_secs(30);
 /// and with it how far everything reading or writing large files on its
 /// disk has.
 #[derive(Debug, Clone, Default)]
-pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>);
+pub struct Progress(Arc<AtomicU64>, Arc<AtomicU64>, Duration);
 
 impl Progress {
     /// Tell of `bytes` more done.
     pub fn made(&self, bytes: usize) {
+        if !self.2.is_zero() {
+            std::thread::sleep(self.2);
+        }
         self.0.fetch_add(bytes as u64, Ordering::Relaxed);
         self.1.fetch_add(1, Ordering::Relaxed);
     }
@@ -733,8 +746,30 @@ impl Disk {
             still_for: Duration::ZERO,
             moved: Arc::default(),
             loads: Arc::default(),
+            piece_takes: Duration::ZERO,
         }
         .fetching(&Transfers::default())
+    }
+
+    /// As this disk, each piece a step run on its own thread, such as the
+    /// check of a vectors file, tells of taking at least `taking`,
+    /// slept on that thread before it is told of: a disk slower than any
+    /// machine's cache of a file just written, for tests that need a step
+    /// to be given up at its bound whatever the machine. It blocks the
+    /// disk's thread, never an async one. Not for use.
+    #[doc(hidden)]
+    pub fn each_piece_taking(self, taking: Duration) -> Self {
+        Self {
+            piece_takes: taking,
+            ..self
+        }
+    }
+
+    /// How many steps are on this disk's threads now, waited for or given
+    /// up and running on. For tests.
+    #[doc(hidden)]
+    pub fn steps_under_way(&self) -> usize {
+        self.threads.most - self.threads.free.available_permits()
     }
 
     /// As this disk, with files fetched to it from a store as `transfers`
@@ -893,7 +928,7 @@ impl Disk {
 
     /// Word of how far a step with a turn at a large file has got.
     pub(crate) fn progress(&self) -> Progress {
-        Progress(Arc::default(), self.moved.clone())
+        Progress(Arc::default(), self.moved.clone(), Duration::ZERO)
     }
 
     /// How many whole large files this disk reads or writes at once.
@@ -916,7 +951,9 @@ impl Disk {
         let within = self.within(piece);
         let thread = self.thread(within).await?;
         let (threads, number) = (self.threads.clone(), thread.step);
-        let progress = self.progress();
+        // Only a step on the disk's own thread is slowed by the test hook,
+        // never one told of from an async task.
+        let progress = Progress(Arc::default(), self.moved.clone(), self.piece_takes);
         let (done, mut waited) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("vellev-disk".into())
@@ -948,20 +985,18 @@ impl Disk {
             let (had, shifts) = self.loads.now();
             let (beside, most) = (had.max(1), self.turns as u64);
             pace.owe(owing, shifts, beside, most, least);
-            match stepped {
-                Ok(stepped) => return stepped.map_err(std::io::Error::other)?,
-                Err(_) if progress.so_far() == seen => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("local disk got no further within {within:?}"),
-                    ))
-                }
+            let ended = match stepped {
+                Ok(stepped) => stepped.map_err(std::io::Error::other).and_then(|done| done),
+                Err(_) if progress.so_far() == seen => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("local disk got no further within {within:?}"),
+                )),
                 Err(_) if pace.behind(progress.so_far()) => {
                     let slowest = least / beside;
-                    return Err(std::io::Error::new(
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("local disk is slower than {slowest} bytes a second"),
-                    ));
+                    ))
                 }
                 Err(_) => {
                     seen = progress.so_far();
@@ -969,8 +1004,10 @@ impl Disk {
                     if let Some(due) = due.get_mut(&number) {
                         *due = tokio::time::Instant::now() + within;
                     }
+                    continue;
                 }
-            }
+            };
+            return ended;
         }
     }
 
@@ -1057,12 +1094,38 @@ impl ObjectBlobs {
         Self { aborts, ..self }
     }
 
+    /// Start an upload in parts under `path`, on a task of its own: one
+    /// whose caller stops waiting before the store answers is aborted once
+    /// the store does, never left begun with no parts and nothing to abort
+    /// it.
+    async fn started(&self, key: &str, path: &ObjectPath) -> Result<Box<dyn MultipartUpload>> {
+        let within = self.transfers.request_within;
+        let (store, path, named) = (self.store.clone(), path.clone(), key.to_string());
+        let mut starting = Starting {
+            start: Some(tokio::spawn(async move {
+                bounded(&named, within, store.put_multipart(&path)).await
+            })),
+            within,
+            aborts: self.aborts.clone(),
+        };
+        let started = starting.start.as_mut().expect("just begun").await;
+        starting.start = None;
+        match started {
+            Ok(started) => started,
+            Err(failed) => match failed.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                // Cancelled, as the runtime shuts down.
+                Err(failed) => Err(StorageError::Background(failed.to_string())),
+            },
+        }
+    }
+
     /// Upload `bytes` under `key` in parts, each its own request, and abort
     /// the upload if any of it fails or it is dropped unfinished.
     async fn put_in_parts(&self, key: &str, path: &ObjectPath, bytes: Bytes) -> Result<()> {
         let within = self.transfers.request_within;
         let mut upload = Unfinished {
-            upload: Some(bounded(key, within, self.store.put_multipart(path)).await?),
+            upload: Some(self.started(key, path).await?),
             within,
             aborts: self.aborts.clone(),
         };
@@ -1241,7 +1304,8 @@ impl Reading {
     }
 }
 
-/// The aborts of uploads dropped unfinished that are on their way: each is
+/// The aborts of uploads dropped unfinished that are on their way, and the
+/// deletes of files a build given up uploaded: each is
 /// sent on a task of its own, which nothing waits for, and a process that
 /// exits at once may never send it, leaving the upload's parts in the
 /// store, where no listing shows them. A process that stops waits for
@@ -1293,7 +1357,7 @@ impl Aborts {
     }
 
     /// One more on its way, until what this gives is dropped.
-    fn begun(&self) -> Aborting {
+    pub(crate) fn begun(&self) -> Aborting {
         self.0.pending.fetch_add(1, Ordering::SeqCst);
         Aborting(self.clone())
     }
@@ -1301,7 +1365,7 @@ impl Aborts {
 
 /// An abort on its way, counted in its [`Aborts`] until this is dropped:
 /// once it is answered or given up, or the task that sends it goes.
-struct Aborting(Aborts);
+pub(crate) struct Aborting(Aborts);
 
 impl Drop for Aborting {
     fn drop(&mut self) {
@@ -1333,6 +1397,32 @@ impl Unfinished {
             }
         }
         self.upload = None;
+    }
+}
+
+/// An upload in parts being started, aborted once the store answers if
+/// whoever started it stopped waiting first.
+struct Starting {
+    start: Option<tokio::task::JoinHandle<Result<Box<dyn MultipartUpload>>>>,
+    within: Duration,
+    aborts: Aborts,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let (Some(start), Ok(runtime)) = (self.start.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let (within, aborting) = (self.within, self.aborts.begun());
+        runtime.spawn(async move {
+            let _aborting = aborting;
+            if let Ok(Ok(mut upload)) = start.await {
+                if let Err(error) = bounded("an upload", within, upload.abort()).await {
+                    tracing::warn!(%error, "an upload started for nobody could not be aborted");
+                }
+            }
+        });
     }
 }
 
@@ -1495,8 +1585,7 @@ impl Blobs for ObjectBlobs {
                 while holding + came.len() > part {
                     held.push(came.split_to(part - holding));
                     if upload.upload.is_none() {
-                        let started = bounded(key, within, self.store.put_multipart(&path));
-                        upload.upload = Some(started.await?);
+                        upload.upload = Some(self.started(key, &path).await?);
                     }
                     if sent == MOST_PARTS {
                         return Err(too_many());
@@ -2136,6 +2225,7 @@ impl Blobs for CachedBlobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use object_store::memory::InMemory;
 
     #[test]

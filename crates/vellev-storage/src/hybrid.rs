@@ -58,6 +58,8 @@ pub struct Hybrid<'a> {
     /// as a one-bit segment does, besides its first [`crate::CODE_FROM`]
     /// rows, which are scored exactly.
     pub oversample: usize,
+    /// As [`crate::Query::split`], for the vector search.
+    pub split: usize,
 }
 
 impl<'a> Hybrid<'a> {
@@ -72,6 +74,7 @@ impl<'a> Hybrid<'a> {
             candidates: DEFAULT_CANDIDATES,
             filter: None,
             oversample: DEFAULT_OVERSAMPLE,
+            split: 1,
         }
     }
 }
@@ -141,6 +144,7 @@ impl State {
                     limit: candidates,
                     filter: query.filter,
                     oversample: query.oversample,
+                    split: query.split,
                 },
                 query
                     .limit

@@ -17,38 +17,25 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use vellev_core::{Distance, SQUARED_LENGTH_UNDER};
 
+use crate::pool::{CallersPool, Passes};
 use crate::rotation::{Random, Rotation};
+use crate::stop::{Stage, Stop, Stopped};
 
 const LANES: usize = 16;
 
 /// The dot product, accumulated in independent lanes so that it compiles to
-/// wide vector instructions without any being named.
+/// wide vector instructions without any being named; on x86-64 with AVX2,
+/// in those instructions, to the same result bit for bit (see [`f32s`]).
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    lanes(a, b, |x, y| x * y)
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
+    (f32s::chosen().dot)(a, b)
 }
 
 pub fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
-    lanes(a, b, |x, y| (x - y) * (x - y))
-}
-
-#[inline]
-fn lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
-    let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
-    let tail: f32 = a_chunks
-        .remainder()
-        .iter()
-        .zip(b_chunks.remainder())
-        .map(|(x, y)| term(*x, *y))
-        .sum();
-    let sums = a_chunks
-        .zip(b_chunks)
-        .fold([0.0f32; LANES], |mut sums, (x, y)| {
-            for lane in 0..LANES {
-                sums[lane] += term(x[lane], y[lane]);
-            }
-            sums
-        });
-    sums.iter().sum::<f32>() + tail
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
+    (f32s::chosen().squared_l2)(a, b)
 }
 
 /// The dot product of `a` and `b` together with `b`'s squared length, in one
@@ -58,25 +45,188 @@ fn lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
 /// times slower, so a squared length to set beside these must be taken
 /// from here too.
 fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
-    let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
-    let tail = a_chunks
-        .remainder()
-        .iter()
-        .zip(b_chunks.remainder())
-        .fold((0.0, 0.0), |(dot, norm), (x, y)| {
-            (dot + x * y, norm + y * y)
-        });
-    let sums = a_chunks
-        .zip(b_chunks)
-        .fold([(0.0f32, 0.0f32); LANES], |mut sums, (x, y)| {
-            for lane in 0..LANES {
-                sums[lane].0 += x[lane] * y[lane];
-                sums[lane].1 += y[lane] * y[lane];
+    // Of other lengths the ways would pair other elements in the tail.
+    debug_assert_eq!(a.len(), b.len());
+    (f32s::chosen().dot_and_norm)(a, b)
+}
+
+/// The sums over `f32` vectors every distance is made of, in each way this
+/// machine can run them, every way giving the portable way's result to the
+/// last bit: each lane multiplies, then adds, rounding after each as the
+/// portable lanes do, and the lanes and the tail are summed in the same
+/// order. Fused multiply-adds round once instead, and so are not used.
+pub(crate) mod f32s {
+    use super::LANES;
+
+    /// A way of making the three sums.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Way {
+        /// What the rules call it.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub name: &'static str,
+        pub dot: fn(&[f32], &[f32]) -> f32,
+        pub squared_l2: fn(&[f32], &[f32]) -> f32,
+        pub dot_and_norm: fn(&[f32], &[f32]) -> (f32, f32),
+    }
+
+    /// The portable way, which every other is held to.
+    pub(crate) const PORTABLE: Way = Way {
+        name: "portable",
+        dot: |a, b| lanes(a, b, |x, y| x * y),
+        squared_l2: |a, b| lanes(a, b, |x, y| (x - y) * (x - y)),
+        dot_and_norm: dot_and_norm_portably,
+    };
+
+    /// Every way this machine can run, the portable first.
+    pub(crate) fn ways_here() -> Vec<Way> {
+        #[allow(unused_mut)]
+        let mut ways = vec![PORTABLE];
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            ways.push(Way {
+                name: "avx2",
+                // SAFETY: handed out only where the CPU has just said it
+                // has AVX2, which is all these ask.
+                dot: |a, b| unsafe { avx2::dot(a, b) },
+                squared_l2: |a, b| unsafe { avx2::squared_l2(a, b) },
+                dot_and_norm: |a, b| unsafe { avx2::dot_and_norm(a, b) },
+            });
+        }
+        ways
+    }
+
+    /// The way chosen for this machine: the last, so the widest, of
+    /// [`ways_here`]. Decided once a process. On aarch64 the portable
+    /// way already compiles to NEON, which every aarch64 CPU has.
+    pub(crate) fn chosen() -> &'static Way {
+        static CHOSEN: std::sync::OnceLock<Way> = std::sync::OnceLock::new();
+        CHOSEN.get_or_init(|| *ways_here().last().expect("the portable way is always here"))
+    }
+
+    #[inline]
+    fn lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
+        let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+        let tail: f32 = a_chunks
+            .remainder()
+            .iter()
+            .zip(b_chunks.remainder())
+            .map(|(x, y)| term(*x, *y))
+            .sum();
+        let sums = a_chunks
+            .zip(b_chunks)
+            .fold([0.0f32; LANES], |mut sums, (x, y)| {
+                for lane in 0..LANES {
+                    sums[lane] += term(x[lane], y[lane]);
+                }
+                sums
+            });
+        sums.iter().sum::<f32>() + tail
+    }
+
+    fn dot_and_norm_portably(a: &[f32], b: &[f32]) -> (f32, f32) {
+        let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+        let tail = a_chunks
+            .remainder()
+            .iter()
+            .zip(b_chunks.remainder())
+            .fold((0.0, 0.0), |(dot, norm), (x, y)| {
+                (dot + x * y, norm + y * y)
+            });
+        let sums = a_chunks
+            .zip(b_chunks)
+            .fold([(0.0f32, 0.0f32); LANES], |mut sums, (x, y)| {
+                for lane in 0..LANES {
+                    sums[lane].0 += x[lane] * y[lane];
+                    sums[lane].1 += y[lane] * y[lane];
+                }
+                sums
+            });
+        sums.iter()
+            .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
+    }
+
+    /// The sums in AVX2: the sixteen lanes as two registers of eight, each
+    /// lane a product (or a difference squared) added after rounding, the
+    /// lanes then summed in order in `f32`, and the tail as the portable
+    /// way sums it.
+    #[cfg(target_arch = "x86_64")]
+    mod avx2 {
+        use std::arch::x86_64::*;
+
+        use super::LANES;
+
+        /// The sixteen lanes of `term` over the whole chunks of `a` and `b`,
+        /// and how many values they took.
+        #[target_feature(enable = "avx2")]
+        fn lanes(
+            a: &[f32],
+            b: &[f32],
+            term: impl Fn(__m256, __m256) -> __m256,
+        ) -> ([f32; LANES], usize) {
+            let whole = a.len().min(b.len()) / LANES * LANES;
+            let (mut low, mut high) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            let mut at = 0;
+            while at < whole {
+                // SAFETY: `at + 16 <= whole`, which neither slice is shorter
+                // than; the loads ask no alignment.
+                let (xl, xh, yl, yh) = unsafe {
+                    (
+                        _mm256_loadu_ps(a.as_ptr().add(at)),
+                        _mm256_loadu_ps(a.as_ptr().add(at + 8)),
+                        _mm256_loadu_ps(b.as_ptr().add(at)),
+                        _mm256_loadu_ps(b.as_ptr().add(at + 8)),
+                    )
+                };
+                low = _mm256_add_ps(low, term(xl, yl));
+                high = _mm256_add_ps(high, term(xh, yh));
+                at += LANES;
             }
-            sums
-        });
-    sums.iter()
-        .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
+            let mut sums = [0.0f32; LANES];
+            // SAFETY: `sums` holds sixteen values; the stores ask no
+            // alignment.
+            unsafe {
+                _mm256_storeu_ps(sums.as_mut_ptr(), low);
+                _mm256_storeu_ps(sums.as_mut_ptr().add(8), high);
+            }
+            (sums, whole)
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn dot(a: &[f32], b: &[f32]) -> f32 {
+            let (sums, whole) = lanes(a, b, |x, y| _mm256_mul_ps(x, y));
+            let tail: f32 = a[whole..].iter().zip(&b[whole..]).map(|(x, y)| x * y).sum();
+            sums.iter().sum::<f32>() + tail
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
+            let (sums, whole) = lanes(a, b, |x, y| {
+                let d = _mm256_sub_ps(x, y);
+                _mm256_mul_ps(d, d)
+            });
+            let tail: f32 = a[whole..]
+                .iter()
+                .zip(&b[whole..])
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum();
+            sums.iter().sum::<f32>() + tail
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub(super) fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
+            let (dots, whole) = lanes(a, b, |x, y| _mm256_mul_ps(x, y));
+            let (norms, _) = lanes(a, b, |_, y| _mm256_mul_ps(y, y));
+            let tail = a[whole..]
+                .iter()
+                .zip(&b[whole..])
+                .fold((0.0f32, 0.0f32), |(dot, norm), (x, y)| {
+                    (dot + x * y, norm + y * y)
+                });
+            dots.iter()
+                .zip(&norms)
+                .fold(tail, |(dot, norm), (d, n)| (dot + d, norm + n))
+        }
+    }
 }
 
 /// As [`dot_and_norm`], in `f64`, where neither sum can overflow or vanish
@@ -275,7 +425,7 @@ pub(crate) fn as_far_from_every_vector(metric: Distance, query: &[f32]) -> bool 
 }
 
 /// How to order two rows whose estimated distances are equal.
-pub type Ties<'a> = &'a dyn Fn(u32, u32) -> Ordering;
+pub type Ties<'a> = &'a (dyn Fn(u32, u32) -> Ordering + Sync);
 
 /// Rows of equal estimate in row order, for a caller with no order of its
 /// own.
@@ -434,9 +584,6 @@ pub struct Coded {
 }
 
 impl BinaryIndex {
-    /// Index `vectors`, which must be in ascending row order and all of one
-    /// length, for search under `metric`. Returns `None` when there is
-    /// nothing to index.
     /// As [`Self::build`], with codes taken about `centre` (in the rotated
     /// space) rather than about the vectors' own median.
     pub fn build_about(
@@ -444,7 +591,23 @@ impl BinaryIndex {
         vectors: &[(u32, &[f32])],
         centre: Vec<f32>,
     ) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        match Self::build_about_stopping(metric, vectors, centre, &Stop::new(), CallersPool) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
+    }
+
+    /// As [`Self::build_about`], asking `stop` as each row is coded.
+    fn build_about_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        centre: Vec<f32>,
+        stop: &Stop,
+        on: impl Passes,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         debug_assert!(vectors.windows(2).all(|pair| pair[0].0 < pair[1].0));
         debug_assert!(vectors.iter().all(|(_, vector)| vector.len() == dimensions));
         let mut index = Self::empty(metric, dimensions, centre);
@@ -454,27 +617,35 @@ impl BinaryIndex {
         let words = index.words;
         let mut codes = vec![0u64; measured.len() * words];
         let (rotation, centre) = (&index.rotation, &index.centre);
-        let factors = codes
-            .par_chunks_mut(words)
-            .zip(measured.par_iter())
-            .map(|(code, (_, vector))| {
-                let vector = rotation.apply(&normalised(metric, vector));
-                code.iter_mut()
-                    .zip(encode(centre, &vector))
-                    .for_each(|(slot, word)| *slot = word);
-                let (squared, along) = residual(centre, &vector);
-                let term = match metric {
-                    Distance::L2 => squared,
-                    Distance::Dot | Distance::Cosine => -along,
-                };
-                (term, squared.sqrt())
-            })
-            .collect();
+        let factors = on.pass("coding", || {
+            codes
+                .par_chunks_mut(words)
+                .zip(measured.par_iter())
+                .map(|(code, (_, vector))| {
+                    // Given up: the rows left are not coded, and the build
+                    // gives up once the pass is through them.
+                    if stop.check(Stage::Coding).is_err() {
+                        return (0.0, 0.0);
+                    }
+                    let vector = rotation.apply(&normalised(metric, vector));
+                    code.iter_mut()
+                        .zip(encode(centre, &vector))
+                        .for_each(|(slot, word)| *slot = word);
+                    let (squared, along) = residual(centre, &vector);
+                    let term = match metric {
+                        Distance::L2 => squared,
+                        Distance::Dot | Distance::Cosine => -along,
+                    };
+                    (term, squared.sqrt())
+                })
+                .collect()
+        });
+        stop.passed()?;
         index.rows = measured.iter().map(|(row, _)| *row).collect();
         index.codes = codes;
         index.factors = factors;
         index.unmeasured = unmeasured.iter().map(|(row, _)| *row).collect();
-        Some(index)
+        Ok(Some(index))
     }
 
     /// An index of `dimensions`, of no rows yet, its codes taken about
@@ -499,21 +670,58 @@ impl BinaryIndex {
         }
     }
 
+    /// Index `vectors`, which must be in ascending row order and all of one
+    /// length, for search under `metric`. Returns `None` when there is
+    /// nothing to index.
     pub fn build(metric: Distance, vectors: &[(u32, &[f32])]) -> Option<Self> {
-        let dimensions = vectors.first()?.1.len();
+        match Self::build_stopping(metric, vectors, &Stop::new()) {
+            Ok(index) => index,
+            Err(Stopped) => unreachable!("a build without a stop is never stopped"),
+        }
+    }
+
+    /// As [`Self::build`], giving up with [`Stopped`] once `stop` is
+    /// stopped: asked as each row is sampled for the centre, and as each
+    /// is coded.
+    pub fn build_stopping(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+    ) -> Result<Option<Self>, Stopped> {
+        Self::build_stopping_on(metric, vectors, stop, CallersPool)
+    }
+
+    /// As [`Self::build_stopping`], each parallel pass where `on` says:
+    /// sampling for the centre, and coding. The rest stays on the calling
+    /// thread.
+    pub fn build_stopping_on(
+        metric: Distance,
+        vectors: &[(u32, &[f32])],
+        stop: &Stop,
+        on: impl Passes,
+    ) -> Result<Option<Self>, Stopped> {
+        let Some(dimensions) = vectors.first().map(|(_, vector)| vector.len()) else {
+            return Ok(None);
+        };
         let rotation = Rotation::new(dimensions, ROTATION_SEED);
         let measured: Vec<&[f32]> = vectors
             .iter()
             .map(|(_, vector)| *vector)
             .filter(|vector| measurable(metric, vector))
             .collect();
-        let sampled: Vec<Vec<f32>> = Random(ROTATION_SEED)
-            .sample(measured.len(), CENTRE_SAMPLE)
-            .into_par_iter()
-            .map(|at| rotation.apply(&normalised(metric, measured[at])))
-            .collect();
+        let sample = Random(ROTATION_SEED).sample(measured.len(), CENTRE_SAMPLE);
+        let sampled: Vec<Vec<f32>> = on.pass("sampling", || {
+            sample
+                .into_par_iter()
+                .map(|at| match stop.check(Stage::Sampling) {
+                    Ok(()) => rotation.apply(&normalised(metric, measured[at])),
+                    Err(Stopped) => Vec::new(),
+                })
+                .collect()
+        });
+        stop.passed()?;
         let centre = median(rotation.width, sampled.iter().map(Vec::as_slice));
-        Self::build_about(metric, vectors, centre)
+        Self::build_about_stopping(metric, vectors, centre, stop, on)
     }
 
     /// An index of no rows yet, its codes to be taken about the mean of
@@ -667,12 +875,38 @@ pub(crate) fn short_enough(squared: f64) -> bool {
     squared < f64::from(MEASURABLE_UNDER)
 }
 
+/// The rows a search skips, by row: a byte a row, or a bit a row (row `n`
+/// bit `n % 64` of word `n / 64`), as the caller keeps them. A row past
+/// either is not skipped.
+#[derive(Debug, Clone, Copy)]
+pub enum Skipped<'a> {
+    Bytes(&'a [bool]),
+    Bits(&'a [u64]),
+}
+
+impl Skipped<'_> {
+    /// Whether `row` is skipped.
+    #[inline(always)]
+    pub fn holds(&self, row: u32) -> bool {
+        match self {
+            Self::Bytes(bytes) => bytes.get(row as usize).copied().unwrap_or(false),
+            Self::Bits(bits) => bits
+                .get(row as usize / 64)
+                .is_some_and(|word| word >> (row % 64) & 1 == 1),
+        }
+    }
+}
+
 /// Of `rows`, in ascending order, those in `only` when it is given and not
 /// flagged in `skipped`.
-pub(crate) fn allowed(rows: &[u32], only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+pub(crate) fn allowed(
+    rows: &[u32],
+    only: Option<&RoaringBitmap>,
+    skipped: Skipped<'_>,
+) -> Vec<u32> {
     rows.iter()
         .copied()
-        .filter(|row| !skipped.get(*row as usize).copied().unwrap_or(false))
+        .filter(|row| !skipped.holds(*row))
         .filter(|row| only.is_none_or(|only| only.contains(*row)))
         .collect()
 }
@@ -738,21 +972,25 @@ fn encode<'a>(centre: &'a [f32], vector: &'a [f32]) -> impl Iterator<Item = u64>
         })
 }
 
-impl VectorIndex for BinaryIndex {
-    fn len(&self) -> usize {
-        self.rows.len() + self.unmeasured.len()
-    }
-
-    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+impl BinaryIndex {
+    /// As [`VectorIndex::unmeasured`], the rows skipped given as either
+    /// kind of [`Skipped`].
+    pub fn unmeasured_skipping(
+        &self,
+        only: Option<&RoaringBitmap>,
+        skipped: Skipped<'_>,
+    ) -> Vec<u32> {
         allowed(&self.unmeasured, only, skipped)
     }
 
-    fn estimates(
+    /// As [`VectorIndex::estimates`], the rows skipped given as either kind
+    /// of [`Skipped`].
+    pub fn estimates_skipping(
         &self,
         query: &[f32],
         count: usize,
         only: Option<&RoaringBitmap>,
-        skipped: &[bool],
+        skipped: Skipped<'_>,
         ties: Ties<'_>,
     ) -> Vec<(f32, u32)> {
         if count == 0 || query.len() != self.dimensions {
@@ -768,7 +1006,7 @@ impl VectorIndex for BinaryIndex {
                 Distance::L2 => 2.0,
                 Distance::Dot | Distance::Cosine => 1.0,
             };
-        let kept = |row: u32| !skipped.get(row as usize).copied().unwrap_or(false);
+        let kept = |row: u32| !skipped.holds(row);
         let estimated = |position: usize| {
             let estimate = match as_far_from_every_row {
                 true => 0.0,
@@ -800,6 +1038,27 @@ impl VectorIndex for BinaryIndex {
         };
         nearest(&mut estimates, count, |a, b| ties(*a, *b));
         estimates
+    }
+}
+
+impl VectorIndex for BinaryIndex {
+    fn len(&self) -> usize {
+        self.rows.len() + self.unmeasured.len()
+    }
+
+    fn unmeasured(&self, only: Option<&RoaringBitmap>, skipped: &[bool]) -> Vec<u32> {
+        self.unmeasured_skipping(only, Skipped::Bytes(skipped))
+    }
+
+    fn estimates(
+        &self,
+        query: &[f32],
+        count: usize,
+        only: Option<&RoaringBitmap>,
+        skipped: &[bool],
+        ties: Ties<'_>,
+    ) -> Vec<(f32, u32)> {
+        self.estimates_skipping(query, count, only, Skipped::Bytes(skipped), ties)
     }
 }
 
@@ -1501,5 +1760,70 @@ mod tests {
             "only coded rows are ranked"
         );
         assert_eq!(ranked.len(), 976);
+    }
+
+    /// The same sum to the last bit, or both not a number.
+    fn same(a: f32, b: f32) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(400))]
+        /// Every way of making the `f32` sums this machine runs gives the
+        /// portable way's result to the last bit: any length, whole chunks
+        /// or not, and values of every size, from those that vanish to
+        /// those that overflow, and now and then one that is not finite. A
+        /// way that fused its multiply-adds, or summed its lanes in another
+        /// order, would not.
+        #[test]
+        fn every_f32_way_gives_the_portable_sums_to_the_last_bit(
+            seed in 1u64..u64::MAX,
+            len in 0usize..1100,
+            scale in -40i32..40,
+            odd in 0u8..20,
+        ) {
+            let mut noise = seed;
+            let mut next = move || {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                noise
+            };
+            let value = |next: &mut dyn FnMut() -> u64| {
+                let unit = (next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+                match next() % 997 {
+                    0 if odd == 0 => f32::NAN,
+                    1 if odd == 1 => f32::INFINITY,
+                    2 => 0.0,
+                    3 => -0.0,
+                    4 => f32::MIN_POSITIVE / 3.0,
+                    _ => unit * 2f32.powi(scale),
+                }
+            };
+            let a: Vec<f32> = (0..len).map(|_| value(&mut next)).collect();
+            let b: Vec<f32> = (0..len).map(|_| value(&mut next)).collect();
+            let portable = f32s::PORTABLE;
+            for way in f32s::ways_here() {
+                proptest::prop_assert!(same((way.dot)(&a, &b), (portable.dot)(&a, &b)), "{} dot", way.name);
+                proptest::prop_assert!(
+                    same((way.squared_l2)(&a, &b), (portable.squared_l2)(&a, &b)),
+                    "{} squared_l2", way.name
+                );
+                let (d, n) = (way.dot_and_norm)(&a, &b);
+                let (pd, pn) = (portable.dot_and_norm)(&a, &b);
+                proptest::prop_assert!(same(d, pd) && same(n, pn), "{} dot_and_norm", way.name);
+            }
+        }
+    }
+
+    /// The `f32` sums are made the widest way this machine has.
+    #[test]
+    fn the_f32_way_chosen_is_the_widest_this_machine_has() {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            assert_eq!(f32s::chosen().name, "avx2");
+            return;
+        }
+        assert_eq!(f32s::chosen().name, "portable");
     }
 }

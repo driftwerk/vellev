@@ -4306,6 +4306,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "vellev-api",
+ "vellev-bench",
  "vellev-client",
  "vellev-core",
  "vellev-embed",
@@ -4404,6 +4405,7 @@ name = "vellev-index"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "libc",
  "proptest",
  "rayon",
  "rmp-serde",

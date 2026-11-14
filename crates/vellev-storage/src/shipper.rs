@@ -255,6 +255,9 @@ pub struct Shipper {
     /// The run whose backup store this shipper has found nothing past the
     /// committed position in, by its incarnation and base.
     checked: Arc<Mutex<Option<(Incarnation, LogPosition)>>>,
+    /// The most a link with its frame inline may be: see
+    /// [`Self::inlining_at_most`].
+    inline_most: usize,
 }
 
 impl Shipper {
@@ -276,6 +279,20 @@ impl Shipper {
             lineage,
             cluster,
             checked: Arc::new(Mutex::new(None)),
+            inline_most: link::INLINE_MOST,
+        }
+    }
+
+    /// As this shipper, its links' frames inline up to `bytes` with their
+    /// header, and spilled beside them past that. The threshold is at most
+    /// [`link::INLINE_MOST`] and what the backup store creates, so this can
+    /// only lower the default, never raise it; it is apart from what the
+    /// store creates, which bounds a link's header too. Only tests set it
+    /// today, to make frames spill in a store that creates far more.
+    pub fn inlining_at_most(self, bytes: usize) -> Self {
+        Self {
+            inline_most: bytes,
+            ..self
         }
     }
 
@@ -595,10 +612,12 @@ impl Shipper {
                 let unsummed = Sum("0".repeat(64));
                 let shape = declared.map(|size| {
                     let unsummed = header(unsummed, size, Vec::new(), Body::Inline);
-                    link::shape(&unsummed, self.backup.creates_at_most())
+                    link::shape(&unsummed, self.backup.creates_at_most(), self.inline_most)
                 });
                 match shape {
-                    Some(Err(unlinkable)) => return Ok(Err(not_linkable(position, unlinkable))),
+                    Some(Err(unlinkable)) => {
+                        return Ok(Err(not_linkable(position, unlinkable, "")))
+                    }
                     Some(Ok(Body::Spilled)) => {
                         let expected = Expected {
                             key: key.clone(),
@@ -663,17 +682,37 @@ impl Shipper {
             Stored::Manifest(manifest) if manifest.position == position => Some(manifest),
             Stored::Manifest(_) => return not_the_rows,
         };
+        // A checkpoint whose header cannot fit what the store creates even
+        // with its files' sizes at their smallest is not linked, and none
+        // of its files is copied for nothing: its run stalls here.
+        let keys = manifest.map(checkpoint_files).unwrap_or_default();
+        let least = keys.iter().map(|key| Needed {
+            key: key.to_string(),
+            size: 0,
+            sum: Sum("0".repeat(64)),
+        });
+        let least = header(
+            Sum::of(&frame),
+            frame.len() as u64,
+            least.collect(),
+            Body::Inline,
+        );
+        if let Err(unlinkable) =
+            link::shape(&least, self.backup.creates_at_most(), self.inline_most)
+        {
+            return Ok(Err(not_linkable(position, unlinkable, "at least ")));
+        }
         let mut files = Vec::new();
-        for file in manifest.map(checkpoint_files).unwrap_or_default() {
+        for file in keys {
             match self.copy(timeline, file).await? {
                 Ok(needed) => files.push(needed),
                 Err(stall) => return Ok(Err(stall)),
             }
         }
         let mut header = header(Sum::of(&frame), frame.len() as u64, files, Body::Inline);
-        header.body = match link::shape(&header, self.backup.creates_at_most()) {
+        header.body = match link::shape(&header, self.backup.creates_at_most(), self.inline_most) {
             Ok(body) => body,
-            Err(unlinkable) => return Ok(Err(not_linkable(position, unlinkable))),
+            Err(unlinkable) => return Ok(Err(not_linkable(position, unlinkable, ""))),
         };
         let made = Made::of(&header);
         let inline = match header.body {
@@ -1034,14 +1073,16 @@ fn follows(found: &Found, position: LogPosition, last: Option<&Made>) -> bool {
     found.position == position && made_on
 }
 
-/// The stall of a link the backup store cannot take.
-fn not_linkable(position: LogPosition, unlinkable: Unlinkable) -> Stall {
+/// The stall of a link the backup store cannot take, its header's size
+/// said to be `bounded` ("at least " where its files' sizes are not yet
+/// known, and taken at their least).
+fn not_linkable(position: LogPosition, unlinkable: Unlinkable, bounded: &str) -> Stall {
     let why = match unlinkable {
         Unlinkable::NoCreate => {
             "the backup store does not create a file only if none is there".into()
         }
         Unlinkable::HeaderTooLarge { bytes, most } => {
-            format!("its header is {bytes} bytes; the store creates {most} at most")
+            format!("its header is {bounded}{bytes} bytes; the store creates {most} at most")
         }
     };
     Stall::NotCreated { position, why }

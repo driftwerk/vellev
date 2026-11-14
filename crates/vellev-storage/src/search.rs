@@ -1,10 +1,13 @@
 //! Nearest-vector search over a partition's layers.
 
+use rayon::prelude::*;
 use vellev_core::{CollectionName, Object};
+use vellev_index::clustered::{ClusteredIndex, Probing};
+use vellev_index::curve::Curve;
 use vellev_index::filter::{Filter, Predicate};
-use vellev_index::vector::{nearest, Scorer, VectorIndex};
+use vellev_index::vector::{nearest, Scorer, Skipped};
 
-use crate::format::CollectionId;
+use crate::format::{CollectionId, SegmentCurve};
 use crate::state::{Layer, State, Vectors, SHORTLIST_ABOVE};
 use crate::{Result, Work};
 
@@ -21,6 +24,15 @@ pub struct Query<'a> {
     /// Only rows passing this are considered, exactly.
     pub filter: Option<&'a Filter>,
     pub oversample: usize,
+    /// How many parts the search may be split into on the read pool
+    /// ([`vellev_index::pool::reads`]): its layers searched at once, and
+    /// each clustered scan split as [`ClusteredIndex::estimates_split`]
+    /// splits it. 1 searches on the calling thread alone. What is found is
+    /// the same whatever it is. The read pool has as many threads as
+    /// rayon's global pool, so while a flush or merge builds an index
+    /// there, threads briefly outnumber cores; the node splits a read only
+    /// over the threads other reads leave idle.
+    pub split: usize,
 }
 
 impl<'a> Query<'a> {
@@ -30,6 +42,7 @@ impl<'a> Query<'a> {
             limit,
             filter: None,
             oversample: DEFAULT_OVERSAMPLE,
+            split: 1,
         }
     }
 
@@ -94,6 +107,7 @@ impl State {
         budget: usize,
         work: &mut Work,
     ) -> Result<Vec<Hit<'_>>> {
+        work.split_parts = work.split_parts.max(query.split.max(1) as u64);
         let (id, schema) = self.catalog().known(collection)?;
         schema.embedding.check(query.vector)?;
         let predicate = query
@@ -105,8 +119,53 @@ impl State {
         let mut exact = Vec::new();
         let mut estimated = Vec::new();
         let mut floors = 0;
-        for (at, layer) in layers.iter().enumerate() {
-            let offered = candidates(layer, id, predicate.as_ref(), query.vector, budget, work);
+        let split = query.split.max(1);
+        let offers: Vec<Candidates> = match split > 1 && layers.len() > 1 {
+            // Each layer's candidates on the rayon pool, taken in layer
+            // order: the same as one after another.
+            true => {
+                let found: Vec<(Candidates, Work)> = vellev_index::pool::reads().install(|| {
+                    layers
+                        .par_iter()
+                        .map(|layer| {
+                            let mut done = Work::default();
+                            let offered = candidates(
+                                layer,
+                                id,
+                                predicate.as_ref(),
+                                query.vector,
+                                budget,
+                                split,
+                                &mut done,
+                            );
+                            (offered, done)
+                        })
+                        .collect()
+                });
+                found
+                    .into_iter()
+                    .map(|(offered, done)| {
+                        work.add(&done);
+                        offered
+                    })
+                    .collect()
+            }
+            false => layers
+                .iter()
+                .map(|layer| {
+                    candidates(
+                        layer,
+                        id,
+                        predicate.as_ref(),
+                        query.vector,
+                        budget,
+                        split,
+                        work,
+                    )
+                })
+                .collect(),
+        };
+        for ((at, layer), offered) in layers.iter().enumerate().zip(offers) {
             exact.extend(offered.exact.into_iter().map(|row| (at, row)));
             // Each layer's own nearest few are always scored: one whose
             // estimates err more than others' would otherwise crowd them
@@ -190,6 +249,7 @@ fn candidates(
     predicate: Option<&Predicate>,
     vector: &[f32],
     count: usize,
+    split: usize,
     work: &mut Work,
 ) -> Candidates {
     let Some(index) = layer.indexes.get(&collection) else {
@@ -201,7 +261,7 @@ fn candidates(
         work.filtered += index.rows.rows().len();
         work.allowed += allowed.len();
     }
-    let live = || allowed.iter().filter(|row| !layer.dead[*row as usize]);
+    let live = || allowed.iter().filter(|row| !layer.dead.holds(*row));
     let shortlist = index
         .vectors
         .as_ref()
@@ -213,7 +273,7 @@ fn candidates(
         };
     };
     let ties = |a, b| layer.id(a).cmp(&layer.id(b));
-    let unmeasured = vectors.unmeasured(only.as_ref(), layer.dead);
+    let unmeasured = vectors.unmeasured_skipping(only.as_ref(), layer.dead);
     // The memtable's live allowed rows ranked by their codes: every one but
     // those scored exactly anyway.
     if layer.vectors.is_none() {
@@ -222,17 +282,45 @@ fn candidates(
     match vectors {
         Vectors::Clustered(clustered) => Candidates {
             exact: unmeasured,
-            estimated: Some(clustered.estimates(vector, count, only.as_ref(), layer.dead, &ties)),
+            estimated: Some(clustered.estimates_marked(
+                vector,
+                count,
+                only.as_ref(),
+                // Nothing to skip where no row has died: the scan then
+                // reads no marks at all; else their bits.
+                match layer.deaths {
+                    0 => Skipped::Bytes(&[]),
+                    _ => layer.dead,
+                },
+                &ties,
+                Probing {
+                    probes: probes_for(layer.curves, collection, clustered),
+                    parts: split,
+                },
+            )),
         },
         Vectors::Binary(binary) => Candidates {
             exact: binary
-                .shortlist(vector, count, only.as_ref(), layer.dead, &ties)
+                .estimates_skipping(vector, count, only.as_ref(), layer.dead, &ties)
                 .into_iter()
+                .map(|(_, row)| row)
                 .chain(unmeasured)
                 .collect(),
             estimated: None,
         },
     }
+}
+
+/// How many clusters `collection`'s clustered index scans in a layer: as
+/// the layer's curve for it says, where it has one that fits the index,
+/// else as the index was built to.
+fn probes_for(curves: &[SegmentCurve], collection: CollectionId, index: &ClusteredIndex) -> usize {
+    curves
+        .iter()
+        .find(|entry| entry.collection == collection && entry.band == 0)
+        .map(|entry| &entry.curve)
+        .filter(|curve| curve.fits(index.clusters()))
+        .map_or(index.probes(), Curve::probes)
 }
 
 /// The layer's live `row` scored exactly, if it has a vector.
@@ -283,6 +371,73 @@ mod tests {
             .collect()
     }
 
+    /// A layer's curve for a collection gives its probes where it fits
+    /// the index; otherwise, or without one, the index's own count.
+    #[test]
+    fn a_layers_curve_gives_its_probes_where_it_fits() {
+        let vectors: Vec<Vec<f32>> = (0..3_000u32)
+            .map(|n| {
+                (0..8)
+                    .map(|d| ((n * 31 + d * 7) % 97) as f32 - 48.0)
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(n, v)| (n as u32, v.as_slice()))
+            .collect();
+        let index = ClusteredIndex::build(vellev_core::Distance::Cosine, &rows).unwrap();
+        let clusters = index.clusters() as u32;
+        let deep = Curve::of(
+            vellev_index::curve::Source::Rows,
+            1,
+            clusters,
+            vec![clusters - 1],
+        )
+        .unwrap();
+        let other = Curve::of(
+            vellev_index::curve::Source::Rows,
+            1,
+            clusters + 1,
+            vec![clusters],
+        )
+        .unwrap();
+        let (mine, theirs) = (CollectionId(3), CollectionId(4));
+        let entry = |collection, band, curve: &Curve| SegmentCurve {
+            collection,
+            band,
+            curve: curve.clone(),
+        };
+        assert_eq!(
+            probes_for(&[entry(mine, 0, &deep)], mine, &index),
+            clusters as usize
+        );
+        assert_eq!(
+            probes_for(&[entry(theirs, 0, &deep)], mine, &index),
+            index.probes(),
+            "another collection's"
+        );
+        assert_eq!(
+            probes_for(&[entry(mine, 0, &other)], mine, &index),
+            index.probes(),
+            "a curve of another index"
+        );
+        assert_eq!(
+            probes_for(&[entry(mine, 2, &deep)], mine, &index),
+            index.probes(),
+            "another band's"
+        );
+        let mut unknown = deep.clone();
+        unknown.source = vellev_index::curve::Source::Unknown;
+        assert_eq!(
+            probes_for(&[entry(mine, 0, &unknown)], mine, &index),
+            index.probes(),
+            "of a source not known"
+        );
+        assert_eq!(probes_for(&[], mine, &index), index.probes());
+    }
+
     /// Rows estimated alike in two layers are cut in object id order
     /// across both, not layer by layer.
     #[test]
@@ -291,10 +446,11 @@ mod tests {
         let indexes = Indexes::new();
         let layer = |rows| Layer {
             rows,
-            dead: &[false, false],
+            dead: Skipped::Bytes(&[false, false]),
             deaths: 0,
             indexes: &indexes,
             vectors: None,
+            curves: &[],
         };
         let layers = [layer(&first), layer(&second)];
         let mut estimated: Vec<(f32, (usize, u32))> = [(0, 0), (0, 1), (1, 0), (1, 1)]

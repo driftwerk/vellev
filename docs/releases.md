@@ -70,6 +70,14 @@ and say what the caller then answers for.
 
 ### What a node answers
 
+- **A tenant's vector indexes now count in what it is reckoned to take
+  in memory**, where they were left out: a clustered index about 160 MB
+  a million 768-dimension rows, and more in a segment that mixes
+  collections, as its table of row places follows the span of the
+  collection's rows; and the binary index of a collection of 4,000 to
+  200,000 vectors about 140 B a row. With `VELLEV_MEMORY_MB` unchanged,
+  a node lets the least recently used tenants go sooner than before;
+  raise it by as much if the node has the memory to spare.
 - **A new code, `model_unavailable` (501)**, where a node used to answer
   `unavailable` (503): it cannot use the collection's embedding model as
   it is set up, and will not until someone puts that right. Nothing was
@@ -444,6 +452,31 @@ and say what the caller then answers for.
   13,340 objects/s, group commits unchanged), opening 4M rows from
   their segments about 12% longer, resident memory about 10% more.
   Searches are unchanged.
+- **`vellev_merges_stopped_for_budget_total` counts each merge once, and
+  none a stop came too late for**, where it counted one for every sweep
+  that found a merge stopped still under way, and for stops that let the
+  merge commit. It reads lower than before for the same load, so compare
+  neither its rate nor a bench's `stopped_for_budget` across the change.
+  `vellev_merges_stopped_total{reason}` is new: merges stopped or cut off
+  as a hold on a tenant is lost, each once, by why.
+- **A tenant's flushes no longer wait behind its merges.** They run on a
+  task of their own, so a flush due while the tenant's merge builds
+  commits in a flush's own time, where it waited for the build. A merge
+  flushes what is due before its commit, so `vellev_building_held_seconds`
+  reads less for `merge_commit` and more for `flush`. A tenant's merges
+  may see more than one clean, as cleaning up goes on beside them, and
+  `vellev_building_held_seconds{holder="clean"}` can count a little more.
+  `vellev_merge_phase_seconds{phase="turn_idle"}` is new: each wait for the
+  building lock with a merge turn held, 10 s at the most, after which the
+  turn goes back and the merge goes on without one.
+  `vellev_merge_commits_waiting_bytes` is new: what merges hold now that
+  gave their turns back to wait to commit. Nothing limits how many do but
+  one to a tenant, so a node can hold a built segment for each tenant
+  beside the builds its turns allow. It is in no total a sweep answers, as
+  those bytes leave in seconds by themselves.
+  `vellev_tenants_given_up_total` counts a panic on either task, two at
+  once on one tenant counting twice, and the line logged for it now reads
+  "a tenant's task panicked" with the task named.
 
 ### Numbers are read exactly
 
@@ -733,3 +766,44 @@ Breaking:
 
 New: `ClusteredIndex::fit`, which says whether an index is fit for the
 vectors it is given, and `Unfit`, why it is not.
+
+New, additive: `vector::Skipped`, the rows a search skips as a byte a row
+or a bit a row, with `holds`; and the methods that take it,
+`BinaryIndex::{unmeasured_skipping, estimates_skipping}` and
+`ClusteredIndex::{unmeasured_skipping, estimates_marked}`. The methods
+taking `&[bool]` are unchanged.
+
+New, additive: `stop::{Stop, Stopped}`, a way to ask a long build to give
+up, and the builds that take one, `ClusteredIndex::build_stopping` and
+`BinaryIndex::build_stopping`, which give back `Err(Stopped)` once their
+`Stop` is stopped. `pool::tune` does work on the tuning pool in turn,
+giving up while it waits if its `Stop` is stopped; a clustered build takes
+its turn to tune through it. `build` is unchanged.
+
+New, additive: `TextIndex`, `text::Field` and `RowIndex` implement
+`PartialEq`, comparing what they hold, not the order of their maps. And for
+a merge's reckoning, `TextIndex::shapes`, `text::{FieldShape, Vocabulary}`,
+a sketch of how many different tokens a field holds, which two segments'
+can say of the both of them, `text::VOCABULARY_OFF`, how far it can be off,
+and `text::{table_bytes, last_grown_at, dictionary_bytes}`, what a field's
+map and dictionary take. `RowIndex::resident` counts a value at what it is
+measured to take, about 245 bytes past its text where it said about 85.
+
+New, additive: `TextIndex::resident` and `RowIndex::resident`, about how
+many bytes each index takes in memory, and `TextIndex::tokenized_resident`,
+about how many its rows take tokenized all at once before they are
+indexed. A merge reckons what its build holds from them.
+
+New, additive: `pool::merge_slots(slots, threads, nice)`, pools for merges
+to build on apart from the global one: `slots` pools of `threads / slots`
+threads, those of slot `s` named `vellev-merge-s-N`, each run `nice` lower
+than the process on Linux, made after the read, tuning and passes pools.
+
+New, additive: `ClusteredIndex::build_stopping_on` and
+`BinaryIndex::build_stopping_on`, as `build_stopping`, each parallel pass
+where a `pool::Passes` says, and the rest on the calling thread, which must
+be on no pool that builds. `pool::CallersPool` runs each pass on the pool
+of the calling thread, as `build_stopping` does.
+
+New, additive: `pool::thread_cpu`, the CPU time the calling thread has
+spent so far, where the system says.

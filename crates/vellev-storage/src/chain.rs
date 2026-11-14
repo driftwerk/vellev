@@ -412,6 +412,7 @@ mod tests {
             tombstones: 0,
             index: index.then(|| file("index")),
             vectors: vectors.then(|| file("vectors")),
+            probes: vec![],
         }
     }
 

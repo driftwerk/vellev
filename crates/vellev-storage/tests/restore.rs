@@ -713,3 +713,31 @@ async fn a_restore_overtaken_by_another_writer_of_its_lease_is_refused_by_the_co
         [Some(1), Some(2), None, None]
     );
 }
+
+/// A restore in place moves the writer's epoch on, so that no merge
+/// planned before it is committed after it, though the same segments may
+/// be back with other rows live in them.
+#[tokio::test]
+async fn a_restore_in_place_moves_the_epoch_on() {
+    let cluster = Cluster::new().await;
+    let writer = writer(&cluster).await;
+    let (head, position) = history(&cluster, &writer).await;
+    let at = writer.epoch();
+    writer.restore(Some(&head), position).await.unwrap();
+    assert_eq!(writer.epoch(), at + 1);
+}
+
+/// A segment's dead rows are just those the live map does not lead to
+/// after a restore, and in a copy opened fresh.
+#[tokio::test]
+async fn dead_rows_are_what_the_live_map_leaves_after_a_restore_and_a_reload() {
+    let cluster = Cluster::new().await;
+    let writer = writer(&cluster).await;
+    let (head, position) = history(&cluster, &writer).await;
+    assert!(writer.partition().read(State::dead_rows_agree));
+    writer.restore(Some(&head), position).await.unwrap();
+    writer.commit(vec![delete("notes", 2)]).await.unwrap();
+    assert!(writer.partition().read(State::dead_rows_agree));
+    let follower = cluster.open().await;
+    assert!(follower.partition().read(State::dead_rows_agree));
+}

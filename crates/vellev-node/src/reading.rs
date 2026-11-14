@@ -146,9 +146,10 @@ impl Followed {
         *self.used.lock().expect("use lock")
     }
 
-    /// About how many bytes the copy takes in memory.
+    /// About how many bytes the copy takes in memory, as it was last
+    /// changed: read without its lock.
     pub(crate) fn resident(&self) -> usize {
-        self.follower.partition().read(State::resident)
+        self.follower.partition().figures().resident
     }
 
     fn reached(&self, incarnation: Incarnation, position: LogPosition) -> bool {
@@ -199,7 +200,7 @@ impl Node {
         let mut asked = false;
         if let Some(writer) = self.0.held(tenant) {
             writer.touch();
-            let partition = writer.writer.partition();
+            let partition = writer.work.writer.partition();
             let current = match fresh {
                 Freshness::Eventual => true,
                 Freshness::After(incarnation, position) => partition.reached(incarnation, position),
@@ -211,8 +212,8 @@ impl Node {
                 Freshness::Strong => {
                     asked = true;
                     let committed = self.committed(tenant).await?;
-                    !writer.writer.is_closed()
-                        && committed.generation == writer.writer.lease().generation
+                    !writer.work.writer.is_closed()
+                        && committed.generation == writer.work.writer.lease().generation
                         && committed.incarnation == partition.incarnation()
                         && partition.read(State::position) >= committed.log_position
                 }
