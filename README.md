@@ -423,8 +423,11 @@ Both are required, each named once, and the keys must not be blank: a payload
 missing one is refused, not completed from the environment. They take the
 place of whatever the command line or environment gave, so a supervisor
 should not set either in the environment at all (it would stay readable
-there). The descriptor must be a pipe, and the node gives up on it after
-10 seconds.
+there). The descriptor must be a pipe (a socket pair is refused), and the
+node gives up on it after 10 seconds. Only these two values are carried:
+embedding keys and cloud credentials still come from the environment, and the
+values sit in the node's memory as plain text, so this guards the command line
+and environment, not a debugger or a core dump of the same user.
 
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,
