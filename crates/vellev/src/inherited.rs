@@ -14,7 +14,6 @@
 //! and a supervisor that never writes is an error at the deadline. Errors
 //! name a variable or a position, never a value.
 
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -35,14 +34,14 @@ const API_KEYS: &str = "VELLEV_API_KEYS";
 /// their values.
 #[derive(Default)]
 pub struct Inherited {
-    pub database_url: Option<String>,
+    pub database_url: String,
     pub api_keys: Vec<String>,
 }
 
 impl std::fmt::Debug for Inherited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inherited")
-            .field("database_url", &self.database_url.is_some())
+            .field("database_url", &!self.database_url.is_empty())
             .field("api_keys", &self.api_keys.len())
             .finish()
     }
@@ -92,7 +91,7 @@ impl Inherited {
                 file.read_exact(&mut header)?;
                 let len = u32::from_be_bytes(header) as usize;
                 if len > MAX_BYTES {
-                    return Err(std::io::Error::other("too long"));
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
                 }
                 let mut body = vec![0u8; len];
                 file.read_exact(&mut body)?;
@@ -102,7 +101,7 @@ impl Inherited {
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
-            Ok(Err(e)) if e.to_string() == "too long" => {
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
                 bail!("the secrets are over {MAX_BYTES} bytes")
             }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -117,42 +116,81 @@ impl Inherited {
     fn parse(body: &[u8]) -> Result<Self> {
         // serde_json's messages can quote what they read: only the position
         // is kept.
-        let raw: BTreeMap<String, String> = serde_json::from_slice(body).map_err(|e| {
+        let Pairs(raw) = serde_json::from_slice(body).map_err(|e| {
             eyre!(
-                "the secrets aren't a JSON object of strings (line {}, column {})",
+                "the secrets aren't a JSON object of strings, each named once (line {}, column {})",
                 e.line(),
                 e.column()
             )
         })?;
-        let mut inherited = Self::default();
+        let (mut database_url, mut api_keys) = (None, None);
         for (name, value) in raw {
             if value.is_empty() {
                 bail!("{name} was handed over empty");
             }
-            match name.as_str() {
-                DATABASE_URL => inherited.database_url = Some(value),
-                API_KEYS => {
-                    inherited.api_keys = value
-                        .split(',')
-                        .map(|k| k.trim().to_string())
-                        .filter(|k| !k.is_empty())
-                        .collect();
-                }
+            let seen = match name.as_str() {
+                DATABASE_URL => database_url.replace(value).is_some(),
+                API_KEYS => api_keys.replace(value).is_some(),
                 _ => bail!("{name:?} isn't a secret the node takes on a pipe"),
+            };
+            if seen {
+                bail!("{name} was handed over twice");
             }
         }
-        Ok(inherited)
+        // Both are required: a supervisor that drops one must not leave the
+        // node on whatever its environment or command line holds.
+        let Some(database_url) = database_url else {
+            bail!("{DATABASE_URL} wasn't handed over");
+        };
+        let Some(api_keys) = api_keys else {
+            bail!("{API_KEYS} wasn't handed over");
+        };
+        let api_keys: Vec<String> = api_keys
+            .split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        if api_keys.is_empty() {
+            bail!("{API_KEYS} was handed over with no key in it");
+        }
+        Ok(Self {
+            database_url,
+            api_keys,
+        })
     }
 
     /// Puts what was handed over in place of what the command line or the
     /// environment gave.
     pub fn apply(self, config: &mut Config) {
-        if let Some(url) = self.database_url {
-            config.database_url = url;
+        config.database_url = self.database_url;
+        config.api_keys = self.api_keys;
+    }
+}
+
+/// A JSON object's members in the order given, with none dropped: serde's
+/// maps keep only the last of a repeated name.
+struct Pairs(Vec<(String, String)>);
+
+impl<'de> serde::Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Pairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of strings")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Pairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry::<String, String>()? {
+                    pairs.push(pair);
+                }
+                Ok(Pairs(pairs))
+            }
         }
-        if !self.api_keys.is_empty() {
-            config.api_keys = self.api_keys;
-        }
+        d.deserialize_map(V)
     }
 }
 
@@ -181,10 +219,7 @@ mod tests {
             br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":"k1-fixture,k2-fixture"}"#,
         ))
         .unwrap();
-        assert_eq!(
-            read.database_url.as_deref(),
-            Some("postgres://u:pw-fixture@127.0.0.1:1/db")
-        );
+        assert_eq!(read.database_url, "postgres://u:pw-fixture@127.0.0.1:1/db");
         assert_eq!(read.api_keys, ["k1-fixture", "k2-fixture"]);
         let shown = format!("{read:?}");
         assert!(
@@ -216,7 +251,9 @@ mod tests {
 
     #[test]
     fn malformed_or_short_payloads_are_refused_without_repeating_them() {
-        let mut short = framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#);
+        let mut short = framed(
+            br#"{"VELLEV_DATABASE_URL":"postgres://x-fixture","VELLEV_API_KEYS":"k-fixture"}"#,
+        );
         short.truncate(short.len() - 2);
         for bad in [
             short,
@@ -242,7 +279,9 @@ mod tests {
         drop(writer);
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer
-            .write_all(&framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#))
+            .write_all(&framed(
+                br#"{"VELLEV_DATABASE_URL":"postgres://x-fixture","VELLEV_API_KEYS":"k-fixture"}"#,
+            ))
             .unwrap();
         let read = Inherited::read(reader.into(), Duration::from_secs(5)).unwrap();
         assert_eq!(read.api_keys, ["k-fixture"]);
@@ -307,7 +346,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("VELLEV_API_KEYS"), "{err}");
-        assert!(!err.contains("k1-fixture") && !err.contains("k2-fixture"), "{err}");
+        assert!(
+            !err.contains("k1-fixture") && !err.contains("k2-fixture"),
+            "{err}"
+        );
     }
 
     /// What `--secrets-fd` may name: not a standard stream, not a closed
@@ -319,7 +361,9 @@ mod tests {
             let err = Inherited::from_descriptor(fd).unwrap_err().to_string();
             assert!(err.contains("standard stream"), "{err}");
         }
-        let err = Inherited::from_descriptor(1_000_000).unwrap_err().to_string();
+        let err = Inherited::from_descriptor(1_000_000)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("pipe"), "{err}");
         let file = tempfile::tempfile().unwrap();
         let err = Inherited::from_descriptor(file.as_raw_fd())

@@ -419,8 +419,12 @@ inherited pipe instead, so they are in neither the node's command line nor
 its environment, which other processes of the same user can read:
 `serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
 and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
-They take the place of whatever the environment gave. The descriptor must be
-a pipe, and the node gives up on it after 10 seconds.
+Both are required, each named once, and the keys must not be blank: a payload
+missing one is refused, not completed from the environment. They take the
+place of whatever the command line or environment gave, so a supervisor
+should not set either in the environment at all (it would stay readable
+there). The descriptor must be a pipe, and the node gives up on it after
+10 seconds.
 
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,
