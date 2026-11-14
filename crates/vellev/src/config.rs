@@ -25,7 +25,14 @@ use vellev_storage::{Disk, Transfers};
 #[derive(Clone, clap::Args)]
 pub struct Config {
     /// Postgres, for the record of who writes each tenant and how far.
-    #[arg(long, env = "VELLEV_DATABASE_URL", hide_env_values = true)]
+    /// Required, unless a supervisor hands it over on a pipe
+    /// (`--secrets-fd`).
+    #[arg(
+        long,
+        env = "VELLEV_DATABASE_URL",
+        hide_env_values = true,
+        default_value = ""
+    )]
     pub database_url: String,
     #[arg(long, env = "VELLEV_DATABASE_CONNECTIONS", default_value_t = 8)]
     pub database_connections: u32,
@@ -537,6 +544,9 @@ impl Config {
     /// Everything that can be wrong without reaching another machine is
     /// found wrong here.
     pub fn checked(&self) -> Result<(Limits, ObjectBlobs)> {
+        if self.database_url.trim().is_empty() {
+            bail!("no database is configured; set VELLEV_DATABASE_URL");
+        }
         let keyed = self.embedding_keys()?;
         self.embedding()?;
         let embedding_urls = self
@@ -700,7 +710,7 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use clap::Parser;
 
     use super::*;
@@ -765,7 +775,7 @@ mod tests {
         }
     }
 
-    fn config(extra: &[&str]) -> Config {
+    pub(crate) fn config(extra: &[&str]) -> Config {
         let required = [
             "vellev",
             "--database-url",
@@ -774,6 +784,16 @@ mod tests {
             "memory://",
         ];
         Parsed::parse_from(required.iter().chain(extra)).config
+    }
+
+    /// With no database, from the command line, the environment or a
+    /// supervisor's pipe, a node refuses to start, and says so.
+    #[test]
+    fn a_node_without_a_database_is_refused() {
+        let mut config = config(&[]);
+        config.database_url.clear();
+        let refused = format!("{:#}", config.checked().map(drop).unwrap_err());
+        assert!(refused.contains("VELLEV_DATABASE_URL"), "{refused}");
     }
 
     #[test]

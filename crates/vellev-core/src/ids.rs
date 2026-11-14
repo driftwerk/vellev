@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn tenant_ids_are_safe_as_storage_prefixes() {
-        for ok in ["wf-patchwork", "edge_1", "0abc", "a"] {
+        for ok in ["wf-acme", "edge_1", "0abc", "a"] {
             assert!(TenantId::new(ok).is_ok(), "{ok}");
         }
         for bad in ["", "-a", "A", "a/b", "a..b", "a b", "../x", &"a".repeat(64)] {
