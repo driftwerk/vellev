@@ -22,11 +22,10 @@ static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new(
 pub static OPTIONS: vellev::allocator::Options =
     vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
 
-/// A size_t statistic or setting of jemalloc's, as of now; usize::MAX if
-/// it cannot be read.
+/// A size_t statistic or setting of jemalloc's, as of the last epoch
+/// advanced; usize::MAX if it cannot be read.
 #[cfg(target_os = "linux")]
 fn statistic(name: &str) -> usize {
-    let _ = tikv_jemalloc_ctl::epoch::advance();
     let name = format!("{name}\0");
     // SAFETY: every name asked is jemalloc's, of a size_t statistic.
     unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name.as_bytes()) }.unwrap_or(usize::MAX)
@@ -36,6 +35,7 @@ fn statistic(name: &str) -> usize {
 /// jemalloc's decay still has to purge.
 #[cfg(target_os = "linux")]
 fn dirty() -> u64 {
+    let _ = tikv_jemalloc_ctl::epoch::advance();
     let pages = statistic("stats.arenas.4096.pdirty") as u64;
     pages.saturating_mul(statistic("arenas.page") as u64)
 }
@@ -44,12 +44,16 @@ fn dirty() -> u64 {
 #[cfg(target_os = "linux")]
 fn jemalloc() -> String {
     const MIB: usize = 1024 * 1024;
+    // One epoch for every figure, so that they add up as of one moment.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    let pages = statistic("stats.arenas.4096.pdirty") as u64;
+    let dirty = pages.saturating_mul(statistic("arenas.page") as u64);
     format!(
         "jemalloc: allocated {} MiB, active {} MiB, metadata {} MiB, dirty {} MiB, resident {} MiB, retained {} MiB, {} background threads",
         statistic("stats.allocated") / MIB,
         statistic("stats.active") / MIB,
         statistic("stats.metadata") / MIB,
-        dirty() / MIB as u64,
+        dirty / MIB as u64,
         statistic("stats.resident") / MIB,
         statistic("stats.retained") / MIB,
         statistic("stats.background_thread.num_threads"),
