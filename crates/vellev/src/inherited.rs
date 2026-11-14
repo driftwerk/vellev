@@ -32,7 +32,6 @@ const API_KEYS: &str = "VELLEV_API_KEYS";
 
 /// What a supervisor handed over. `Debug` shows which were given, never
 /// their values.
-#[derive(Default)]
 pub struct Inherited {
     pub database_url: String,
     pub api_keys: Vec<String>,
@@ -125,7 +124,7 @@ impl Inherited {
         })?;
         let (mut database_url, mut api_keys) = (None, None);
         for (name, value) in raw {
-            if value.is_empty() {
+            if value.trim().is_empty() {
                 bail!("{name} was handed over empty");
             }
             let seen = match name.as_str() {
@@ -380,5 +379,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("over"), "{err}");
+    }
+
+    /// Each name is pinned on its own: a repeated URL, a blank URL and an
+    /// extra name beside both valid ones are each refused, naming the name.
+    #[test]
+    fn each_name_is_checked_on_its_own() {
+        let keys = r#""VELLEV_API_KEYS":"k-fixture""#;
+        for (payload, named) in [
+            (
+                format!(r#"{{{URL_FIXTURE},{URL_FIXTURE},{keys}}}"#),
+                "VELLEV_DATABASE_URL",
+            ),
+            (
+                format!(r#"{{"VELLEV_DATABASE_URL":"",{keys}}}"#),
+                "VELLEV_DATABASE_URL",
+            ),
+            (
+                format!(r#"{{"VELLEV_DATABASE_URL":"   ",{keys}}}"#),
+                "VELLEV_DATABASE_URL",
+            ),
+            (
+                format!(r#"{{{URL_FIXTURE},{keys},"AWS_SECRET_ACCESS_KEY":"s-fixture"}}"#),
+                "AWS_SECRET_ACCESS_KEY",
+            ),
+        ] {
+            let err = through_pipe(&framed(payload.as_bytes()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(named), "{err}");
+            assert!(!err.contains("fixture"), "{err}");
+        }
     }
 }
