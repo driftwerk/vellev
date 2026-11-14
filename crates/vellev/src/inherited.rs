@@ -261,4 +261,80 @@ mod tests {
             .to_string();
         assert!(err.contains("pipe"), "{err}");
     }
+
+    const URL_FIXTURE: &str = r#""VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db""#;
+
+    /// A supervisor that drops a secret must not leave the node on whatever
+    /// the environment or command line happens to hold: both names are
+    /// required, and the refusal names the one missing, never a value.
+    #[test]
+    fn a_payload_missing_a_secret_is_refused() {
+        let keys = r#""VELLEV_API_KEYS":"k-fixture""#;
+        for (payload, missing) in [
+            ("{}".to_string(), "VELLEV_DATABASE_URL"),
+            (format!("{{{keys}}}"), "VELLEV_DATABASE_URL"),
+            (format!("{{{URL_FIXTURE}}}"), "VELLEV_API_KEYS"),
+        ] {
+            let err = through_pipe(&framed(payload.as_bytes()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(missing), "{err}");
+            assert!(!err.contains("fixture"), "{err}");
+        }
+    }
+
+    /// Keys that are all blanks are no keys: the node isn't left on the
+    /// environment's.
+    #[test]
+    fn a_key_list_with_no_key_in_it_is_refused() {
+        for blank in [",", " ", " , ,"] {
+            let payload = format!(r#"{{{URL_FIXTURE},"VELLEV_API_KEYS":"{blank}"}}"#);
+            let err = through_pipe(&framed(payload.as_bytes()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VELLEV_API_KEYS"), "{err}");
+            assert!(!err.contains("pw-fixture"), "{err}");
+        }
+    }
+
+    /// Two values for one name are ambiguous, not "the last one".
+    #[test]
+    fn a_name_given_twice_is_refused() {
+        let payload = format!(
+            r#"{{{URL_FIXTURE},"VELLEV_API_KEYS":"k1-fixture","VELLEV_API_KEYS":"k2-fixture"}}"#
+        );
+        let err = through_pipe(&framed(payload.as_bytes()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VELLEV_API_KEYS"), "{err}");
+        assert!(!err.contains("k1-fixture") && !err.contains("k2-fixture"), "{err}");
+    }
+
+    /// What `--secrets-fd` may name: not a standard stream, not a closed
+    /// number, and not a file, which is left open for whoever owns it.
+    #[test]
+    fn a_descriptor_that_is_not_a_handed_over_pipe_is_refused_and_left_open() {
+        use std::os::fd::AsRawFd;
+        for fd in [0, 1, 2] {
+            let err = Inherited::from_descriptor(fd).unwrap_err().to_string();
+            assert!(err.contains("standard stream"), "{err}");
+        }
+        let err = Inherited::from_descriptor(1_000_000).unwrap_err().to_string();
+        assert!(err.contains("pipe"), "{err}");
+        let file = tempfile::tempfile().unwrap();
+        let err = Inherited::from_descriptor(file.as_raw_fd())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pipe"), "{err}");
+        assert!(file.metadata().is_ok(), "the file's descriptor was closed");
+    }
+
+    /// An oversize payload is told apart by its kind, not by its words.
+    #[test]
+    fn an_oversize_payload_is_named_as_such() {
+        let err = through_pipe(&((MAX_BYTES as u32) + 1).to_be_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over"), "{err}");
+    }
 }
