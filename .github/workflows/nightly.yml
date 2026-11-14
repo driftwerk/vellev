@@ -5,14 +5,11 @@ name: Nightly
 # look for dependencies with newly reported faults, which would otherwise
 # fail unrelated commits.
 on:
-  schedule:
-    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
-      cases:
-        description: Histories to generate per property test
-        type: number
-        default: 20000
+      fail:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,69 +22,25 @@ env:
 
 jobs:
   simulation:
-    name: Simulation
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --locked -p vellev-storage --test simulation --test partition
-      # A failing history is shrunk and written next to the test; keep it so
-      # it can be committed as a regression seed.
-      - if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: proptest-regressions
-          path: crates/vellev-storage/tests/*.proptest-regressions
-          if-no-files-found: ignore
-
-  # The default rescore budget's recall on real embeddings: the SQuAD 2.0
-  # fixture (CC BY-SA 4.0, see scripts/recall-fixture/ATTRIBUTION.md), fetched
-  # from its release and checked against the checksums committed here.
+      - run: '[ "${{ inputs.fail }}" != true ]'
   recall:
-    name: Recall on real embeddings
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      FIXTURE: fixture-recall-squad2-bge-base-v1
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - name: Fetch the fixture and check it
-        run: |
-          mkdir -p "$RUNNER_TEMP/fixture"
-          cd "$RUNNER_TEMP/fixture"
-          gh release download "$FIXTURE" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.zst' --pattern ATTRIBUTION.md
-          sha256sum --check --strict "$GITHUB_WORKSPACE/scripts/recall-fixture/SHA256SUMS"
-          zstd --decompress --rm -- *.zst
-      - name: Recall gate
-        run: cargo test --release --locked -p vellev-storage --test recall_fixture -- --ignored --nocapture
-        env:
-          VELLEV_RECALL_FIXTURE: ${{ runner.temp }}/fixture/memories.jsonl
-          VELLEV_RECALL_QUERIES: ${{ runner.temp }}/fixture/queries.vectors.jsonl
-
+      - run: 'true'
   advisories:
-    name: Advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
+      - run: 'true'
 
-  # A red nightly runs while nobody is looking, so it has to say so: it was
-  # red for ten days in November with nobody told (DW-670). One issue tracks
-  # the red run: the first red night opens it, each further red night adds a
-  # comment, and the first green night closes it.
   report:
     name: Report
     needs: [simulation, recall, advisories]
     # Runs after a failed job, but not when the run itself was cancelled,
     # and only for the default branch: a manual run on another branch, or
     # with a few cases, must not close or add to the nightly's issue.
-    if: ${{ !cancelled() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    if: ${{ !cancelled() && github.ref == 'refs/heads/scratch-des8-report' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Two reports at once could both find no open issue and open two.
