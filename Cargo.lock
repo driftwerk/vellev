@@ -4455,6 +4455,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "memmap2",
+ "nix",
  "object_store",
  "proptest",
  "rayon",

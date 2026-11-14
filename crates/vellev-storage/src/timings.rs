@@ -133,18 +133,21 @@ pub enum MergeEnd {
     Uncovered,
     /// Stopped: its tenant let go, its lease lost, or the node stopping.
     Stopped,
+    /// Skipped: no room for its vectors on local disk.
+    NoRoom,
     /// Failed with an error.
     Failed,
 }
 
 impl MergeEnd {
-    pub const ALL: [MergeEnd; 7] = [
+    pub const ALL: [MergeEnd; 8] = [
         MergeEnd::Committed,
         MergeEnd::Nothing,
         MergeEnd::Stale,
         MergeEnd::Changed,
         MergeEnd::Uncovered,
         MergeEnd::Stopped,
+        MergeEnd::NoRoom,
         MergeEnd::Failed,
     ];
 
@@ -156,6 +159,7 @@ impl MergeEnd {
             MergeEnd::Changed => "changed",
             MergeEnd::Uncovered => "uncovered",
             MergeEnd::Stopped => "stopped",
+            MergeEnd::NoRoom => "no_room",
             MergeEnd::Failed => "failed",
         }
     }

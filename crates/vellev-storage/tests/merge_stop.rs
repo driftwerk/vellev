@@ -319,11 +319,26 @@ async fn a_merge_on_a_lease_already_taken_uploads_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "timed, in release, at a size where each stage takes seconds"]
 async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
+    stopped_at_any_moment(Cluster::new().await).await;
+}
+
+/// M8: as the rule above, of a merge that gathers on local disk, each write
+/// waited for where a stop finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timed, in release, at a size where each stage takes seconds"]
+async fn a_merge_gathered_on_disk_stopped_at_any_moment_gives_up_within_two_seconds() {
+    let mut cluster = Cluster::new().await;
+    let cache = tempfile::tempdir().unwrap();
+    cluster.blobs = Arc::new(CachedBlobs::new(cluster.blobs.clone(), cache.path()));
+    let writer = stopped_at_any_moment(cluster).await;
+    assert!(writer.last_spilled() > 0, "gathered in memory");
+}
+
+async fn stopped_at_any_moment(cluster: Cluster) -> Arc<Writer> {
     let rows: u32 = std::env::var("VELLEV_STOP_ROWS")
         .ok()
         .and_then(|rows| rows.parse().ok())
         .unwrap_or(250_000);
-    let cluster = Cluster::new().await;
     let merging = Merging {
         fanout: 2,
         ..Merging::default()
@@ -405,6 +420,7 @@ async fn a_merge_stopped_at_any_moment_gives_up_within_two_seconds() {
     );
     assert!(stopped >= 5, "too few stops to say: {stopped}");
     assert!(worst <= Duration::from_secs(2), "a stop took {worst:?}");
+    writer
 }
 
 /// A merge waiting its turn behind another when merges are stopped is

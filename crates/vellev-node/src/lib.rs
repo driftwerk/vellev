@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch, OnceCell};
 use tokio::task::AbortHandle;
 use vellev_core::{Embedding, ModelFault, NodeId, Partition, RequestId, TenantId};
 use vellev_embed::{EmbedError, Embedders};
-use vellev_storage::blobs::Blobs;
+use vellev_storage::blobs::{Blobs, SpillFigures};
 use vellev_storage::coordinator::{
     Acquired, Clock, Coordinator, CoordinatorError, Generation, Lease, Lineage, LogPosition,
     ManifestRef, PartitionKey, Point, Restore, RestorePoint, Restored, SystemClock, TenantKey,
@@ -1581,11 +1581,21 @@ impl TenantWork {
         // included. Losing the hold aborts the task, and with it both.
         let tidied = self.tidied_beside_merges(&merges_ended, grace);
         let (merged, ()) = tokio::join!(merged, tidied);
-        merged?;
+        // A merge that fails, as on a disk that fills, may be over long
+        // before a clean beside it was due, and cleaning up is what frees
+        // that disk: so it comes all the same, and the failure is the
+        // round's once it has. One that was skipped for want of room found
+        // nothing to fail on, and comes here as any other.
+        if self.writer.is_closed() {
+            merged?;
+            return Ok(0);
+        }
         // The round ends here if cleaning up was left for a later round:
         // the flush due goes first, and the rest is done then.
         let flush_due = || self.flush_due();
-        let Some(deleted) = self.cleaned_unless(grace, &flush_due).await? else {
+        let cleaned = self.cleaned_unless(grace, &flush_due).await;
+        merged?;
+        let Some(deleted) = cleaned? else {
             return Ok(0);
         };
         self.rows_passed().await;
@@ -2231,6 +2241,12 @@ impl Node {
             largest: builds.largest_reckoned(),
             waiting_to_commit: builds.waiting_to_commit(),
         }
+    }
+
+    /// What this node's merges have spilled to its store's local disk.
+    pub fn spills(&self) -> SpillFigures {
+        let spills = self.0.blobs.spills();
+        spills.map_or_else(SpillFigures::default, |spills| spills.figures())
     }
 
     /// Where the writers this node opens time their background work: the
