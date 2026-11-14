@@ -76,3 +76,43 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
+
+  # A red nightly runs while nobody is looking, so it has to say so: it was
+  # red for ten days in November with nobody told (DW-670). One issue tracks
+  # the red run: the first red night opens it, each further red night adds a
+  # comment, and the first green night closes it.
+  report:
+    name: Report
+    needs: [simulation, recall, advisories]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SIMULATION: ${{ needs.simulation.result }}
+      RECALL: ${{ needs.recall.result }}
+      ADVISORIES: ${{ needs.advisories.result }}
+    steps:
+      - name: Open, update or close the red-nightly issue
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --label nightly-red --state open --json number --jq '.[0].number // empty')
+          if [ "$SIMULATION" = success ] && [ "$RECALL" = success ] && [ "$ADVISORIES" = success ]; then
+            if [ -n "$open" ]; then
+              gh issue close "$open" --comment "The nightly is green again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          body="The nightly is red: simulation ${SIMULATION}, recall ${RECALL}, advisories ${ADVISORIES}. $RUN_URL"
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Still red: $body"
+          else
+            gh label create nightly-red --color B60205 \
+              --description "The nightly workflow is failing" 2>/dev/null || true
+            gh issue create --label nightly-red \
+              --title "Nightly is red" --body "$body"
+          fi
