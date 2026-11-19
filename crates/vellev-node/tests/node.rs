@@ -9866,6 +9866,23 @@ fn settings_that_flush_no_tenant_let_go_are_refused() {
     );
 }
 
+/// A sweep that may give up no lease at once would give up none: every
+/// tenant let go would keep its lease until it ran out. Such settings are
+/// refused.
+#[test]
+fn settings_that_release_no_lease_at_once_are_refused() {
+    let at_once = |releases_at_once| Settings {
+        releases_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(at_once(1).check().is_ok());
+    let refused = at_once(0).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
 /// Track 2, V3: a property embedded but not stored is new in format 2.
 /// A node refuses a schema with one until the cluster writes format 2,
 /// which it does once every node registered reads it and the nodes are
