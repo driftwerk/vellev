@@ -23,11 +23,13 @@
 //!
 //! Only these two take the pipe: embedding keys and an object store's
 //! credentials still come from the environment. On Linux another process
-//! of the same user can open `/proc/<pid>/fd/<n>` in the moment before the
-//! node reads, so the pipe shortens the exposure the environment had but
-//! does not close it: such a process can read the payload, and can even
-//! replace it whole, undetected. Only a partial read or bytes added once
-//! the node reads fail the start. macOS has no such path.
+//! of the same user can open the pipe through `/proc/<pid>/fd/<n>`, the
+//! supervisor's or the node's, from when the pipe is made until the node
+//! has read it, so the pipe shortens the exposure the environment had but
+//! does not close it. Such a process can copy the payload without taking
+//! it (`tee(2)`), or replace it whole, and neither is seen; taking it
+//! without writing a whole frame back, adding bytes, or holding a write
+//! end open fails the start. macOS has no such path.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -92,7 +94,8 @@ impl Inherited {
     }
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
-    /// closes it.
+    /// closes it by the time it returns, but at the deadline: the reader is
+    /// then left holding it, blocked, until the process exits.
     pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
@@ -114,7 +117,8 @@ impl Inherited {
         std::thread::spawn(move || {
             let read = Self::read_frame(&mut file, &framed_in);
             // Closed before the answer is sent, so it is closed by the time
-            // this returns, not some time after.
+            // an answer is returned, not some time after (at the deadline no
+            // answer is waited for, and this thread keeps it).
             drop(file);
             let _ = tx.send(read);
         });
@@ -517,18 +521,19 @@ mod tests {
         }
     }
 
-    /// A payload of exactly the most is taken, one byte more is refused.
-    /// (That the most fits a default fresh pipe is held by the constant's
-    /// own compile-time check, not shown here.)
+    /// A payload of exactly the most is taken, written whole before
+    /// anything reads (so on the platform it runs on, the largest frame
+    /// fits a default fresh pipe), and a length one byte more is refused
+    /// from its header alone.
     #[test]
     fn the_most_a_payload_may_hold_is_taken_and_a_byte_more_refused() {
         let mut most = BOTH.to_vec();
         most.resize(MAX_BYTES, b' ');
         let read = through_pipe(&framed(&most)).unwrap();
         assert_eq!(read.api_keys, ["k-fixture"]);
-        let mut over = most;
-        over.push(b' ');
-        let err = format!("{:#}", through_pipe(&framed(&over)).unwrap_err());
+        let mut over = ((MAX_BYTES + 1) as u32).to_be_bytes().to_vec();
+        over.extend_from_slice(b"{\"");
+        let err = format!("{:#}", through_pipe(&over).unwrap_err());
         assert!(err.contains("over the most the secrets may hold"), "{err}");
     }
 
@@ -609,15 +614,23 @@ mod tests {
         drop(writer);
     }
 
-    /// Closed by the time the read returns, not some time after on the
-    /// reader's thread: many times over, so a close that races the return
-    /// is seen. Told by the pipe's inode, as the number may be reused.
+    /// Closed by the time the read returns. Told by the pipe's inode, as
+    /// the number may be reused. A guard, not a proof of the order: with
+    /// the close after the answer is sent, the reader's thread almost
+    /// always closes before this looks, so it may well pass (it did, before
+    /// the close was moved ahead of the send, which orders it by itself).
     #[test]
     fn the_pipe_is_closed_by_the_time_the_read_returns() {
         use std::os::fd::{AsRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
+        // Where this process's descriptors show as files.
+        let fds = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
         let inode = |fd: RawFd| {
-            std::fs::metadata(format!("/dev/fd/{fd}"))
+            std::fs::metadata(format!("{fds}/{fd}"))
                 .ok()
                 .map(|m| (m.dev(), m.ino()))
         };
