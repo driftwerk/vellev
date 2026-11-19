@@ -196,6 +196,12 @@ pub enum Timed {
     /// [`Timed::LetGoFlushWait`] of a let-go that its sweep's deadline
     /// reached before it had one of its flushes, so that it never began.
     LetGoFlushNotReached,
+    /// A spell a tenant was kept by sweeps over the memory budget for its
+    /// building lock busy, nothing else holding it: from the first sweep
+    /// that kept it so to the first that did not, as by taking it out,
+    /// keeping it for something else holding it, or finding the node no
+    /// longer over its budget.
+    KeptForBuilding,
 }
 
 impl Timed {
@@ -213,6 +219,7 @@ impl Timed {
             Timed::LetGoFlushHeld,
             Timed::LetGoFlushQueued,
             Timed::LetGoFlushNotReached,
+            Timed::KeptForBuilding,
         ]);
         all
     }
@@ -233,11 +240,12 @@ impl Timed {
             Timed::LetGoFlushHeld => 2 * holders + 2 * phases + 3,
             Timed::LetGoFlushQueued => 2 * holders + 2 * phases + 4,
             Timed::LetGoFlushNotReached => 2 * holders + 2 * phases + 5,
+            Timed::KeptForBuilding => 2 * holders + 2 * phases + 6,
         }
     }
 }
 
-const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 6;
+const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 7;
 
 /// The bucket bounds, in seconds: a millisecond, and twice as long each
 /// time, to 2,097 seconds, about 35 minutes. Past the last is counted only

@@ -524,6 +524,48 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
     assert_eq!(opened.read(State::unflushed), 0, "not flushed as it went");
 }
 
+/// The overseer's busy-lock gate: a tenant kept over the budget for its busy
+/// building lock, sweep after sweep, is timed as one spell, from the first
+/// sweep that kept it so to the sweep that takes it out. A merge holds the
+/// lock from a round, which holds the tenant, so that it is kept as held:
+/// only what holds the lock and not the tenant, as a sweep's race with a
+/// task or this test's seam, keeps it for its lock.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
+    let node = over_budget(memory());
+    node.timings().keep_events(true);
+    let writer = written(&node, "busy", 2).await;
+    unused_long_enough().await;
+    let building = writer.building_when_free().await;
+    node.timings().drain_events();
+    // Five minutes held, as by a merge's long commit, swept every 30 s.
+    let held_for = Duration::from_secs(5 * 60);
+    let every = Duration::from_secs(30);
+    for _ in 0..held_for.as_secs() / every.as_secs() {
+        node.sweep_now().await;
+        tokio::time::sleep(every).await;
+    }
+    let kept = KeptBySweeps {
+        building: 10,
+        held: 0,
+    };
+    assert_eq!(node.kept_by_sweeps(), kept);
+    drop(building);
+    node.sweep_now().await;
+    assert_eq!(written_for(&node), Vec::<String>::new(), "not let go");
+    let events = node.timings().drain_events();
+    let spells: Vec<Duration> = events
+        .iter()
+        .filter(|event| event.timed == Timed::KeptForBuilding)
+        .map(|event| event.took)
+        .collect();
+    assert_eq!(spells.len(), 1, "{events:?}");
+    assert!(
+        spells[0] >= held_for && spells[0] < held_for + Duration::from_secs(1),
+        "{spells:?}"
+    );
+}
+
 /// A tenant a request holds, chosen to be let go, is kept as held, not as
 /// one whose building lock is busy: what keeps it is looked at first.
 #[tokio::test(start_paused = true)]
