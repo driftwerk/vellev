@@ -2156,10 +2156,9 @@ pub struct MergesStopped {
 pub struct LetGo {
     pub idle: u64,
     pub for_budget: u64,
-    /// How many of the tenants let go with rows to flush were not flushed,
-    /// as a sweep's flushes ran out of time: cut short, or never reached.
-    /// Their rows are in the log, and the next opener replays them unless
-    /// a commit cut short landed.
+    /// Let-go flushes not made or not known to have landed: cut or not
+    /// reached by the sweep's deadline, cut in the commit, or with the
+    /// writer already closed. Their rows replay unless that commit landed.
     pub flushes_skipped: u64,
 }
 

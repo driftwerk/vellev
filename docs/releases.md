@@ -560,13 +560,12 @@ A node of an earlier release does not know the flag and exits with status
     with the flush before letting go made under it, so nothing comes in
     between and whatever queued for the lock ends with the hold. A sweep's
     tenants go together, two flushing at a time, with 30 s for all those
-    flushes. A flush cut at that, or not reached by then, is skipped: the
-    tenant goes all the same, and whoever opens it next replays its rows
-    from the log, unless the flush was cut in its commit and that commit
-    landed. A flush cut once its checkpoint was adopted went through, and
-    is not skipped; nor is one not made because the tenant's writer had
-    closed. `vellev_let_go_flushes_skipped_total` is new and counts those
-    skipped; none is a flush that failed.
+    flushes. A flush cut once its checkpoint was adopted went through, and
+    is not skipped. `vellev_let_go_flushes_skipped_total` is new and counts
+    let-go flushes not made or not known to have landed: cut or not
+    reached by the sweep's deadline, cut in the commit, or with the writer
+    already closed. Their rows replay unless that commit landed; the
+    tenant goes all the same. None is a flush that failed.
   - *Releases.* Each tenant gives its lease up as it is let go, four at a
     time, and a sweep's releases are over 5 s after its last flush ends,
     or after the 30 s if that comes first; one not begun by then is not

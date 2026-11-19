@@ -525,7 +525,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     let counter = ConstCounter::new(let_go.flushes_skipped);
     counter.encode(encoder.encode_descriptor(
         "let_go_flushes_skipped",
-        "Let-go flushes cut or not reached by a sweep's deadline: their rows replay unless the commit landed",
+        "Let-go flushes not made or not known to have landed: cut or not reached by the sweep's deadline, cut in the commit, or with the writer already closed. Their rows replay unless that commit landed",
         None,
         counter.metric_type(),
     )?)?;
