@@ -1366,15 +1366,38 @@ impl BuildingHeld {
     pub async fn flush(&mut self, stop: &Stop) -> Result<(LogPosition, Option<Duration>)> {
         let writer = &self.writer;
         let stopping = Stopping::flush(stop.clone());
-        let mut building = Building {
-            _guard: None,
-            holder: Holder::Flush,
-            since: Instant::now(),
-            writer,
-            timed: true,
+        let mut flushing = Cuttable {
+            building: Building {
+                _guard: None,
+                holder: Holder::Flush,
+                since: Instant::now(),
+                writer,
+                timed: true,
+            },
+            ended: false,
         };
-        let position = writer.flushing_held(&mut building, &stopping).await?;
-        Ok((position, building.timed.then(|| building.held())))
+        let flushed = writer
+            .flushing_held(&mut flushing.building, &stopping)
+            .await;
+        flushing.ended = true;
+        let building = &flushing.building;
+        Ok((flushed?, building.timed.then(|| building.held())))
+    }
+}
+
+/// A let-go's flush's hold of the building lock, timed only if the flush
+/// ends, gone through or failed: one cut short, dropped where it waits, is
+/// no flush's hold.
+struct Cuttable<'a> {
+    building: Building<'a>,
+    ended: bool,
+}
+
+impl Drop for Cuttable<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.building.built_nothing();
+        }
     }
 }
 
