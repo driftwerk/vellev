@@ -18,7 +18,7 @@ use vellev_node::{Node, Settings, Tenant, LET_GO_FLUSHES_AT_ONCE, LET_GO_FLUSH_W
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
 use vellev_storage::timings::{Holder, Timed};
-use vellev_storage::{Mutation, State, StorageError, Writer};
+use vellev_storage::{Holding, Mutation, State, StorageError, Writer};
 
 fn tenant(name: &str) -> TenantId {
     TenantId::new(name).unwrap()
@@ -562,6 +562,46 @@ async fn a_let_go_s_flush_that_hangs_is_cut_at_its_bound_and_its_rows_replay() {
     let opened = node.tenant(&tenant("hung")).await.unwrap();
     assert_eq!(noted(&opened), 2, "rows lost");
     assert_eq!(opened.read(State::unflushed), 2, "not by replay");
+}
+
+/// Review A of #177, M1: a let-go's flush cut at its deadline mid-build
+/// stops that build. The build runs off the async threads, where dropping
+/// the flush does not reach it, and would otherwise run on for nobody,
+/// holding the rows it copied and a turn among the work off the async
+/// threads. A build held until its flush is stopped stands for one that runs
+/// long: the cut lets it go, and so its turn, within moments, not at the
+/// minute a test hold lasts at most. Real time, as a build held off the async
+/// threads holds a paused clock where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_let_go_s_flush_cut_mid_build_gives_its_build_up() {
+    let within = Duration::from_secs(1);
+    let node = node_on(memory(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+        settings.let_go_flush_within = within;
+    });
+    let builds = node.merge_builds().clone();
+    written(&node, "building", 2).await;
+    unused_long_enough().await;
+    builds.hold(Some(Holding::FlushUntilStopped));
+    let sweep = tokio::spawn({
+        let node = node.clone();
+        async move { node.sweep_now().await }
+    });
+    until(5, "the let-go's flush came to build", || builds.held() == 1).await;
+    tokio::time::timeout(within + Duration::from_secs(2), sweep)
+        .await
+        .expect("the sweep outlasted what it gives its flushes")
+        .unwrap();
+    assert_eq!(node.let_go().flushes_skipped, 1, "{:?}", node.let_go());
+    until(3, "the cut flush's build ran on, holding its turn", || {
+        builds.held() == 0
+    })
+    .await;
+    builds.hold(None);
+    let opened = node.tenant(&tenant("building")).await.unwrap();
+    assert_eq!(noted(&opened), 2, "rows lost");
 }
 
 /// M7-R5b, nothing else in the gap: the tenant's own flush task comes to try

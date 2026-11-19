@@ -2945,6 +2945,7 @@ impl Writer {
             None => return Ok(None),
         };
         let stopping = stopping.clone();
+        let builds = self.merge_builds.clone();
         // The merge's share of its build is let go only after everything the
         // work made or holds, whether or not anyone awaits it: it is the
         // closure's first local, so that it drops last should the work
@@ -2961,6 +2962,9 @@ impl Writer {
                 Some(build) => OnPool::merge(build),
                 None => OnPool::global(),
             };
+            if build.is_none() {
+                builds.held_here(&stopping, HeldAt::Flush);
+            }
             let cpu = vellev_index::pool::thread_cpu();
             let built = match rows(&stopping, build.as_deref(), on) {
                 Ok(Some((file, vectors, with))) => {
