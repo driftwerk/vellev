@@ -846,6 +846,37 @@ async fn a_merge_commit_s_flush_is_not_held_as_a_flush_s() {
     committed.expect("the merge commit's flush was held as a flush's");
 }
 
+/// Review of 79b8103, L8: a sweep dropped while a let-go's flush builds
+/// stops that build, as the deadline's cut does: the build, off the async
+/// threads, is not dropped with the sweep, and would run on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_dropped_mid_flush_gives_its_flush_s_build_up() {
+    let node = node_on(memory(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    let builds = node.merge_builds().clone();
+    written(&node, "building", 2).await;
+    unused_long_enough().await;
+    builds.hold(Some(Holding::FlushUntilStopped));
+    let sweep = tokio::spawn({
+        let node = node.clone();
+        async move { node.sweep_now().await }
+    });
+    until(5, "the let-go's flush came to build", || builds.held() == 1).await;
+    sweep.abort();
+    assert!(sweep.await.is_err_and(|ended| ended.is_cancelled()));
+    let given_up = tokio::time::timeout(Duration::from_secs(3), async {
+        while builds.held() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    builds.hold(None);
+    given_up.expect("the dropped flush's build ran on");
+}
+
 /// Review A of #177, M2: a let-go's flush cut by the sweep's deadline after
 /// its checkpoint was committed and adopted, as it frees what it took out,
 /// went through. It is no flush skipped, nor one that failed, and the next
