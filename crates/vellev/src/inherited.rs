@@ -643,9 +643,14 @@ mod tests {
         }
 
         #[test]
-        fn a_standard_stream_is_refused() {
-            for fd in [0, 1, 2, -1] {
-                assert!(take(fd).is_err(), "{fd}");
+        fn a_standard_stream_or_a_negative_number_is_refused() {
+            for fd in [0, 1, 2] {
+                let err = format!("{:#}", take(fd).unwrap_err());
+                assert!(err.contains("one of the standard streams"), "{fd}: {err}");
+            }
+            for fd in [-1, i32::MIN] {
+                let err = format!("{:#}", take(fd).unwrap_err());
+                assert!(err.contains("isn't a descriptor"), "{fd}: {err}");
             }
         }
 
@@ -664,22 +669,27 @@ mod tests {
             let (reader, mut writer) = std::io::pipe().unwrap();
             writer.write_all(&framed(BOTH)).unwrap();
             drop(writer);
+            // Not dropped until it is shown left open: were it wrongly
+            // taken and closed, dropping it would close a number another
+            // test may hold by then.
+            let reader = std::mem::ManuallyDrop::new(reader);
             let before = inode(reader.as_raw_fd());
             let err = format!("{:#}", take(reader.as_raw_fd()).unwrap_err());
             assert!(err.contains("inherited"), "{err}");
             assert_eq!(inode(reader.as_raw_fd()), before);
-            drop(reader);
+            drop(std::mem::ManuallyDrop::into_inner(reader));
         }
 
         #[test]
         fn an_inherited_descriptor_that_isnt_a_pipe_is_refused_and_left_open() {
             let file = tempfile::tempfile().unwrap();
             inherited(&file);
+            let file = std::mem::ManuallyDrop::new(file);
             let before = inode(file.as_raw_fd());
             let err = format!("{:#}", take(file.as_raw_fd()).unwrap_err());
             assert!(err.contains("pipe"), "{err}");
             assert_eq!(inode(file.as_raw_fd()), before);
-            drop(file);
+            drop(std::mem::ManuallyDrop::into_inner(file));
         }
 
         /// Once taken, the descriptor is close-on-exec, so nothing the node
@@ -694,18 +704,23 @@ mod tests {
             assert_ne!(fd_flags(owned.as_raw_fd()) & libc::FD_CLOEXEC, 0);
         }
 
+        /// Closed by the time the read returns, not some time after on
+        /// the reader's thread: many times over, so a close that races the
+        /// return is seen.
         #[test]
         fn an_inherited_pipe_is_read_and_closed() {
-            let (reader, mut writer) = std::io::pipe().unwrap();
-            writer.write_all(&framed(BOTH)).unwrap();
-            drop(writer);
-            inherited(&reader);
-            let pipe = inode(reader.as_raw_fd());
-            let fd = reader.into_raw_fd();
-            let read = take(fd).unwrap();
-            assert_eq!(read.api_keys, ["k-fixture"]);
-            // Closed: the number is free, or reused by something else.
-            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            for _ in 0..500 {
+                let (reader, mut writer) = std::io::pipe().unwrap();
+                writer.write_all(&framed(BOTH)).unwrap();
+                drop(writer);
+                inherited(&reader);
+                let pipe = inode(reader.as_raw_fd());
+                let fd = reader.into_raw_fd();
+                let read = take(fd).unwrap();
+                assert_eq!(read.api_keys, ["k-fixture"]);
+                // Closed: the number is free, or reused by something else.
+                assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            }
         }
 
         /// A supervisor whose pipe is non-blocking (shared with the node,
