@@ -205,13 +205,34 @@ mod tests {
         assert_eq!(config.api_keys, ["k-fixture"]);
     }
 
+    /// A name the node doesn't take is refused, and is not repeated: a
+    /// supervisor that writes the wrong shape may put a secret where a
+    /// name belongs.
     #[test]
-    fn anything_but_the_two_names_is_refused() {
-        let err = through_pipe(&framed(br#"{"AWS_SECRET_ACCESS_KEY":"s-fixture"}"#))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("AWS_SECRET_ACCESS_KEY"), "{err}");
-        assert!(!err.contains("s-fixture"), "{err}");
+    fn anything_but_the_two_names_is_refused_without_repeating_it() {
+        for payload in [
+            &br#"{"AWS_SECRET_ACCESS_KEY":"s-fixture"}"#[..],
+            br#"{"postgres://u:pw-fixture@127.0.0.1:1/db":"x"}"#,
+            br#"{"postgres://u:pw-fixture@127.0.0.1:1/db":""}"#,
+        ] {
+            let err = format!("{:#}", through_pipe(&framed(payload)).unwrap_err());
+            assert!(err.contains("isn't a secret the node takes"), "{err}");
+            for secret in ["AWS_SECRET_ACCESS_KEY", "s-fixture", "pw-fixture"] {
+                assert!(!err.contains(secret), "{err}");
+            }
+        }
+    }
+
+    /// Keys handed over on the pipe that come to none once trimmed are
+    /// refused, rather than leaving the command line's or environment's
+    /// keys in force.
+    #[test]
+    fn a_key_list_that_is_empty_once_trimmed_is_refused() {
+        for keys in [" ", ",", " , ,"] {
+            let payload = format!(r#"{{"VELLEV_API_KEYS":"{keys}"}}"#);
+            let err = format!("{:#}", through_pipe(&framed(payload.as_bytes())).unwrap_err());
+            assert!(err.contains("VELLEV_API_KEYS"), "{err}");
+        }
     }
 
     #[test]
