@@ -956,16 +956,14 @@ async fn a_let_go_with_nothing_to_flush_adds_no_sample() {
     let store = TenantPuts::new();
     let node = over_budget(store.clone());
     node.timings().keep_events(true);
-    for name in ["flushed", "empty"] {
-        written(&node, name, 1).await.flush().await.unwrap();
-    }
+    written(&node, "flushed", 1).await.flush().await.unwrap();
     written(&node, "tail", 1).await;
     node.timings().drain_events();
     unused_long_enough().await;
     tokio::time::timeout(Duration::from_secs(5), node.sweep_now())
         .await
         .expect("the sweep ended");
-    assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
+    assert_eq!(node.let_go().for_budget, 2, "{:?}", node.let_go());
     assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
     let events = node.timings().drain_events();
     let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
