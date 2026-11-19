@@ -88,17 +88,17 @@ and say what the caller then answers for.
 
 New: `vellev serve --secrets-fd <n>` takes `VELLEV_DATABASE_URL` and
 `VELLEV_API_KEYS` from a pipe the node inherits on descriptor `<n>`,
-rather than from its command line or environment, which other processes
-can read. The flag is not listed in `--help`; the README, under Run,
-gives what the pipe must hold and how a supervisor hands it over. Only
-these two take the pipe: embedding keys and the object store's
+rather than from its command line or environment, which other processes of
+the same user can read. The flag is not listed in `--help`; the README,
+under Run, gives what the pipe must hold and how a supervisor hands it
+over. Only these two take the pipe: embedding keys and the object store's
 credentials still come from the environment. A node started without the
 flag takes both as before.
 
 With the flag, the pipe is their only source: **a node also given either
 one on the command line or in the environment does not start**. It exits
-with status 1, and on stderr, after `Error: `, names the variable, never
-its value:
+with status 1, and on stderr, after `Error: ` on the first line, names the
+variable, never its value:
 
 ```
 VELLEV_DATABASE_URL is also set on the command line or in the environment; with --secrets-fd it comes only on the pipe
@@ -106,11 +106,12 @@ VELLEV_API_KEYS is also set on the command line or in the environment; with --se
 ```
 
 If both are set, it names `VELLEV_DATABASE_URL` alone. A secret given
-empty or blank, on the command line or in the environment, counts as
-unset. To start such a node, remove both variables from its environment,
-and `--database-url` and `--api-keys` from its command line, and hand
-the values on the pipe alone. A node of an earlier release does not know
-the flag and exits with status 2, as for any option it does not take.
+empty or blank (for the keys, only commas and spaces), on the command line
+or in the environment, counts as unset. To start such a node, remove both
+variables from its environment, and `--database-url` and `--api-keys` from
+its command line, and hand the values on the pipe alone. A node of an
+earlier release does not know the flag and exits with status 2, as for any
+option it does not take.
 
 ### What a node answers
 
