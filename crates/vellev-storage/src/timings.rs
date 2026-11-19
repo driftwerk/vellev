@@ -223,7 +223,8 @@ pub enum Timed {
     Kept(KeptFor),
     /// The same spell's upper end: from the first sweep that kept the
     /// tenant so to the first that did not, or, for a spell still open, to
-    /// when it is read. The keep lay between the two.
+    /// when it is read. The keep lay between the two. For a bench: no
+    /// metric serves it.
     KeptUpTo(KeptFor),
 }
 
@@ -254,6 +255,7 @@ impl Timed {
         let index = |holder: Holder| Holder::ALL.iter().position(|h| *h == holder).unwrap();
         let of = |phase: MergePhase| MergePhase::ALL.iter().position(|p| *p == phase).unwrap();
         let kept = |why: KeptFor| KeptFor::ALL.iter().position(|k| *k == why).unwrap();
+        let kept_base = 2 * holders + 2 * phases + 6;
         match self {
             Timed::BuildingWait(holder) => index(holder),
             Timed::BuildingHeld(holder) => holders + index(holder),
@@ -265,8 +267,8 @@ impl Timed {
             Timed::LetGoFlushHeld => 2 * holders + 2 * phases + 3,
             Timed::LetGoFlushQueued => 2 * holders + 2 * phases + 4,
             Timed::LetGoFlushNotReached => 2 * holders + 2 * phases + 5,
-            Timed::Kept(why) => 2 * holders + 2 * phases + 6 + kept(why),
-            Timed::KeptUpTo(why) => 2 * holders + 2 * phases + 6 + KeptFor::ALL.len() + kept(why),
+            Timed::Kept(why) => kept_base + kept(why),
+            Timed::KeptUpTo(why) => kept_base + KeptFor::ALL.len() + kept(why),
         }
     }
 }

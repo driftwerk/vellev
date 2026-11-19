@@ -2554,10 +2554,9 @@ impl Node {
         held + building
     }
 
-    /// The keep spells not yet ended, each as events of how long it has
-    /// run so far, and its upper end, to now, as no event of an ended spell
-    /// tells them: so that a bench holds a tenant kept to the end of its run
-    /// to the keep mark.
+    /// Each open keep spell as its two events: from the first sweep that
+    /// kept it to the last, and to now. So a bench holds a tenant kept to
+    /// the end of its run to the keep mark.
     pub fn kept_spells_open(&self) -> Vec<Event> {
         let (now, at) = (Instant::now(), std::time::Instant::now());
         let since = self.0.kept_since.lock().expect("kept since lock");

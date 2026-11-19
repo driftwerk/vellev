@@ -2689,14 +2689,10 @@ fn reported(
         "let_go_flush.held".into(),
         summary(of(Timed::LetGoFlushHeld)),
     );
-    timings.insert("kept.held".into(), summary(of(Timed::Kept(KeptFor::Held))));
-    timings.insert(
-        "kept.building".into(),
-        summary(of(Timed::Kept(KeptFor::Building))),
-    );
     for why in KeptFor::ALL {
-        let upper = summary(of(Timed::KeptUpTo(why)));
-        timings.insert(format!("kept_up_to.{}", why.name()), upper);
+        let (spells, upper) = (of(Timed::Kept(why)), of(Timed::KeptUpTo(why)));
+        timings.insert(format!("kept.{}", why.name()), summary(spells));
+        timings.insert(format!("kept_up_to.{}", why.name()), summary(upper));
     }
 
     // Merge debt: each tenant carried forward while let go, from its
