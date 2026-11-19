@@ -1824,6 +1824,9 @@ struct Taken {
     kept: Vec<(Arc<Tenant>, usize)>,
     /// How many chosen, written for or copied, something else held.
     held_elsewhere: u64,
+    /// How many chosen, written for, nothing else held but with their
+    /// building lock busy.
+    kept_for_building: u64,
     /// About how many bytes what was taken out held.
     freed: usize,
     /// How many were taken out for being idle, and for the budget.
@@ -1856,8 +1859,9 @@ impl Taken {
                     .get(&held.id)
                     .is_some_and(|now| Arc::ptr_eq(now, opening));
                 let unheld = Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2;
+                let free_of_others = same && unheld && tenant.between_rounds();
                 // Tried last: held from here, so tried only of one that goes.
-                let building = (same && unheld && tenant.between_rounds())
+                let building = free_of_others
                     .then(|| tenant.work.writer.building_if_free())
                     .flatten();
                 if let Some(building) = building {
@@ -1868,7 +1872,10 @@ impl Taken {
                     return true;
                 } else if same {
                     self.kept.push((tenant.clone(), held.size));
-                    self.held_elsewhere += 1;
+                    match free_of_others {
+                        true => self.kept_for_building += 1,
+                        false => self.held_elsewhere += 1,
+                    }
                 }
                 false
             }
@@ -1955,8 +1962,9 @@ struct Inner {
     /// When the node was made: how old its census is until its first sweep.
     started: Instant,
     /// How many tenants sweeps chose to let go but found something else
-    /// holding.
+    /// holding, and how many they kept with their building lock busy.
     held_elsewhere: AtomicU64,
+    kept_for_building: AtomicU64,
     /// How many merges sweeps have stopped so that a tenant over the
     /// budget could be let go.
     stopped_for_budget: AtomicU64,
@@ -2229,6 +2237,7 @@ impl Node {
             sweep_hold: Mutex::default(),
             started: Instant::now(),
             held_elsewhere: AtomicU64::new(0),
+            kept_for_building: AtomicU64::new(0),
             stopped_for_budget: AtomicU64::new(0),
             merges_stopped: Arc::default(),
             let_go_idle: AtomicU64::new(0),
@@ -2362,14 +2371,15 @@ impl Node {
     /// memory budget, but found something else holding, as a request or a
     /// merge does, or with their building lock busy: let go at a later round.
     pub fn tenants_kept_by_sweeps(&self) -> u64 {
-        self.0.held_elsewhere.load(Ordering::Relaxed)
+        let KeptBySweeps { held, building } = self.kept_by_sweeps();
+        held + building
     }
 
     /// [`Self::tenants_kept_by_sweeps`] by why each was kept.
     pub fn kept_by_sweeps(&self) -> KeptBySweeps {
         KeptBySweeps {
-            building: 0,
-            held: self.tenants_kept_by_sweeps(),
+            held: self.0.held_elsewhere.load(Ordering::Relaxed),
+            building: self.0.kept_for_building.load(Ordering::Relaxed),
         }
     }
 
@@ -2892,6 +2902,8 @@ impl Inner {
         let taken = self.taken_out(&idle, &older, total);
         self.held_elsewhere
             .fetch_add(taken.held_elsewhere, Ordering::Relaxed);
+        self.kept_for_building
+            .fetch_add(taken.kept_for_building, Ordering::Relaxed);
         self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
         self.let_go_for_budget
             .fetch_add(taken.for_budget, Ordering::Relaxed);

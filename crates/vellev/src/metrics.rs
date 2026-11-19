@@ -721,13 +721,17 @@ impl Collector for Counted {
             None,
             counter.metric_type(),
         )?)?;
-        let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
-        counter.encode(encoder.encode_descriptor(
+        let kept = node.kept_by_sweeps();
+        let counter = ConstCounter::new(0u64);
+        let mut family = encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does, or with their building lock busy: let go at a later round",
+            "Tenants a sweep chose to let go but kept for a later one: something else held it (held), or its building lock was busy (building)",
             None,
             counter.metric_type(),
-        )?)?;
+        )?;
+        for (reason, count) in [("held", kept.held), ("building", kept.building)] {
+            ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
+        }
         let counter = ConstCounter::new(node.tenants_given_up());
         counter.encode(encoder.encode_descriptor(
             "tenants_given_up",

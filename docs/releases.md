@@ -512,6 +512,9 @@ and say what the caller then answers for.
   "a tenant's task panicked" with the task named.
 - **A sweep waits on no tenant, and its flushes are bounded.** A tenant
   chosen to be let go whose building lock is busy is kept for a later sweep.
+  `vellev_sweep_tenants_kept_total` gains a `reason` label: `held`, as
+  before, for one something else holds, and `building` for one kept only
+  for its busy lock. Their sum is the count the unlabelled series gave.
   One it takes has that lock from then on, with the flush before letting go
   made under it, so nothing comes in between and whatever queued for the
   lock ends with the hold. The tenants of a sweep go together, two flushing
