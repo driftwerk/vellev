@@ -415,9 +415,9 @@ cargo run -p vellev -- serve --listen 127.0.0.1:8080
 ```
 
 A supervisor can hand the database URL and the admin keys over on an
-inherited pipe instead, so they are in neither the node's command line nor
-its environment, which other processes of the same user can read:
-`serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
+inherited pipe instead, so they are in neither the node's command line,
+which any user can usually read, nor its environment, which other
+processes of the same user can: `serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
 and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
 Both are required, and neither may also be set on the command line or in
 the environment. The descriptor must be the read end of an inherited pipe
