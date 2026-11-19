@@ -516,7 +516,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     let counter = ConstCounter::new(let_go.flushes_skipped);
     counter.encode(encoder.encode_descriptor(
         "let_go_flushes_skipped",
-        "Tenants let go with rows unflushed that the flush before letting them go did not reach, or that it was cut short for, as a sweep's flushes are bounded: their rows are in the log, and the next opener replays them",
+        "Let-go flushes cut or not reached by a sweep's deadline: their rows replay unless the commit landed",
         None,
         counter.metric_type(),
     )?)?;

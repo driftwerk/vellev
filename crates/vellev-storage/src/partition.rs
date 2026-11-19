@@ -1351,6 +1351,8 @@ impl Drop for Building<'_> {
 pub struct BuildingHeld {
     writer: Arc<Writer>,
     _guard: OwnedMutexGuard<()>,
+    /// See [`Self::adopted`].
+    adopted: AtomicBool,
 }
 
 impl BuildingHeld {
@@ -1364,7 +1366,8 @@ impl BuildingHeld {
     /// off the async threads, which dropping the flush does not reach, then
     /// lets go of what it holds.
     pub async fn flush(&mut self, stop: &Stop) -> Result<(LogPosition, Option<Duration>)> {
-        let writer = &self.writer;
+        let (writer, adopted) = (&self.writer, &self.adopted);
+        adopted.store(false, Ordering::SeqCst);
         let stopping = Stopping::flush(stop.clone());
         let mut flushing = Cuttable {
             building: Building {
@@ -1377,11 +1380,22 @@ impl BuildingHeld {
             ended: false,
         };
         let flushed = writer
-            .flushing_held(&mut flushing.building, &stopping)
+            .flushing_held(&mut flushing.building, &stopping, Some(adopted))
             .await;
         flushing.ended = true;
         let building = &flushing.building;
         Ok((flushed?, building.timed.then(|| building.held())))
+    }
+}
+
+impl BuildingHeld {
+    /// Whether the last flush under this lock had its checkpoint committed
+    /// and adopted, whether or not it was waited for to its end: as a node
+    /// tells a flush its deadline cut once it went through from one it cut
+    /// before. Nothing else does: the writer's position may move by a commit
+    /// of its own, as one taken into a group before its caller went.
+    pub fn adopted(&self) -> bool {
+        self.adopted.load(Ordering::SeqCst)
     }
 }
 
@@ -2172,7 +2186,8 @@ impl Writer {
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
         let mut building = self.building(Holder::Flush).await;
-        self.flushing_held(&mut building, &Stopping::never()).await
+        self.flushing_held(&mut building, &Stopping::never(), None)
+            .await
     }
 
     /// As [`Self::flush`], if it still holds `rows` rows unflushed once it
@@ -2187,7 +2202,8 @@ impl Writer {
             return Ok(None);
         }
         let stopping = Stopping::never();
-        self.flushing_held(&mut building, &stopping).await.map(Some)
+        let flushed = self.flushing_held(&mut building, &stopping, None).await;
+        flushed.map(Some)
     }
 
     /// The building lock, if nothing holds it or queues for it this moment,
@@ -2200,6 +2216,7 @@ impl Writer {
         Some(BuildingHeld {
             writer,
             _guard: guard,
+            adopted: AtomicBool::new(false),
         })
     }
 
@@ -2213,16 +2230,19 @@ impl Writer {
         BuildingHeld {
             writer,
             _guard: guard,
+            adopted: AtomicBool::new(false),
         }
     }
 
     /// What [`Self::flush`] does once it holds the building lock, as
     /// `building`: which, if there is nothing to flush, built nothing. It
-    /// gives up before its commit once `stopping` is stopped.
+    /// gives up before its commit once `stopping` is stopped, and sets
+    /// `adopted`, if given, as its checkpoint is adopted.
     async fn flushing_held(
         &self,
         building: &mut Building<'_>,
         stopping: &Stopping,
+        adopted: Option<&AtomicBool>,
     ) -> Result<LogPosition> {
         // Noted under the lock it is taken under, so that no rows are
         // applied between: the rows it takes are exactly those it notes.
@@ -2249,7 +2269,13 @@ impl Writer {
         // the turn held, nothing is committed before it is adopted.
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
-            state.flushed(&key, position, snapshot, segment, Some(kept))
+            let discarded = state.flushed(&key, position, snapshot, segment, Some(kept));
+            // Committed, as `adopt` runs only once it is: told before the
+            // checkpoint frees what it took out, where a cut may yet fall.
+            if let Some(adopted) = adopted {
+                adopted.store(true, Ordering::SeqCst);
+            }
+            discarded
         })
         .await?;
         Ok(position)
@@ -3665,7 +3691,9 @@ impl Writer {
             writer: self,
             timed: true,
         };
-        let flushed = self.flushing_held(&mut building, &Stopping::never()).await;
+        let flushed = self
+            .flushing_held(&mut building, &Stopping::never(), None)
+            .await;
         (flush_first.tried)(flushed.is_ok());
         match flushed {
             Ok(position) => Ok(Some(position)),

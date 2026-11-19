@@ -1444,19 +1444,16 @@ impl TenantWork {
     /// anything to flush: so that a let-go with nothing to flush takes none
     /// of `flushes` and adds no sample to the mark the merge bench holds the
     /// wait to (merge note, §3). Its wait for one of `flushes`, and its hold,
-    /// are timed under their own name. `false` if `deadline` came first,
-    /// the sweep's for all it lets go, cutting the flush short or before it
-    /// began: no flush that failed, for its rows are in the log, and the next
-    /// opener replays them. Cut in its commit, a flush closes the writer,
-    /// which is safe with the hold lost at once.
+    /// are timed under their own name. Cut by `deadline`, the sweep's for
+    /// all it lets go, it is no flush that failed: see [`Self::cut_short`].
     async fn flush_to_let_go(
         &self,
         building: &mut BuildingHeld,
         flushes: &Semaphore,
         deadline: Instant,
-    ) -> Result<bool> {
+    ) -> Result<LetGoFlush> {
         if self.read(State::unflushed) == 0 {
-            return Ok(true);
+            return Ok(LetGoFlush::Done);
         }
         let timings = self.writer.timings();
         let partition = &self.writer.lease().key;
@@ -1464,14 +1461,14 @@ impl TenantWork {
         let flush = before(deadline, flushes.acquire()).await;
         timings.record(Timed::LetGoFlushWait, partition, asked.elapsed());
         let Some(Ok(_flush)) = flush else {
-            return Ok(false);
+            return Ok(LetGoFlush::Skipped);
         };
         // Stopped at the cut: the flush's build, off the async threads, is
         // not dropped with it.
         let stop = Stop::new();
         let Some(flushed) = before(deadline, building.flush(&stop)).await else {
             stop.stop();
-            return Ok(false);
+            return Ok(self.cut_short(building));
         };
         self.flush_tried(flushed.is_ok());
         let (_, held) = flushed.map_err(|error| self.failed(error))?;
@@ -1479,7 +1476,23 @@ impl TenantWork {
         if let Some(held) = held {
             timings.record(Timed::LetGoFlushHeld, partition, held);
         }
-        Ok(true)
+        Ok(LetGoFlush::Done)
+    }
+
+    /// What a let-go's flush the deadline cut under `building` came to: done,
+    /// counted as any flush through, if its checkpoint was adopted;
+    /// unknown, if the cut closed the writer in its commit; else skipped.
+    /// Timed as no flush's hold either way.
+    fn cut_short(&self, building: &BuildingHeld) -> LetGoFlush {
+        if building.adopted() {
+            self.flush_tried(true);
+            self.settling.flushed.fetch_add(1, Ordering::SeqCst);
+            LetGoFlush::Done
+        } else if self.writer.is_closed() {
+            LetGoFlush::Unknown
+        } else {
+            LetGoFlush::Skipped
+        }
     }
 
     /// Merge segments until a merge finds nothing to do. Nothing waits for
@@ -1676,6 +1689,18 @@ impl TenantWork {
             _ => error.into(),
         }
     }
+}
+
+/// How the flush made before a tenant is let go ended, short of failing.
+enum LetGoFlush {
+    /// It went through, or there was nothing to flush.
+    Done,
+    /// Cut by the sweep's deadline before its commit, or never reached: its
+    /// rows replay.
+    Skipped,
+    /// Cut in its commit, which closed the writer: its rows replay unless
+    /// its commit landed.
+    Unknown,
 }
 
 /// What `work` comes to, if it ends before `deadline`: never polled once the
@@ -2011,7 +2036,8 @@ pub struct LetGo {
     pub for_budget: u64,
     /// How many of the tenants let go with rows to flush were not flushed,
     /// as a sweep's flushes ran out of time: cut short, or never reached.
-    /// Their rows are in the log, and the next opener replays them.
+    /// Their rows are in the log, and the next opener replays them unless
+    /// a commit cut short landed.
     pub flushes_skipped: u64,
 }
 
@@ -2864,10 +2890,14 @@ impl Inner {
         } = going;
         let work = &tenant.work;
         match work.flush_to_let_go(&mut building, flushes, deadline).await {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(LetGoFlush::Done) => {}
+            Ok(LetGoFlush::Skipped) => {
                 self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(tenant = %tenant.id(), "flush before letting go skipped; the next opener replays its rows");
+            }
+            Ok(LetGoFlush::Unknown) => {
+                self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(tenant = %tenant.id(), "flush before letting go cut in its commit; its rows replay unless its commit landed");
             }
             Err(error) => {
                 tracing::warn!(tenant = %tenant.id(), %error, "flush before letting go failed");
