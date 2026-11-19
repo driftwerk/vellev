@@ -16,10 +16,10 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{MergesStopped, Node, NodeError, Settings};
-use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
+use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs, SpillFigures, SpillsTold};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::timings::{Holder, Timed};
-use vellev_storage::{Holding, MergeGate, Mutation, State, MERGE_BUILDS};
+use vellev_storage::timings::{Holder, MergeEnd, Timed};
+use vellev_storage::{Disk, Holding, MergeGate, Mutation, State, MERGE_BUILDS};
 
 /// Notes written between flushes: as many as a flush is made at.
 const NOTES: u128 = 10;
@@ -835,6 +835,147 @@ async fn a_merge_stopped_by_a_lease_lost_or_a_shutdown_is_counted_as_that() {
     within(30, "the request never ended", shutting)
         .await
         .unwrap();
+}
+
+/// The spills in the cache directory `dir`.
+fn spills(dir: &std::path::Path) -> usize {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let spill =
+        |entry: &std::fs::DirEntry| entry.path().extension().is_some_and(|it| it == "spill");
+    entries.filter(spill).count()
+}
+
+/// M8. A tenant's writer is given the node's store as it is: a merge a node
+/// runs over a cache gathers its vectors there, whatever else the storage
+/// rules say of a store that spills. A store put between them that says
+/// nothing of spills would leave every node gathering on the heap, with every
+/// rule of the storage crate still passing. And what is gathered goes, with
+/// the merge, as the node shuts down. The node reports the spill as its
+/// store counts it, from when it begins until it goes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothing_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ObjectBlobs::new(Arc::new(object_store::memory::InMemory::new()));
+    // A disk of its own, so that its figures are this merge's alone: the
+    // shared one counts whatever else in the process spills to it.
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 64);
+    let cached = CachedBlobs::new(Arc::new(store), dir.path()).on(disk);
+    let cached: Arc<dyn Blobs> = Arc::new(cached);
+    let node = node_on(cached, |settings| {
+        settings.flush_rows = NOTES as usize;
+    });
+    assert_eq!(node.spills(), SpillFigures::default(), "a new disk counts");
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(Holding::GatheringUntilLetGo));
+    four_flushes(&node, "merging").await;
+    until(30, "the merge never gathered", || builds.held() == 1).await;
+    assert_eq!(spills(dir.path()), 1, "gathered on the heap");
+    let gathering = node.spills();
+    assert!(
+        gathering.bytes > 0,
+        "a spill under way not counted: {gathering:?}"
+    );
+    node.shutdown().await;
+    builds.hold(None);
+    builds.let_one_go();
+    until(30, "a stopped merge's spill stays", || {
+        spills(dir.path()) == 0 && builds.under_way() == 0
+    })
+    .await;
+    until(30, "a spill gone still counted", || {
+        node.spills().bytes == 0
+    })
+    .await;
+}
+
+/// A store under a cache, counting what is deleted from it.
+#[derive(Debug)]
+struct DeletesCounted {
+    inner: Arc<dyn Blobs>,
+    deletes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for DeletesCounted {
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete(key).await
+    }
+}
+
+/// M8-R15. Cleaning up is the one thing that frees a disk a merge has no room
+/// on, so a round whose merge fails, or is skipped for want of that room,
+/// goes on to clean all the same.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_whose_merge_fails_or_is_skipped_still_cleans_up() {
+    for skipped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(DeletesCounted {
+            inner: Arc::new(ObjectBlobs::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            ))),
+            deletes: deletes.clone(),
+        });
+        let told = Arc::new(SpillsTold::default());
+        let disk =
+            Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
+        let cached = CachedBlobs::new(store, dir.path()).on(disk);
+        match skipped {
+            true => told.free.store(0, Ordering::SeqCst),
+            false => told.at_most.store(0, Ordering::SeqCst),
+        }
+        let node = node_on(Arc::new(cached), |settings| {
+            settings.flush_rows = NOTES as usize;
+            settings.restore_window = Duration::ZERO;
+            settings.grace = Duration::ZERO;
+        });
+        four_flushes(&node, "merging").await;
+        let end = match skipped {
+            true => MergeEnd::NoRoom,
+            false => MergeEnd::Failed,
+        };
+        until(30, "no merge ended so", || {
+            node.timings().merges_ended(end) > 0
+        })
+        .await;
+        // The node reports it as its store counts it.
+        let figures = node.spills();
+        let (counted, other) = match skipped {
+            true => (figures.skipped, figures.failed),
+            false => (figures.failed, figures.skipped),
+        };
+        assert!(counted > 0 && other == 0, "{end:?} reported as {figures:?}");
+        // The rounds before it cleaned, having no merge to fail: what counts
+        // is one more flush's leavings going, with every round's merge
+        // ending as this one did.
+        let ended = node.timings().merges_ended(end);
+        let cleaned = deletes.load(Ordering::SeqCst);
+        let held = node.tenant(&tenant("merging")).await.unwrap();
+        let batch: Vec<Mutation> = (0..NOTES).map(|n| note(9_000 + n)).collect();
+        held.write(batch).await.unwrap();
+        until(30, "no later merge ended so", || {
+            node.timings().merges_ended(end) > ended
+        })
+        .await;
+        until(30, "a round that merged nothing cleaned nothing", || {
+            deletes.load(Ordering::SeqCst) > cleaned
+        })
+        .await;
+        drop(held);
+        node.shutdown().await;
+    }
 }
 
 /// M7-R4, for the sweep's own stop: every sweep that finds the tenant held
