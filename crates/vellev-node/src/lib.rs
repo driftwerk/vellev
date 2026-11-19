@@ -2387,9 +2387,18 @@ impl Node {
     }
 
     /// The keep spells not yet ended, each as an event of how long it has
-    /// run so far. Not reported yet.
+    /// run so far, as no event of an ended spell tells it: so that a bench
+    /// holds a tenant kept to the end of its run to the keep mark.
     pub fn kept_spells_open(&self) -> Vec<Event> {
-        Vec::new()
+        let (now, at) = (Instant::now(), std::time::Instant::now());
+        let since = self.0.kept_since.lock().expect("kept since lock");
+        let open = since.values().map(|(why, began, partition)| Event {
+            timed: Timed::Kept(*why),
+            took: now.saturating_duration_since(*began),
+            partition: partition.clone(),
+            at,
+        });
+        open.collect()
     }
 
     /// [`Self::tenants_kept_by_sweeps`] by why each was kept.

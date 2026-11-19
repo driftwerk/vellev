@@ -3094,6 +3094,8 @@ async fn arm(bench: Bench, running: Running) {
     let at_end = Reading::of(&node, &app);
     let _ = tokio::time::timeout(Duration::from_secs(30), sampler).await;
     events.lock().unwrap().extend(node.timings().drain_events());
+    // A tenant kept to the end is held to the keep mark as it stands.
+    events.lock().unwrap().extend(node.kept_spells_open());
     // Served until the load generator has its last answers and has
     // reported, or for ten minutes at most.
     let load_reported = appeared(&load_path(&bench), Duration::from_secs(10 * 60))
