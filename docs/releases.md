@@ -10,12 +10,17 @@ cannot see.
 
 A release is checked by every gate a commit to main is, and by one more:
 no dependency may have an advisory in the RustSec database that
-`deny.toml` does not ignore. A pull request is not held to that, so that
+`deny.toml` does not ignore. No per-commit gate is held to that, so that
 an advisory reported overnight does not turn unrelated work red; the
 nightly checks it instead, and opens an issue while it fails. An
 advisory reported the morning of a release therefore stops it, until the
 dependency is moved off or the advisory is ignored in `deny.toml` with
 its reason, a date to look at it again, and the owner's OK.
+
+The check reads `deny.toml` as the tagged commit has it, so running the
+stopped release again changes nothing: tag the commit that carries the
+fix, a new version or the same one moved to it. Running Publish by hand
+from main instead publishes the crates but does not name the image.
 
 ## 0.2.0
 
