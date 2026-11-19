@@ -947,6 +947,26 @@ async fn restorable(node: &Node, acme: &TenantId) -> vellev_storage::Receipt {
     kept
 }
 
+/// Review of f800a51, L2: the hold a test puts on a flush's build holds no
+/// restore's. A restore to a point with rows in memory builds a segment of
+/// them, which nothing stops: held as a flush's, it would wait out the
+/// hold's bound.
+#[tokio::test]
+async fn a_restore_s_build_is_not_held_as_a_flush_s() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::FlushUntilStopped));
+    let point = Point::Position(kept.position);
+    let restoring = node.restore(&acme, point, RequestId::generate());
+    let restored = tokio::time::timeout(Duration::from_secs(20), restoring).await;
+    builds.hold(None);
+    let restored = restored.expect("the restore's build was held as a flush's");
+    assert!(restored.is_ok(), "{restored:?}");
+}
+
 #[tokio::test]
 async fn a_restore_asked_for_again_is_answered_as_it_was_on_any_node_and_undoes_nothing_since() {
     let cluster = Cluster::new();
