@@ -26,7 +26,7 @@ use vellev_storage::{Disk, Transfers};
 pub struct Config {
     /// Postgres, for the record of who writes each tenant and how far.
     /// Required, unless a supervisor hands it over on a pipe
-    /// (`--secrets-fd`).
+    /// (`--secrets-fd`), in which case it must not also be given here.
     #[arg(
         long,
         env = "VELLEV_DATABASE_URL",
@@ -58,7 +58,9 @@ pub struct Config {
     pub identity_keys: Vec<String>,
     /// The admin keys, separated by commas: each reaches every tenant and
     /// alone may create, drop and list tenants and issue their keys. A key
-    /// that reaches one tenant is issued through the API.
+    /// that reaches one tenant is issued through the API. With
+    /// `--secrets-fd` they come on the pipe, and must not also be given
+    /// here.
     #[arg(
         long,
         env = "VELLEV_API_KEYS",

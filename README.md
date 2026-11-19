@@ -422,8 +422,10 @@ and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
 Both are required, and neither may also be set on the command line or in
 the environment. The descriptor must be an inherited pipe (not
 close-on-exec) that the supervisor wrote the payload to once and closed its
-own end of before starting the node: bytes after the payload are refused,
-and the node gives up after 10 seconds.
+own end of before starting the node, and no other copy of the write end may
+survive, in the supervisor's other children included. Bytes after the
+payload and a name given twice are refused, and the node gives up after 10
+seconds.
 
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,

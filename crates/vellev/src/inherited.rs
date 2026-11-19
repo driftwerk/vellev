@@ -11,15 +11,17 @@
 //! on the command line or in the environment is refused.
 //!
 //! The descriptor must be a pipe the node inherited (not close-on-exec);
-//! once taken it is made close-on-exec, and blocking. The supervisor writes the payload once
-//! and closes its end before the node starts: the node reads the frame and
-//! then the pipe's end, so bytes written after the frame are refused, and
-//! a write end still open elsewhere, like a supervisor that never writes,
-//! is an error at the deadline rather than a node waiting for ever. Errors
-//! name one of the two variables or a position, never a value, nor a name
-//! the node doesn't take.
+//! once taken it is made close-on-exec, and blocking. The supervisor writes
+//! the payload once and closes its end before the node starts, and no other
+//! copy of the write end may survive anywhere, in other children of the
+//! supervisor included: the node reads the frame and then the pipe's end,
+//! so bytes written after the frame, or a name given twice in it, are
+//! refused, and a write end still open elsewhere, like a supervisor that
+//! never writes, is an error at the deadline (saying which) rather than a
+//! node waiting for ever. Errors name one of the two variables or a
+//! position, never a value, nor a name the node doesn't take.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -151,8 +153,12 @@ impl Inherited {
         // Read on a thread of its own, so a supervisor that never writes is
         // an error at the deadline rather than a node that never starts.
         let (tx, rx) = std::sync::mpsc::channel();
+        // Set once the frame is in, so a pipe that never ends after it is
+        // told from one nothing was written to.
+        let framed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let framed_in = framed.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::read_frame(&mut file));
+            let _ = tx.send(Self::read_frame(&mut file, &framed_in));
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
@@ -162,10 +168,22 @@ impl Inherited {
                 bail!("more was written after the secrets; the supervisor writes them once")
             }
             Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
-            Err(_) => bail!(
-                "the secrets didn't arrive within {within:?}, with their writer's end \
-                 closed after them"
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if framed.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                bail!(
+                    "the secrets arrived, but the pipe's write end is still open elsewhere \
+                     after {within:?}: the supervisor, and every child of it, must close it \
+                     once they are written"
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "the secrets didn't arrive within {within:?}, nor did the pipe's write end \
+                 close"
             ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("reading the secrets stopped without an answer")
+            }
         };
         Self::parse(&body)
     }
@@ -173,7 +191,10 @@ impl Inherited {
     /// The framed payload, and then the end of the pipe: the supervisor
     /// writes it once and closes its end, so anything after it was written
     /// by something else.
-    fn read_frame(file: &mut std::fs::File) -> std::result::Result<Vec<u8>, Unread> {
+    fn read_frame(
+        file: &mut std::fs::File,
+        framed: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<Vec<u8>, Unread> {
         let short = |e: std::io::Error| match e.kind() {
             std::io::ErrorKind::UnexpectedEof => Unread::Short,
             _ => Unread::Io(e),
@@ -186,6 +207,7 @@ impl Inherited {
         }
         let mut body = vec![0u8; len];
         file.read_exact(&mut body).map_err(short)?;
+        framed.store(true, std::sync::atomic::Ordering::Release);
         let mut after = [0u8; 1];
         loop {
             match file.read(&mut after) {
@@ -200,7 +222,7 @@ impl Inherited {
     fn parse(body: &[u8]) -> Result<Self> {
         // serde_json's messages can quote what they read: only the position
         // is kept.
-        let raw: BTreeMap<String, String> = serde_json::from_slice(body).map_err(|e| {
+        let Pairs(raw) = serde_json::from_slice(body).map_err(|e| {
             eyre!(
                 "the secrets aren't a JSON object of strings (line {}, column {})",
                 e.line(),
@@ -208,7 +230,12 @@ impl Inherited {
             )
         })?;
         let mut inherited = Self::default();
+        let mut seen = BTreeSet::new();
         for (name, value) in raw {
+            let known = name == DATABASE_URL || name == API_KEYS;
+            if known && !seen.insert(name.clone()) {
+                bail!("{name} was handed over twice");
+            }
             // A name is repeated only once it is known to be one of the
             // two: a supervisor that writes the wrong shape may put a
             // secret where a name belongs.
@@ -265,6 +292,34 @@ impl Inherited {
         config.database_url = self.database_url.unwrap_or_default();
         config.api_keys = self.api_keys;
         Ok(())
+    }
+}
+
+/// A JSON object of strings, its names and values in the order given,
+/// repeats kept, so a name given twice is seen rather than the last one
+/// silently winning.
+struct Pairs(Vec<(String, String)>);
+
+impl<'de> serde::Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Pairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object of strings")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Pairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry::<String, String>()? {
+                    pairs.push(pair);
+                }
+                Ok(Pairs(pairs))
+            }
+        }
+        d.deserialize_map(Visit)
     }
 }
 
@@ -389,8 +444,14 @@ mod tests {
         let mut twice = framed(BOTH);
         twice.extend(framed(br#"{"VELLEV_API_KEYS":"forged-fixture"}"#));
         let err = format!("{:#}", through_pipe(&twice).unwrap_err());
-        assert!(err.contains("after"), "{err}");
+        assert!(err.contains("more was written"), "{err}");
         assert!(!err.contains("forged-fixture"), "{err}");
+        for stray in 1..=3 {
+            let mut trailer = framed(BOTH);
+            trailer.extend(std::iter::repeat_n(b'x', stray));
+            let err = format!("{:#}", through_pipe(&trailer).unwrap_err());
+            assert!(err.contains("more was written"), "{stray}: {err}");
+        }
     }
 
     /// A name the node doesn't take is refused, and is not repeated: a
@@ -412,17 +473,73 @@ mod tests {
     }
 
     /// Keys handed over on the pipe that come to none once trimmed are
-    /// refused, rather than leaving the command line's or environment's
-    /// keys in force.
+    /// refused as such, beside a good database URL.
     #[test]
     fn a_key_list_that_is_empty_once_trimmed_is_refused() {
         for keys in [" ", ",", " , ,"] {
-            let payload = format!(r#"{{"VELLEV_API_KEYS":"{keys}"}}"#);
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"{keys}"}}"#);
             let err = format!(
                 "{:#}",
                 through_pipe(&framed(payload.as_bytes())).unwrap_err()
             );
-            assert!(err.contains("VELLEV_API_KEYS"), "{err}");
+            assert!(
+                err.contains("VELLEV_API_KEYS was handed over with no key in it"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A database URL handed over blank is refused as such, not left for
+    /// `checked()` to call missing.
+    #[test]
+    fn a_blank_database_url_is_refused() {
+        for url in ["", " ", "\\t "] {
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"{url}","VELLEV_API_KEYS":"k-fixture"}}"#);
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(payload.as_bytes())).unwrap_err()
+            );
+            assert!(
+                err.contains("VELLEV_DATABASE_URL was handed over empty"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A name given twice is refused, as anything after the frame is: the
+    /// supervisor writes each once. Only a known name is repeated.
+    #[test]
+    fn a_name_given_twice_is_refused() {
+        let twice = br#"{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"a-fixture","VELLEV_API_KEYS":"b-fixture"}"#;
+        let err = format!("{:#}", through_pipe(&framed(twice)).unwrap_err());
+        assert!(
+            err.contains("VELLEV_API_KEYS was handed over twice"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("a-fixture") && !err.contains("b-fixture"),
+            "{err}"
+        );
+        let unknown = br#"{"postgres://u:pw-fixture@h/db":"x","postgres://u:pw-fixture@h/db":"y"}"#;
+        let err = format!("{:#}", through_pipe(&framed(unknown)).unwrap_err());
+        assert!(!err.contains("pw-fixture"), "{err}");
+    }
+
+    /// Blank values clap leaves from an empty or comma-only variable count
+    /// as unset, as they do for `keys()` and `checked()`.
+    #[test]
+    fn blank_values_from_the_environment_are_not_a_second_source() {
+        for (url, keys) in [("", vec![""]), ("  ", vec![" ", ""]), ("", vec![])] {
+            let mut config = bare_config();
+            config.database_url = url.into();
+            config.api_keys = keys.into_iter().map(String::from).collect();
+            through_pipe(&framed(BOTH))
+                .unwrap()
+                .apply(&mut config)
+                .unwrap();
+            assert_eq!(config.api_keys, ["k-fixture"]);
         }
     }
 
@@ -458,17 +575,21 @@ mod tests {
     #[test]
     fn a_silent_pipe_or_a_held_write_end_is_refused_at_the_deadline() {
         let (reader, writer) = std::io::pipe().unwrap();
-        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+        let silent = Inherited::read(reader.into(), Duration::from_millis(200))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("within"), "{err}");
+        assert!(silent.contains("didn't arrive within"), "{silent}");
         drop(writer);
+        // The payload is in, but the pipe never ends: the error says so,
+        // as this is a supervisor (or a child of it) still holding a copy
+        // of the write end, not one that never wrote.
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(&framed(BOTH)).unwrap();
-        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+        let held = Inherited::read(reader.into(), Duration::from_millis(200))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("within"), "{err}");
+        assert!(held.contains("write end is still open"), "{held}");
+        assert!(!held.contains("didn't arrive"), "{held}");
         drop(writer);
     }
 
