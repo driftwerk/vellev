@@ -2060,12 +2060,12 @@ mod tests {
                 let mut noise = Noise(seed);
                 (0..rows).map(|_| noise.vector(dimensions)).collect()
             };
-            let numbered: Vec<(u32, &[f32])> = vectors
+            let by_row: Vec<(u32, &[f32])> = vectors
                 .iter()
                 .enumerate()
                 .map(|(n, v)| (first + n as u32 * spread, v.as_slice()))
                 .collect();
-            let built = ClusteredIndex::build(Distance::Cosine, &numbered).unwrap();
+            let built = ClusteredIndex::build(Distance::Cosine, &by_row).unwrap();
             let read: ClusteredIndex =
                 rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
             let last = first + (rows as u32 - 1) * spread;
@@ -2414,7 +2414,7 @@ mod tests {
         assert_eq!(crate::pool::tuning().current_num_threads(), 1);
         let vectors = grouped(5, 3_000, 16, 12, 0.3);
         let index = indexed(Distance::Cosine, &vectors);
-        let numbered: Vec<(u32, &[f32])> = numbered(&vectors).collect();
+        let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
         let (release, held) = std::sync::mpsc::channel::<()>();
         let held = std::sync::Arc::new(std::sync::Mutex::new(held));
         let (started, busy) = std::sync::mpsc::channel::<()>();
@@ -2434,7 +2434,7 @@ mod tests {
             scope.spawn(|| {
                 done.send(
                     index
-                        .sample_ranks(&numbered, &samples, crate::pool::tuning())
+                        .sample_ranks(&by_row, &samples, crate::pool::tuning())
                         .len(),
                 )
                 .unwrap()
@@ -2467,8 +2467,8 @@ mod tests {
             let read: ClusteredIndex =
                 rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
             proptest::prop_assert_eq!(read.rows_curve(), None);
-            let numbered: Vec<(u32, &[f32])> = numbered(&vectors).collect();
-            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+            let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&by_row), built.rows_curve());
         }
     }
 
@@ -2494,10 +2494,10 @@ mod tests {
                 (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
             };
             let index = indexed(metric, &vectors);
-            let numbered: Vec<(u32, &[f32])> = numbered(&vectors).collect();
+            let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
             let samples: Vec<usize> = (0..rows).step_by(7).collect();
-            let found = index.nearest_of_samples(&numbered, &samples, &Stop::new()).unwrap();
-            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
+            let found = index.nearest_of_samples(&by_row, &samples, &Stop::new()).unwrap();
+            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &by_row, &samples));
 
             let curve = index.rows_curve().expect("a built index has a curve of its rows");
             proptest::prop_assert_eq!(curve.source, crate::curve::Source::Rows);
@@ -3039,8 +3039,8 @@ mod tests {
             for metric in [Distance::Dot, Distance::L2] {
                 let index = indexed(metric, &vectors);
                 assert!(index.unmeasured(None, &[]).is_empty());
-                for (at, vector) in vectors.iter().enumerate().step_by(7) {
-                    let (cluster, place) = index.at[index.position(at as u32 * 2).unwrap()];
+                for (row, vector) in numbered(&vectors).step_by(7) {
+                    let (cluster, place) = index.at[index.position(row).unwrap()];
                     let centroid = index.centroid(cluster as usize);
                     let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
                     let factor = index.clusters[cluster as usize].factors[place as usize];
