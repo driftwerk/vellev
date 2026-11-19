@@ -747,10 +747,13 @@ impl Hold {
     /// counted for `why`; one stopped already is not, so what first stopped
     /// it is what it is counted as. A merge that no task of this hold runs,
     /// as a request's, past where a stop ends it, goes on: nothing here
-    /// stopped it.
+    /// stopped it. Only the first call does anything: [`Self::opened`] and
+    /// [`Self::stops`] stop what comes after it.
     fn lose(&self, why: Lost) {
         let mut tasks = self.tasks.lock().expect("tasks lock");
-        self.lost.store(true, Ordering::SeqCst);
+        if self.lost.swap(true, Ordering::SeqCst) {
+            return;
+        }
         if let Some(commits) = self.commits.get() {
             commits.stop();
         }
@@ -870,11 +873,7 @@ impl Drop for GivesUp {
             );
             self.given_up.fetch_add(1, Ordering::Relaxed);
         }
-        // Lost already, what stopped it said why: a second `lose` would
-        // count a merge begun since as a lease lost.
-        if !self.hold.is_lost() {
-            self.hold.lose(Lost::Lease);
-        }
+        self.hold.lose(Lost::Lease);
     }
 }
 
@@ -3706,11 +3705,11 @@ impl Inner {
                 let Some(deadline) = deadline.upgrade() else {
                     return;
                 };
-                if hold.is_lost() {
-                    return;
-                }
                 if stopped.load(Ordering::SeqCst) {
                     hold.lose(Lost::Shutdown);
+                    return;
+                }
+                if hold.is_lost() {
                     return;
                 }
                 let unusable = hold
