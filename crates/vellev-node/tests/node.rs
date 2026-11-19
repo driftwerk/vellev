@@ -2047,13 +2047,10 @@ async fn acquire_gated(
         let node = node.clone();
         async move { node.tenant(&tenant).await.map(|_| ()) }
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+    until("the opening at its acquire", || {
+        coordinator.acquires_waiting.load(Ordering::SeqCst) > 0
     })
-    .await
-    .expect("the opening never came to its acquire");
+    .await;
     opening
 }
 
@@ -2082,13 +2079,10 @@ async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
     // Its reads take a day: it holds its lease in Writer::open.
     *cluster.store.slow.lock().unwrap() = Some(Duration::from_secs(24 * 60 * 60));
     coordinator.acquire_gate.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.acquires_waiting.load(Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+    until("the opening's lease", || {
+        coordinator.acquires_waiting.load(Ordering::SeqCst) == 0
     })
-    .await
-    .expect("the opening never had its lease");
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !given_up(&cluster, "stuck").await,

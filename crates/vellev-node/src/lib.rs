@@ -1200,7 +1200,8 @@ impl Tenant {
     /// Move what has been written since the last checkpoint out of memory.
     /// However it is asked for, one that fails puts the next the node
     /// tries off, as [`Settings::flush_backoff`] says, and is counted in
-    /// [`Node::flushing`]; one that goes through ends that.
+    /// [`Node::flushing`]; one that goes through ends that. Refused with
+    /// [`StorageError::Closed`] once the hold on the tenant is lost.
     pub async fn flush(&self) -> Result<LogPosition> {
         self.work.flush().await
     }
@@ -1208,6 +1209,8 @@ impl Tenant {
     /// Merge segments until a merge finds nothing to do, and then delete
     /// the files nothing needs any more, as [`Writer::clean`] with `grace`,
     /// which deletes so many at once, until one finds fewer than that.
+    /// Refused with [`StorageError::Closed`] once the hold on the tenant is
+    /// lost.
     ///
     /// `grace` is taken as it is given, and nothing here checks it. A node
     /// looking after its tenants gives the tenant's restore window and
@@ -1437,7 +1440,7 @@ impl TenantWork {
         *backoff = (failed, Some(Instant::now() + wait));
     }
 
-    /// As [`Tenant::flush`]. Refused once the hold is lost, as a write is.
+    /// As [`Tenant::flush`].
     async fn flush(&self) -> Result<LogPosition> {
         self.not_lost()?;
         let flushed = self.writer.flush().await;
@@ -1539,8 +1542,6 @@ impl TenantWork {
     /// be asleep through: rows replayed at an open ask for no flush. One that
     /// goes through adds to no flushes to be followed, as this goes on
     /// merging, and a merge dropped after one says so by a position.
-    ///
-    /// Refused once the hold is lost, as a write is, before each merge.
     async fn merged(&self) -> Result<()> {
         let tried = |went_through| {
             self.flush_tried(went_through);
@@ -1565,7 +1566,7 @@ impl TenantWork {
         }
     }
 
-    /// Refused once the hold is lost, as a write is then.
+    /// Refused once the hold is lost, as a write is.
     fn not_lost(&self) -> Result<()> {
         match self.hold.is_lost() {
             true => Err(StorageError::Closed.into()),
