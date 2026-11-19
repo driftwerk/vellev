@@ -690,73 +690,38 @@ async fn a_merge_stopped_as_it_waits_with_its_turn_gives_the_turn_back_at_once()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_under_way_sends_a_turn_waiting_for_its_lock_back_at_once() {
     let builds = MergeBuilds::new(1);
-    let (cluster, other) = (Cluster::new().await, Cluster::new().await);
-    builds.hold(Some(Holding::UntilLetGo));
-    let writer = flushed(&cluster, &builds, 2).await;
-    let holder = flushed(&other, &builds, 2).await;
-    let holding = tokio::spawn({
-        let holder = holder.clone();
-        async move { holder.merge().await }
-    });
-    until(60, "the other merge never came to build", || {
-        builds.held() == 1
-    })
-    .await;
+    let cluster = Cluster::new().await;
     // Past its look for a restore, in the queue for the turn the other holds:
     // waited for, however long the merge takes to get there.
-    let merging = tokio::spawn({
-        let writer = writer.clone();
-        async move { writer.merge().await }
-    });
-    until(60, "the merge never came to ask for its turn", || {
-        builds.asking() == 1
-    })
-    .await;
-    let at = cluster.committed().await;
-    let restore = Restore {
-        request: RequestId::generate(),
-        asked: [0; 32],
-        from: at.log_position,
-        from_at: cluster.clock.now(),
-    };
+    let mut queued = queued(&cluster, &builds).await;
+    let (restore, head) = restore_of(&cluster).await;
+    let writer = queued.writer.clone();
     let restoring = writer
         .restore_from(
             cluster.blobs.clone(),
-            at.manifest.as_ref(),
+            head.as_ref(),
             restore,
             None,
             &Claimed,
         )
         .await
         .unwrap();
-    builds.hold(None);
-    within(60, "the other merge never ended", holding)
-        .await
-        .unwrap()
-        .unwrap();
-    until(3, "a turn stayed idle behind a restore", || {
-        builds.turns_free() == 1 && builds.under_way() == 0
-    })
-    .await;
-    assert!(!merging.is_finished());
+    queued.waiting_on_the_lock(&builds).await;
     drop(restoring);
-    let merged = within(60, "the merge never ended", merging).await;
-    assert!(merged.unwrap().unwrap().is_some());
-    assert_eq!(writer.timings().merges_ended(MergeEnd::Committed), 1);
-    assert_eq!(writer.timings().merges_ended(MergeEnd::Stale), 0);
+    queued.committed(None).await;
     assert_eq!(builds.turns_free(), 1);
 }
 
 /// A writer's merge queued for the one turn of `builds`, past its look for
 /// a restore, behind another tenant's merge held at its build.
-struct Queued {
+struct QueuedMerge {
     writer: Arc<Writer>,
     holding: tokio::task::JoinHandle<vellev_storage::Result<Option<LogPosition>>>,
     merging: tokio::task::JoinHandle<vellev_storage::Result<Option<LogPosition>>>,
     ended: Arc<AtomicBool>,
 }
 
-async fn queued(cluster: &Cluster, builds: &Arc<MergeBuilds>) -> Queued {
+async fn queued(cluster: &Cluster, builds: &Arc<MergeBuilds>) -> QueuedMerge {
     builds.hold(Some(Holding::UntilLetGo));
     let writer = flushed(cluster, builds, 2).await;
     let holder = flushed(&Cluster::new().await, builds, 2).await;
@@ -778,7 +743,7 @@ async fn queued(cluster: &Cluster, builds: &Arc<MergeBuilds>) -> Queued {
         builds.asking() == 1
     })
     .await;
-    Queued {
+    QueuedMerge {
         writer,
         holding,
         merging,
@@ -786,7 +751,7 @@ async fn queued(cluster: &Cluster, builds: &Arc<MergeBuilds>) -> Queued {
     }
 }
 
-impl Queued {
+impl QueuedMerge {
     /// The other merge let go, and with it the turn, which the merge takes
     /// and gives back as it waits for the lock a restore holds.
     async fn waiting_on_the_lock(&mut self, builds: &MergeBuilds) {
@@ -805,9 +770,12 @@ impl Queued {
         );
     }
 
-    /// Hold the writer's restores as they let writes and merges on, and
-    /// let them go, once `before` is done, as the merge ends or within 2 s:
-    /// it can end meanwhile only if the restore let its lock go first.
+    /// Hold the writer's restores as they let writes and merges on, and,
+    /// once one is held there, let it go as the merge ends or within 2 s,
+    /// `before` done first: the merge can end meanwhile only if the restore
+    /// let its lock go first. The 2 s start only once the restore is held,
+    /// so that however slow it is to get there they can never let it go
+    /// before it has.
     fn held_as_it_lets_on(
         &self,
         before: impl FnOnce() + Send + 'static,
@@ -816,6 +784,14 @@ impl Queued {
         let letting_go = std::thread::spawn({
             let (gate, ended) = (gate.clone(), self.ended.clone());
             move || {
+                let armed = std::time::Instant::now();
+                while !gate.reached.load(Ordering::SeqCst) {
+                    if armed.elapsed() > Duration::from_secs(60) {
+                        // Let go, for the rule to fail on `reached`.
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 let held = std::time::Instant::now();
                 while !ended.load(Ordering::SeqCst) && held.elapsed() < Duration::from_secs(2) {
                     std::thread::sleep(Duration::from_millis(5));
@@ -829,11 +805,13 @@ impl Queued {
 
     /// The merge committed, not dropped as stale for a restore that put
     /// nothing back.
-    async fn committed(self, gate: &RefusalGate) {
-        assert!(
-            gate.reached.load(Ordering::SeqCst),
-            "the restore never let writes on"
-        );
+    async fn committed(self, gate: Option<&RefusalGate>) {
+        if let Some(gate) = gate {
+            assert!(
+                gate.reached.load(Ordering::SeqCst),
+                "the restore never let writes on"
+            );
+        }
         let merged = within(60, "the merge never ended", self.merging).await;
         assert!(
             merged.unwrap().unwrap().is_some(),
@@ -882,7 +860,23 @@ async fn a_restore_given_up_lets_merges_on_before_its_lock_goes() {
     let (gate, letting_go) = queued.held_as_it_lets_on(|| {});
     drop(restoring);
     letting_go.join().unwrap();
-    queued.committed(&gate).await;
+    queued.committed(Some(&gate)).await;
+    // Disarmed, a gate set before holds no restore after.
+    let unarmed = writer.hold_refusals();
+    writer.stop_holding_refusals();
+    let (restore, head) = restore_of(&cluster).await;
+    let after = writer
+        .restore_from(
+            cluster.blobs.clone(),
+            head.as_ref(),
+            restore,
+            None,
+            &Claimed,
+        )
+        .await
+        .unwrap();
+    drop(after);
+    assert!(!unarmed.reached.load(Ordering::SeqCst), "held, disarmed");
 }
 
 /// A store whose puts fail while armed, and otherwise is the one it is
@@ -982,8 +976,8 @@ async fn a_restore_whose_commit_fails_lets_merges_on_before_its_lock_goes() {
     });
     cluster.blobs = refused.clone();
     let mut queued = queued(&cluster, &builds).await;
-    // Unflushed, for the commit to put before it publishes, which a commit
-    // failing after closes the writer.
+    // Unflushed, so that the commit puts it before it publishes. A commit
+    // that fails at or after publishing closes the writer.
     let mut random = Random(7);
     let unflushed = vec![note(10 * NOTES, &mut random)];
     queued.writer.commit(unflushed).await.unwrap();
@@ -1010,7 +1004,7 @@ async fn a_restore_whose_commit_fails_lets_merges_on_before_its_lock_goes() {
         "committed with puts refused"
     );
     letting_go.join().unwrap();
-    queued.committed(&gate).await;
+    queued.committed(Some(&gate)).await;
 }
 
 /// A merge stopped once it has given its turn back, with no turn to go back,

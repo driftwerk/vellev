@@ -680,7 +680,7 @@ impl Reservation {
         let kept = Arc::new(Kept::default());
         let parked = *lock(&builds.parked_at_most);
         let (turns, granted) = (builds.turns.clone(), kept.clone());
-        let counted = Queued::counted(&builds.queued);
+        let counted = Place::counted(&builds.queued);
         let asking = tokio::spawn(async move {
             let acquired = turns.acquire_owned().await;
             drop(counted);
@@ -732,16 +732,16 @@ impl Drop for Reservation {
 
 /// A place in the queue for a turn, counted from when it is made until its
 /// turn is had, the turns are closed, or the task asking for it is aborted.
-struct Queued(Arc<AtomicUsize>);
+struct Place(Arc<AtomicUsize>);
 
-impl Queued {
+impl Place {
     fn counted(queued: &Arc<AtomicUsize>) -> Self {
         queued.fetch_add(1, Ordering::SeqCst);
         Self(queued.clone())
     }
 }
 
-impl Drop for Queued {
+impl Drop for Place {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
