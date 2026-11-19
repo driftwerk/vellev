@@ -42,7 +42,7 @@ use vellev_node::{MergePool, Node, Settings};
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
 use vellev_storage::timings::{Event, Holder, KeptFor, MergePhase, OpenWaits, Timed};
-use vellev_storage::{Disk, Mutation, Transfers, MERGE_BUILDS};
+use vellev_storage::{Disk, MergeGate, Mutation, State, Transfers, MERGE_BUILDS};
 
 /// The node's allocator, as the binary runs on it.
 #[global_allocator]
@@ -2149,6 +2149,122 @@ fn a_keep_as_held_past_twice_a_flush_s_hold_fails_the_mark() {
         "a short held keep does not pass a long building one"
     );
     assert!(!passed(&[held(50.0)]), "held, no flush hold");
+}
+
+/// The keep mark as a node's own events read it (review of f800a51, M4):
+/// a tenant whose fourth flush holds the building lock for `flush_held`,
+/// its one real flush hold of note, and whose merge then holds the lock in
+/// its commit for `commit_held`, swept over the budget every 30 s, read
+/// while that commit is held: so its spell is still open (M1).
+async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> Value {
+    const ROWS: u128 = 10;
+    let notes = CollectionName::new("notes").unwrap();
+    let note = |n: u128| Mutation::Upsert {
+        collection: notes.clone(),
+        id: ObjectId(uuid::Uuid::from_u128(n)),
+        properties: json!({ "title": format!("note {n}") })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: Some(vec![1.0, n as f32]),
+        only_if_version: None,
+    };
+    let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let settings = Settings {
+        warm: None,
+        memory: Some(1),
+        flush_rows: ROWS as usize,
+        tenant_idle: Duration::from_secs(60 * 60),
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let node = node(&Arc::default(), &blobs, settings);
+    node.timings().keep_events(true);
+    let tenant = TenantId::new("merging").unwrap();
+    node.create_tenant(&tenant).await.unwrap();
+    let held = node.tenant(&tenant).await.unwrap();
+    let writer = held.writer().clone();
+    let before_commit = held.hold_merges_before_commit();
+    let schema = Collection {
+        name: notes.clone(),
+        properties: vec![Property::new("title", DataType::Text).searchable()],
+        embedding: Embedding {
+            provider: EmbeddingProvider::None,
+            model: "stand-in".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec![],
+        },
+        distance: Distance::Cosine,
+        bm25: Bm25::default(),
+        access_rule: None,
+    };
+    held.write(vec![Mutation::CreateCollection(Box::new(schema))])
+        .await
+        .unwrap();
+    async fn reached(gate: &MergeGate, what: &str) {
+        let reached = gate.reached.notified();
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect(what);
+    }
+    for flush in 0..4 {
+        let flushing = writer.hold_checkpoints_once_adopted();
+        if flush < 3 {
+            writer.stop_holding_checkpoints();
+        }
+        let rows: Vec<Mutation> = (0..ROWS).map(|n| note(flush * ROWS + n)).collect();
+        held.write(rows).await.unwrap();
+        if flush == 3 {
+            reached(&flushing, "the flush never came to adopt").await;
+            tokio::time::sleep(flush_held).await;
+            writer.stop_holding_checkpoints();
+            flushing.release.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the node never flushed the tenant");
+    }
+    reached(&before_commit, "the merge never came to its commit").await;
+    let committing = writer.hold_checkpoints_once_adopted();
+    writer.stop_holding_merges();
+    before_commit.release.notify_one();
+    reached(&committing, "the merge never came into its commit").await;
+    drop(held);
+    let every = Duration::from_secs(30);
+    for _ in 0..commit_held.as_secs() / every.as_secs() {
+        node.sweep_now().await;
+        tokio::time::sleep(every).await;
+    }
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    writer.stop_holding_checkpoints();
+    committing.release.notify_one();
+    kept_over_budget_mark(&events)
+}
+
+/// A merge's commit holding the building lock for 150 s, against a flush
+/// that held it 40 s, fails the keep mark on its held spell, still open as
+/// it is read; one held 60 s, against a flush that held it 100 s, passes.
+#[tokio::test(start_paused = true)]
+async fn a_node_s_own_long_merge_commit_fails_the_keep_mark() {
+    let mark = kept_in_a_merge_commit(Duration::from_secs(40), Duration::from_secs(150)).await;
+    assert_eq!(mark["held"]["passed"], json!(false), "{mark}");
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or_default();
+    assert!(longest >= 150.0, "{mark}");
+    let flush_p99 = mark["flush_held_p99_s"].as_f64().unwrap_or_default();
+    assert!((40.0..41.0).contains(&flush_p99), "{mark}");
+    assert_eq!(mark["passed"], json!(false), "{mark}");
+    let mark = kept_in_a_merge_commit(Duration::from_secs(100), Duration::from_secs(60)).await;
+    assert_eq!(mark["passed"], json!(true), "{mark}");
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
 }
 
 /// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
