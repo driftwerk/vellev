@@ -261,6 +261,15 @@ pub struct Settings {
     /// Where merges are built: on rayon's global pool, with flushes and
     /// loads, unless told otherwise (merge note, §3).
     pub merge_pool: MergePool,
+    /// How long a sweep gives the flushes of all the tenants it lets go:
+    /// [`LET_GO_FLUSH_WITHIN`] unless told otherwise.
+    pub let_go_flush_within: Duration,
+    /// How many tenants a sweep flushes at once as it lets them go, at
+    /// least one: [`LET_GO_FLUSHES_AT_ONCE`] unless told otherwise.
+    pub let_go_flushes_at_once: usize,
+    /// How long giving a lease up early is waited for:
+    /// [`RELEASE_WITHIN`] unless told otherwise.
+    pub release_within: Duration,
 }
 
 /// The threads a node builds its merges on.
@@ -367,6 +376,9 @@ impl Settings {
             transfers: Transfers::default(),
             served: Served::Every,
             merge_pool: MergePool::Global,
+            let_go_flush_within: LET_GO_FLUSH_WITHIN,
+            let_go_flushes_at_once: LET_GO_FLUSHES_AT_ONCE,
+            release_within: RELEASE_WITHIN,
         }
     }
 

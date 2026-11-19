@@ -9773,6 +9773,22 @@ fn settings_with_a_backlog_below_a_flush_are_refused() {
     }
 }
 
+/// Review B of #177, L7: a sweep that may flush no tenant at once as it
+/// lets them go would skip every flush. Such settings are refused.
+#[test]
+fn settings_that_flush_no_tenant_let_go_are_refused() {
+    let at_once = |let_go_flushes_at_once| Settings {
+        let_go_flushes_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(at_once(1).check().is_ok());
+    let refused = at_once(0).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
 /// Track 2, V3: a property embedded but not stored is new in format 2.
 /// A node refuses a schema with one until the cluster writes format 2,
 /// which it does once every node registered reads it and the nodes are

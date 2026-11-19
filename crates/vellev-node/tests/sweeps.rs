@@ -659,6 +659,39 @@ async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
     assert_eq!(least(flush), 1, "one waited behind the others: {waited:?}");
 }
 
+/// Review B of #177, L7: how many a sweep flushes at once is a setting. A
+/// node set to one flushes one at a time: three flushes of 4 s each take
+/// 12 s, and never two wait on the store together.
+#[tokio::test(start_paused = true)]
+async fn a_node_set_to_one_flush_at_a_time_flushes_one_at_a_time() {
+    let store = TenantPuts::new();
+    let node = node_on(store.clone(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+        settings.let_go_flushes_at_once = 1;
+    });
+    let names = ["one", "two", "three"];
+    for name in names {
+        written(&node, name, 1).await;
+    }
+    unused_long_enough().await;
+    let flush = Duration::from_secs(4);
+    for name in names {
+        store.hold(name, flush);
+    }
+    tokio::time::timeout(3 * flush + Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    assert_eq!(
+        store.most_waiting.load(Ordering::SeqCst),
+        1,
+        "flushes at once"
+    );
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+    assert_eq!(written_for(&node), Vec::<String>::new());
+}
+
 /// M7-R5c: one deadline for the whole sweep. With every flush hanging, the
 /// two let-gos at the head are cut at it, those behind are not reached and
 /// never begin, each is counted as skipped, and all are let go by then, not
