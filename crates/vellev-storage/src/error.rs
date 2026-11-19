@@ -19,6 +19,10 @@ pub enum StorageError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Too little room on local disk to gather what a merge is to put under
+    /// `key`, and leave what must be left: no failure, and nothing written.
+    #[error("no room on local disk for {key}: {free} bytes free, {wanted} wanted")]
+    NoRoom { key: String, free: u64, wanted: u64 },
     #[error("{key} is corrupt: {reason}")]
     Corrupt { key: String, reason: String },
     /// A create refused before anything was sent, by a store that cannot

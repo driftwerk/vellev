@@ -22,6 +22,7 @@ base64.workspace = true
 eyre.workspace = true
 http-body-util.workspace = true
 jsonwebtoken.workspace = true
+libc.workspace = true
 object_store.workspace = true
 prometheus-client.workspace = true
 rayon.workspace = true

@@ -32,7 +32,7 @@ segments, 6.7 GB of vectors, 0.3 GB of indexes). Loaded, that tenant takes
 17.8 GiB of memory on its node.
 
 **These figures are for that full shape, code vectors included: a stress
-bound, and the size that matters for Patchwork.** Driftwerk's cutover moves
+bound, and the size that matters for a large client hub.** Driftwerk's cutover moves
 only its memories and artifacts to vellev; its code vectors stay on
 Weaviate, so its tenants are far smaller than this.
 

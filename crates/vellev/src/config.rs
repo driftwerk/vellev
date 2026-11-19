@@ -25,7 +25,14 @@ use vellev_storage::{Disk, Transfers};
 #[derive(Clone, clap::Args)]
 pub struct Config {
     /// Postgres, for the record of who writes each tenant and how far.
-    #[arg(long, env = "VELLEV_DATABASE_URL", hide_env_values = true)]
+    /// Required, unless a supervisor hands it over on a pipe
+    /// (`--secrets-fd`), in which case it must not also be given here.
+    #[arg(
+        long,
+        env = "VELLEV_DATABASE_URL",
+        hide_env_values = true,
+        default_value = ""
+    )]
     pub database_url: String,
     #[arg(long, env = "VELLEV_DATABASE_CONNECTIONS", default_value_t = 8)]
     pub database_connections: u32,
@@ -51,7 +58,9 @@ pub struct Config {
     pub identity_keys: Vec<String>,
     /// The admin keys, separated by commas: each reaches every tenant and
     /// alone may create, drop and list tenants and issue their keys. A key
-    /// that reaches one tenant is issued through the API.
+    /// that reaches one tenant is issued through the API. With
+    /// `--secrets-fd` they come on the pipe, and must not also be given
+    /// here.
     #[arg(
         long,
         env = "VELLEV_API_KEYS",
@@ -219,10 +228,14 @@ pub struct Config {
     /// second, about 8 Mbit/s, below which a node is not supported.
     #[arg(long, env = "VELLEV_STORE_MIN_BYTES_PER_SEC", default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub store_min_bytes_per_sec: u64,
-    /// The size of the parts a file larger than it goes up to object storage
-    /// in, and comes down in, in MiB: from 5 to 5120, as S3 takes for every
-    /// part but the last. A file may have at most 10,000 parts, so 16 MiB
-    /// parts carry files up to 156 GiB.
+    /// The size of the parts a file larger than it goes up to object
+    /// storage in, and comes down in, in MiB: from 5 to 5120, as S3 takes
+    /// for every part but the last. A file may have at most 10,000 parts,
+    /// so 16 MiB parts carry files up to 156 GiB. A merge whose vectors are
+    /// gathered in the cache directory holds a part of them in memory as
+    /// they go up, rounded up to whole 4 MiB pieces, and 4 MiB more, or all
+    /// of them if that is less: larger parts cost a merge that much more
+    /// memory at its peak.
     #[arg(long, env = "VELLEV_UPLOAD_PART_MIB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(5..=5120))]
     pub upload_part_mib: u64,
     /// How much longer than a tenant's restore window its files that
@@ -537,6 +550,9 @@ impl Config {
     /// Everything that can be wrong without reaching another machine is
     /// found wrong here.
     pub fn checked(&self) -> Result<(Limits, ObjectBlobs)> {
+        if self.database_url.trim().is_empty() {
+            bail!("no database is configured; set VELLEV_DATABASE_URL");
+        }
         let keyed = self.embedding_keys()?;
         self.embedding()?;
         let embedding_urls = self
@@ -700,7 +716,7 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use clap::Parser;
 
     use super::*;
@@ -765,7 +781,7 @@ mod tests {
         }
     }
 
-    fn config(extra: &[&str]) -> Config {
+    pub(crate) fn config(extra: &[&str]) -> Config {
         let required = [
             "vellev",
             "--database-url",
@@ -774,6 +790,16 @@ mod tests {
             "memory://",
         ];
         Parsed::parse_from(required.iter().chain(extra)).config
+    }
+
+    /// With no database, from the command line, the environment or a
+    /// supervisor's pipe, a node refuses to start, and says so.
+    #[test]
+    fn a_node_without_a_database_is_refused() {
+        let mut config = config(&[]);
+        config.database_url.clear();
+        let refused = format!("{:#}", config.checked().map(drop).unwrap_err());
+        assert!(refused.contains("VELLEV_DATABASE_URL"), "{refused}");
     }
 
     #[test]
