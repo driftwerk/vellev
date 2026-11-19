@@ -700,12 +700,16 @@ async fn a_restore_under_way_sends_a_turn_waiting_for_its_lock_back_at_once() {
         builds.held() == 1
     })
     .await;
-    // Past its look for a restore, in the queue for the turn the other holds.
+    // Past its look for a restore, in the queue for the turn the other holds:
+    // waited for, however long the merge takes to get there.
     let merging = tokio::spawn({
         let writer = writer.clone();
         async move { writer.merge().await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until(60, "the merge never came to ask for its turn", || {
+        builds.asking() == 1
+    })
+    .await;
     let at = cluster.committed().await;
     let restore = Restore {
         request: RequestId::generate(),
@@ -736,6 +740,8 @@ async fn a_restore_under_way_sends_a_turn_waiting_for_its_lock_back_at_once() {
     drop(restoring);
     let merged = within(60, "the merge never ended", merging).await;
     assert!(merged.unwrap().unwrap().is_some());
+    assert_eq!(writer.timings().merges_ended(MergeEnd::Committed), 1);
+    assert_eq!(writer.timings().merges_ended(MergeEnd::Stale), 0);
     assert_eq!(builds.turns_free(), 1);
 }
 

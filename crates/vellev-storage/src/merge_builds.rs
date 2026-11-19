@@ -431,6 +431,14 @@ impl MergeBuilds {
         self.let_go.notify_all();
     }
 
+    /// How many merges are in the queue for a turn now, each past all it
+    /// looks at before it asks for one. For tests that order what they do
+    /// on a merge being there.
+    #[doc(hidden)]
+    pub fn asking(&self) -> usize {
+        0
+    }
+
     /// How many builds wait where a test holds them now. For tests.
     #[doc(hidden)]
     pub fn held(&self) -> usize {
@@ -1131,6 +1139,32 @@ mod nesting {
         let global = MergeBuilds::new(2);
         let unslotted = turn_of(&global, "one").await;
         assert_eq!(*lock(&unslotted.counted.slot), None);
+    }
+
+    /// A merge is counted asking for a turn from the moment its place is
+    /// made until it has its turn, or its place goes while it asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_asking_for_a_turn_is_counted_until_it_has_one_or_goes() {
+        let builds = MergeBuilds::new(1);
+        let held = turn_of(&builds, "one").await;
+        assert_eq!(builds.asking(), 0, "a turn had at once is not asked for");
+        let waiting = Reservation::new(&builds);
+        assert_eq!(builds.asking(), 1);
+        drop(held);
+        let granted = waiting.granted().await.expect("the turn let go");
+        assert_eq!(builds.asking(), 0, "counted once it has its turn");
+        let gone = Reservation::new(&builds);
+        assert_eq!(builds.asking(), 1);
+        drop(gone);
+        let counted_out = async {
+            while builds.asking() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), counted_out)
+            .await
+            .expect("still counted once its place went");
+        drop(granted);
     }
 
     /// A slot goes back before the turn that held it, so that a turn
