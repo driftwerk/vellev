@@ -41,8 +41,9 @@ ignore = true
 # RUSTSEC-2026-0543 says `chrono` is unmaintained, and RUSTSEC-2026-0542
 # counts `humantime` unmaintained with it: no fault is known in either, and
 # there is no release to move to. `chrono` is vellev's own: its times in
-# the published API (`vellev-api`'s `created`), in six of its crates, and
-# through `sqlx` and `utoipa`; `object_store` needs both crates in every
+# the published API (`vellev-api`'s `created`, `at`, `taken_at` and more),
+# in six of its crates, and through `sqlx`'s `chrono` feature (`utoipa`'s
+# only describes those types); `object_store` needs both crates in every
 # release up to 0.14.2 as well. `chrono` leaves the build only once vellev
 # keeps time with `jiff` or `time` and `object_store` drops it; `humantime`
 # once `object_store` does. Ignored with the owner's OK of 2026-11-19.
