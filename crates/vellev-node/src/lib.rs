@@ -1438,8 +1438,9 @@ impl TenantWork {
         *backoff = (failed, Some(Instant::now() + wait));
     }
 
-    /// As [`Tenant::flush`].
+    /// As [`Tenant::flush`]. Refused once the hold is lost, as a write is.
     async fn flush(&self) -> Result<LogPosition> {
+        self.not_lost()?;
         let flushed = self.writer.flush().await;
         self.flush_tried(flushed.is_ok());
         if flushed.is_ok() {
@@ -1539,6 +1540,8 @@ impl TenantWork {
     /// be asleep through: rows replayed at an open ask for no flush. One that
     /// goes through adds to no flushes to be followed, as this goes on
     /// merging, and a merge dropped after one says so by a position.
+    ///
+    /// Refused once the hold is lost, as a write is, before each merge.
     async fn merged(&self) -> Result<()> {
         let tried = |went_through| {
             self.flush_tried(went_through);
@@ -1550,14 +1553,25 @@ impl TenantWork {
             may_be_tried: &|| self.flush_may_be_tried(),
             tried: &tried,
         };
-        while self
-            .writer
-            .merge_giving_way(&|| false, flush_first)
-            .await
-            .map_err(|error| self.failed(error))?
-            .is_some()
-        {}
-        Ok(())
+        loop {
+            self.not_lost()?;
+            let merged = self
+                .writer
+                .merge_giving_way(&|| false, flush_first)
+                .await
+                .map_err(|error| self.failed(error))?;
+            if merged.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Refused once the hold is lost, as a write is then.
+    fn not_lost(&self) -> Result<()> {
+        match self.hold.is_lost() {
+            true => Err(StorageError::Closed.into()),
+            false => Ok(()),
+        }
     }
 
     /// Delete the files nothing needs any more, as [`Writer::clean`] with
