@@ -2096,12 +2096,16 @@ fn kept_over_budget_mark(events: &[Event]) -> Value {
 /// anything else holds the lock; no keep passes; and keeps with no flush
 /// hold to set them against do not, as the other marks take a missing
 /// series.
+/// One case of the keep mark's table: its name, the spells timed, and
+/// whether the mark passes them.
+type KeepCase<'a> = (&'a str, &'a [(Timed, f64)], bool);
+
 #[test]
 fn the_keep_mark_holds_each_reason_to_twice_a_flush_s_hold() {
     let flush = Timed::BuildingHeld(Holder::Flush);
     let commit = Timed::BuildingHeld(Holder::MergeCommit);
     let (held, building) = (Timed::Kept(KeptFor::Held), Timed::Kept(KeptFor::Building));
-    let cases: [(&str, &[(Timed, f64)], bool); 11] = [
+    let cases: [KeepCase; 11] = [
         ("building 300 s", &[(flush, 40.0), (building, 300.0)], false),
         ("building 50 s", &[(flush, 40.0), (building, 50.0)], true),
         ("held 300 s", &[(flush, 40.0), (held, 300.0)], false),
