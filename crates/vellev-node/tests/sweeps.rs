@@ -88,42 +88,17 @@ async fn until(limit: u64, what: &str, holds: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("{what} within {limit} s"));
 }
 
-/// A store whose puts, once it is armed, wait until it is disarmed: a
-/// flush that hangs on the store.
+/// A store that holds flushes up. While it is armed every put waits until
+/// it is disarmed: a flush that hangs on the store. Tenant by tenant, the
+/// next put of one named by [`Self::hold`] waits as long as that says, and
+/// the vectors of one named by [`Self::fail_vectors`] fail to go up.
 #[derive(Debug)]
 struct HeldPuts {
     inner: Arc<dyn Blobs>,
     armed: AtomicBool,
-    held: AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl Blobs for HeldPuts {
-    async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
-        while self.armed.load(Ordering::SeqCst) {
-            self.held.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        self.inner.put(key, bytes).await
-    }
-    async fn get(&self, key: &str) -> vellev_storage::Result<bytes::Bytes> {
-        self.inner.get(key).await
-    }
-    async fn list(&self, prefix: &str) -> vellev_storage::Result<Vec<Listed>> {
-        self.inner.list(prefix).await
-    }
-    async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
-        self.inner.delete(key).await
-    }
-}
-
-/// A store that holds flushes up tenant by tenant: the next put of a tenant
-/// named by [`Self::hold`] waits as long as that says, and the vectors of
-/// one named by [`Self::fail_vectors`] fail to go up.
-#[derive(Debug)]
-struct TenantPuts {
-    inner: Arc<dyn Blobs>,
-    held: Mutex<HashMap<String, Duration>>,
+    /// Whether a put has waited while the store was armed.
+    held_armed: AtomicBool,
+    holds: Mutex<HashMap<String, Duration>>,
     failing: Mutex<HashSet<String>>,
     /// The tenants whose flushes have come to a put held.
     reached: Mutex<HashSet<String>>,
@@ -132,11 +107,13 @@ struct TenantPuts {
     most_waiting: AtomicUsize,
 }
 
-impl TenantPuts {
+impl HeldPuts {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: memory(),
-            held: Mutex::default(),
+            armed: AtomicBool::new(false),
+            held_armed: AtomicBool::new(false),
+            holds: Mutex::default(),
             failing: Mutex::default(),
             reached: Mutex::default(),
             waiting: AtomicUsize::new(0),
@@ -144,8 +121,18 @@ impl TenantPuts {
         })
     }
 
+    /// Hold every put from now on, until disarmed.
+    fn arm(&self, armed: bool) {
+        self.armed.store(armed, Ordering::SeqCst);
+    }
+
+    /// Whether a put has waited while the store was armed.
+    fn held_armed(&self) -> bool {
+        self.held_armed.load(Ordering::SeqCst)
+    }
+
     fn hold(&self, tenant: &str, held: Duration) {
-        self.held.lock().unwrap().insert(tenant.into(), held);
+        self.holds.lock().unwrap().insert(tenant.into(), held);
     }
 
     fn fail_vectors(&self, tenant: &str, failing: bool) {
@@ -162,13 +149,17 @@ impl TenantPuts {
 }
 
 #[async_trait::async_trait]
-impl Blobs for TenantPuts {
+impl Blobs for HeldPuts {
     async fn put(&self, key: &str, bytes: bytes::Bytes) -> vellev_storage::Result<()> {
         let tenant = key.split('/').next().unwrap_or_default();
         if key.ends_with(".vectors") && self.failing.lock().unwrap().contains(tenant) {
             return Err(StorageError::Background("no room for vectors".into()));
         }
-        let held = self.held.lock().unwrap().remove(tenant);
+        while self.armed.load(Ordering::SeqCst) {
+            self.held_armed.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let held = self.holds.lock().unwrap().remove(tenant);
         if let Some(held) = held {
             self.reached.lock().unwrap().insert(tenant.into());
             let waiting = self.waiting.fetch_add(1, Ordering::SeqCst) + 1;
@@ -236,11 +227,7 @@ fn written_for(node: &Node) -> Vec<String> {
 /// ends, not a thousand queued behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweeps_asked_for_while_one_runs_are_coalesced_into_one() {
-    let store = Arc::new(HeldPuts {
-        inner: memory(),
-        armed: AtomicBool::new(false),
-        held: AtomicBool::new(false),
-    });
+    let store = HeldPuts::new();
     let node = node_on(store.clone(), |settings| {
         settings.memory = Some(1);
         // Flushed only as it is let go; never let go for being idle.
@@ -255,14 +242,14 @@ async fn sweeps_asked_for_while_one_runs_are_coalesced_into_one() {
     // `slow` unused for longer than any tenant is kept regardless; `used`
     // used again just before each sweep, and so kept.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    store.armed.store(true, Ordering::SeqCst);
+    store.arm(true);
     let before = node.sweeps();
     // A sweep that lets `slow` go, and hangs in its flush.
     drop(node.tenant(&tenant("used")).await.unwrap());
     until(
         5,
         "the sweep never came to flush the tenant it lets go",
-        || store.held.load(Ordering::SeqCst),
+        || store.held_armed(),
     )
     .await;
     assert_eq!(node.sweeps(), before + 1, "one sweep, held in the flush");
@@ -271,7 +258,7 @@ async fn sweeps_asked_for_while_one_runs_are_coalesced_into_one() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(node.sweeps(), before + 1, "none began while one ran");
-    store.armed.store(false, Ordering::SeqCst);
+    store.arm(false);
     // Time enough for the held sweep to end, and for a thousand queued
     // behind it to have run.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -407,11 +394,7 @@ async fn a_sweep_asked_for_now_never_waits_on_the_spacing() {
 /// restore lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
-    let store = Arc::new(HeldPuts {
-        inner: memory(),
-        armed: AtomicBool::new(false),
-        held: AtomicBool::new(false),
-    });
+    let store = HeldPuts::new();
     let node = node_on(store.clone(), |settings| {
         settings.memory = Some(1);
         // Flushed only as it is let go; never let go for being idle.
@@ -427,16 +410,13 @@ async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
     held.write(vec![note(2)]).await.unwrap();
     drop(held);
 
-    store.armed.store(true, Ordering::SeqCst);
+    store.arm(true);
     let point = Point::Position(kept.position);
     let restoring = tokio::spawn({
         let (node, acme) = (node.clone(), acme.clone());
         async move { node.restore(&acme, point, RequestId::generate()).await }
     });
-    until(5, "the restore never came to write", || {
-        store.held.load(Ordering::SeqCst)
-    })
-    .await;
+    until(5, "the restore never came to write", || store.held_armed()).await;
     // Whoever asked stops waiting: the restore goes on, and only it holds
     // the tenant. Unused for longer than any tenant is kept regardless.
     restoring.abort();
@@ -456,7 +436,7 @@ async fn a_tenant_a_restore_holds_is_not_let_go_until_the_restore_ends() {
     assert_eq!(node.census().holding.writers, 1, "let go mid-restore");
     assert!(node.tenants_kept_by_sweeps() > before, "no sweep looked");
     assert_eq!(node.opens().writers, 1, "opened afresh mid-restore");
-    store.armed.store(false, Ordering::SeqCst);
+    store.arm(false);
     tokio::time::timeout(Duration::from_secs(10), async {
         while node.resident() > 0 {
             node.sweep_now().await;
@@ -539,7 +519,7 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
 /// the next opener finds every row, by replaying them.
 #[tokio::test(start_paused = true)]
 async fn a_let_go_s_flush_that_hangs_is_cut_at_its_bound_and_its_rows_replay() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = over_budget(store.clone());
     written(&node, "hung", 2).await;
     unused_long_enough().await;
@@ -643,7 +623,7 @@ async fn a_let_go_s_flush_cut_once_adopted_is_no_flush_skipped() {
 /// counts no flush failed and none skipped. The reopened tenant has every row.
 #[tokio::test(start_paused = true)]
 async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = node_on(store.clone(), |settings| {
         settings.memory = Some(1);
         settings.flush_rows = 1_000_000;
@@ -700,7 +680,7 @@ async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
 /// so only a multi-thread runtime could see it, and only by a race.
 #[tokio::test(start_paused = true)]
 async fn a_flush_queued_behind_a_let_go_never_runs() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let backoff = Duration::from_secs(2);
     let node = node_on(store.clone(), |settings| {
         settings.memory = Some(1);
@@ -758,7 +738,7 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
 #[tokio::test(start_paused = true)]
 async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
     assert_eq!(LET_GO_FLUSHES_AT_ONCE, 2);
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = over_budget(store.clone());
     node.timings().keep_events(true);
     let names = ["one", "two", "three"];
@@ -799,7 +779,7 @@ async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
 /// 12 s, and never two wait on the store together.
 #[tokio::test(start_paused = true)]
 async fn a_node_set_to_one_flush_at_a_time_flushes_one_at_a_time() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = node_on(store.clone(), |settings| {
         settings.memory = Some(1);
         settings.flush_rows = 1_000_000;
@@ -834,7 +814,7 @@ async fn a_node_set_to_one_flush_at_a_time_flushes_one_at_a_time() {
 /// nothing to flush waits for nothing and is no flush skipped.
 #[tokio::test(start_paused = true)]
 async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = over_budget(store.clone());
     node.timings().keep_events(true);
     let names = ["one", "two", "three", "four"];
@@ -878,7 +858,7 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
         "a cut flush timed as held"
     );
     assert_eq!(held(Timed::LetGoFlushHeld), 0, "a cut flush timed as held");
-    store.held.lock().unwrap().clear();
+    store.holds.lock().unwrap().clear();
     for name in names {
         let opened = node.tenant(&tenant(name)).await.unwrap();
         assert_eq!(noted(&opened), 1, "{name}'s rows lost");
@@ -953,7 +933,7 @@ async fn a_tenant_whose_last_writes_were_deletes_is_flushed_as_it_is_let_go() {
 /// waits for nothing.
 #[tokio::test(start_paused = true)]
 async fn a_let_go_with_nothing_to_flush_adds_no_sample() {
-    let store = TenantPuts::new();
+    let store = HeldPuts::new();
     let node = over_budget(store.clone());
     node.timings().keep_events(true);
     written(&node, "flushed", 1).await.flush().await.unwrap();
