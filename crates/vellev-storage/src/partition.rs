@@ -1190,8 +1190,8 @@ pub struct Writer {
     /// [`Self::hold_refusals`].
     refusal_gate: std::sync::Mutex<Option<Arc<RefusalGate>>>,
     /// A gate a checkpoint waits at once adopted, with what it took out of
-    /// memory, if a test has set one: where one may be dropped.
-    #[cfg(test)]
+    /// memory, if a test has set one: where one may be dropped. See
+    /// [`Self::hold_checkpoints_once_adopted`].
     adopted_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
     /// A probe for what the next checkpoint takes out of memory, if a test
     /// has set one.
@@ -1567,7 +1567,6 @@ impl Writer {
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
             refusal_gate: std::sync::Mutex::default(),
-            #[cfg(test)]
             adopted_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             discarded_probe: std::sync::Mutex::new(None),
@@ -2308,11 +2307,11 @@ impl Writer {
         #[cfg(test)]
         {
             discarded.probe = self.discarded_probe.lock().expect("probe lock").take();
-            let gate = self.adopted_gate.lock().expect("gate lock").clone();
-            if let Some(gate) = gate {
-                gate.reached.notify_one();
-                gate.release.notified().await;
-            }
+        }
+        let gate = self.adopted_gate.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
         }
         drop(turn);
         // The building lock is held here. All that a merge's commit took out
@@ -4073,6 +4072,24 @@ impl Writer {
     #[doc(hidden)]
     pub fn kept_while_merging(&self) -> usize {
         self.keeping.lock().expect("keeping lock").len()
+    }
+
+    /// Hold every checkpoint from now on once it is committed and adopted,
+    /// before it frees what it took out of memory, at the gate given back,
+    /// until it is released. For tests that cut a flush there.
+    #[doc(hidden)]
+    pub fn hold_checkpoints_once_adopted(&self) -> Arc<MergeGate> {
+        let gate = Arc::new(MergeGate::default());
+        *self.adopted_gate.lock().expect("gate lock") = Some(gate.clone());
+        gate
+    }
+
+    /// Hold no checkpoint from now on, as before
+    /// [`Self::hold_checkpoints_once_adopted`]. One held already waits
+    /// until its gate is released.
+    #[doc(hidden)]
+    pub fn stop_holding_checkpoints(&self) {
+        *self.adopted_gate.lock().expect("gate lock") = None;
     }
 
     /// Hold every merge from now on between its build and its commit, at

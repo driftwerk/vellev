@@ -604,6 +604,38 @@ async fn a_let_go_s_flush_cut_mid_build_gives_its_build_up() {
     assert_eq!(noted(&opened), 2, "rows lost");
 }
 
+/// Review A of #177, M2: a let-go's flush cut by the sweep's deadline after
+/// its checkpoint was committed and adopted, as it frees what it took out,
+/// went through. It is no flush skipped, nor one that failed, and the next
+/// opener replays nothing: the head holds the rows.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_s_flush_cut_once_adopted_is_no_flush_skipped() {
+    let node = over_budget(memory());
+    let writer = written(&node, "adopted", 2).await;
+    unused_long_enough().await;
+    // Never released: the checkpoint waits there until the deadline cuts it.
+    let gate = writer.hold_checkpoints_once_adopted();
+    let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep outlasted what it gives its flushes");
+    tokio::time::timeout(Duration::from_secs(1), gate.reached.notified())
+        .await
+        .expect("the flush was cut before its checkpoint was adopted");
+    drop(gate);
+    writer.stop_holding_checkpoints();
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    assert_eq!(
+        node.flushing().failed,
+        0,
+        "a flush that went through counted as failed"
+    );
+    let opened = node.tenant(&tenant("adopted")).await.unwrap();
+    assert_eq!(noted(&opened), 2, "rows lost");
+    assert_eq!(opened.read(State::unflushed), 0, "its rows replayed");
+}
+
 /// M7-R5b, nothing else in the gap: the tenant's own flush task comes to try
 /// again as the tenant waits among those a sweep flushes, its building lock
 /// taken as it was taken out. It queues behind that lock, and never has it:
