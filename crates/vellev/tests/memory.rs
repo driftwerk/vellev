@@ -22,12 +22,12 @@ static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new(
 pub static OPTIONS: vellev::allocator::Options =
     vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
 
-/// A size_t statistic of jemalloc's, as of the last epoch advanced;
-/// usize::MAX if it cannot be read.
+/// A size_t value of jemalloc's (a statistic is as of the last epoch
+/// advanced); usize::MAX if it cannot be read.
 #[cfg(target_os = "linux")]
 fn statistic(name: &str) -> usize {
     let name = format!("{name}\0");
-    // SAFETY: every name asked is jemalloc's, of a size_t statistic.
+    // SAFETY: every name asked is jemalloc's, of a size_t value.
     unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name.as_bytes()) }.unwrap_or(usize::MAX)
 }
 
