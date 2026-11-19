@@ -1851,6 +1851,28 @@ async fn a_tenant_let_go_flushes_no_more() {
     assert_eq!(opened.read(count), 10, "its rows were lost");
 }
 
+/// A node on `coordinator` and the cluster's store, over its memory budget
+/// from its first row, flushing only when asked, as `set` sets it up.
+fn node_over_budget(
+    cluster: &Cluster,
+    coordinator: &Arc<Unrenewing>,
+    set: impl FnOnce(&mut Settings),
+) -> Node {
+    let mut settings = Settings {
+        memory: Some(1),
+        flush_rows: 1_000_000,
+        tenant_idle: Duration::from_secs(60 * 60),
+        ..cluster.settings()
+    };
+    set(&mut settings);
+    Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        settings,
+    )
+}
+
 /// A sweep is held up by no lease it gives up: sweeps run one at a time, so
 /// one that never heard back would hold every let-go of the node. The
 /// tenants let go by one sweep wait for their releases together, past the
@@ -1861,17 +1883,7 @@ async fn a_tenant_let_go_flushes_no_more() {
 async fn a_release_that_hangs_holds_up_no_sweep() {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
-    let node = Node::new(
-        coordinator.clone(),
-        cluster.store.clone(),
-        Arc::new(Embedders::new(EmbedSettings::default())),
-        Settings {
-            memory: Some(1),
-            flush_rows: 1_000_000,
-            tenant_idle: Duration::from_secs(60 * 60),
-            ..cluster.settings()
-        },
-    );
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
     let names = ["acme", "globex", "initech"];
     for name in names {
         node.create_tenant(&tenant(name)).await.unwrap();
@@ -1912,17 +1924,7 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
 async fn a_sweep_s_releases_are_bounded_in_number_and_in_time() {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
-    let node = Node::new(
-        coordinator.clone(),
-        cluster.store.clone(),
-        Arc::new(Embedders::new(EmbedSettings::default())),
-        Settings {
-            memory: Some(1),
-            flush_rows: 1_000_000,
-            tenant_idle: Duration::from_secs(60 * 60),
-            ..cluster.settings()
-        },
-    );
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
     let tenants = 100;
     for n in 0..tenants {
         let name = tenant(&format!("idle-{n}"));
@@ -1960,20 +1962,11 @@ async fn a_let_go_s_flush_cut_in_its_commit_costs_no_row() {
     for landed in [false, true] {
         let cluster = Cluster::new();
         let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
-        let node = Node::new(
-            coordinator.clone(),
-            cluster.store.clone(),
-            Arc::new(Embedders::new(EmbedSettings::default())),
-            Settings {
-                memory: Some(1),
-                flush_rows: 1_000_000,
-                tenant_idle: Duration::from_secs(60 * 60),
-                // Longer than a commit is bounded to by the lease: only what
-                // a sweep gives its flushes ends this one.
-                lease: Duration::from_secs(10 * 60),
-                ..cluster.settings()
-            },
-        );
+        let node = node_over_budget(&cluster, &coordinator, |settings| {
+            // Longer than a commit is bounded to by the lease: only what a
+            // sweep gives its flushes ends this one.
+            settings.lease = Duration::from_secs(10 * 60);
+        });
         let acme = tenant("acme");
         node.create_tenant(&acme).await.unwrap();
         let held = node.tenant(&acme).await.unwrap();
