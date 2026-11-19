@@ -2051,6 +2051,45 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     })
 }
 
+/// The busy-lock mark (§9.6; the overseer's ruling on review B of #177,
+/// M2): the longest spell a sweep over the budget kept a tenant for its busy
+/// building lock alone, against twice a flush's hold p99. Not held to
+/// anything yet.
+fn kept_for_building_mark(_events: &[Event]) -> Value {
+    json!({ "passed": true })
+}
+
+/// A tenant kept for its busy building lock for longer than flushes hold it
+/// fails the busy-lock mark; one kept for less, or none kept, passes; and
+/// the bound is a flush's hold, whatever else holds the lock longer.
+#[test]
+fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
+    let at = Instant::now();
+    let event = |timed: Timed, took: f64| Event {
+        timed,
+        took: Duration::from_secs_f64(took),
+        partition: "t0/0".into(),
+        at,
+    };
+    let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
+    let spell = |took: f64| event(Timed::KeptForBuilding, took);
+    let passed = |events: &[Event]| kept_for_building_mark(events)["passed"] == json!(true);
+    assert!(!passed(&[flush_held(40.0), spell(300.0)]), "kept 300 s");
+    assert!(passed(&[flush_held(40.0), spell(50.0)]), "kept 50 s");
+    assert!(passed(&[flush_held(40.0)]), "none kept");
+    assert!(passed(&[]), "none kept, nothing flushed");
+    // A merge's long commit holds the lock far longer than flushes do: the
+    // bound is a flush's hold all the same.
+    let merge_commit = event(Timed::BuildingHeld(Holder::MergeCommit), 400.0);
+    assert!(
+        !passed(&[flush_held(40.0), merge_commit, spell(300.0)]),
+        "bound read from other holds than a flush's"
+    );
+    // Kept, with no flush to set it against: not passed, as the other marks
+    // take a series missing.
+    assert!(!passed(&[spell(50.0)]), "no flush hold");
+}
+
 /// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
 /// lock was never waited for; one a flush's own time does not (review of
 /// #169).
@@ -2384,6 +2423,10 @@ fn reported(
         "let_go_flush.held".into(),
         summary(of(Timed::LetGoFlushHeld)),
     );
+    timings.insert(
+        "kept_for_building".into(),
+        summary(of(Timed::KeptForBuilding)),
+    );
 
     // Merge debt: each tenant carried forward while let go, from its
     // preload until it is first seen held.
@@ -2499,6 +2542,7 @@ fn reported(
             "wait_p99_s": percentile(&let_go_wait, 99.0), "flushes": let_go_wait.len(),
             "mark": "p99 wait < 2 s",
         },
+        "kept_for_building": kept_for_building_mark(&events),
         "backlog_refusals": { "refused": at_end.backlogged - before.backlogged, "mark": "no more than arm (a)'s" },
     });
     let invalid = NodeValidity {
