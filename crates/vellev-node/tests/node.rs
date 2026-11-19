@@ -817,6 +817,35 @@ async fn an_opening_that_fails_lets_go_of_the_tenant_and_a_stopped_node_opens_no
     assert_eq!(second.tenant(&tenant("acme")).await.unwrap().read(count), 1);
 }
 
+/// Review of f800a51, L3: an opening that fails gives its lease up within
+/// [`RELEASE_WITHIN`], whatever the coordinator does with the release: one
+/// that hangs holds up no caller past that, and the lease runs out.
+#[tokio::test(start_paused = true)]
+async fn a_failed_opening_s_release_that_hangs_ends_within_its_bound() {
+    let cluster = Cluster::new();
+    let first = cluster.node();
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = first.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    first.shutdown().await;
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let second = node_leasing(&cluster, coordinator.clone(), LEASE);
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    cluster.store.unreadable.store(true, Ordering::SeqCst);
+    let asked = tokio::time::Instant::now();
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    let opened = tokio::time::timeout(bound, second.tenant(&tenant("acme")))
+        .await
+        .expect("a failed opening waited past its release's bound");
+    assert!(matches!(opened, Err(NodeError::Storage(_))), "{opened:?}");
+    assert!(asked.elapsed() >= RELEASE_WITHIN, "{:?}", asked.elapsed());
+}
+
 #[tokio::test]
 async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
     let cluster = Cluster::new();

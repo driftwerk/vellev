@@ -567,7 +567,8 @@ A node of an earlier release does not know the flag and exits with status
   out. So a tenant with nothing to flush gives its lease up only once its
   sweep's flushes end, and a sweep takes at most 30 s and then 5 s. The 30
   s, the two flushes and the four releases at once, and the 5 s are node
-  settings.
+  settings. An opening that fails gives its lease up within the same 5 s,
+  where it waited on the release with no bound.
   `vellev_flush_to_let_go_seconds{part="wait"}` no longer reads a wait for
   the building lock, which a sweep tries and never waits for. It reads the
   wait, with that lock held, for one of the sweep's two flushes: nothing for
