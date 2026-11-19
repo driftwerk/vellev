@@ -71,6 +71,7 @@ jobs:
   advisories:
     name: Advisories
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -106,7 +107,7 @@ jobs:
       ADVISORIES: ${{ needs.advisories.result }}
       # The repository belongs to an organisation, so an issue alone notifies
       # only those watching it; the one assigned is always told.
-      ASSIGNEE: kingsleyh
+      ASSIGNEE: ${{ vars.NIGHTLY_ASSIGNEE || 'kingsleyh' }}
     steps:
       - name: Open, update or close the red-nightly issue
         run: |

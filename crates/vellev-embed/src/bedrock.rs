@@ -325,6 +325,19 @@ impl Bedrock {
         }
     }
 
+    /// The SDK's behaviour version, held rather than `latest()`: an SDK
+    /// update must not change how calls are retried. `ATTEMPTS`,
+    /// `UNREACHED_FOR` and `CALL_TIMEOUT` are tuned for this one's retries
+    /// (server errors backed off from 1 s); `latest()` became Retry
+    /// Behavior 2.1 in `aws-smithy-runtime-api` 1.20, which backs them off
+    /// from 50 ms, charges the retry budget nearly three times as much for
+    /// each, and stops dropping a connection that answered 5xx. Moving to it
+    /// is its own change, with those timings looked at again.
+    #[allow(deprecated)]
+    pub fn behavior() -> BehaviorVersion {
+        BehaviorVersion::v2026_01_12()
+    }
+
     pub fn retries() -> RetryConfig {
         RetryConfig::standard().with_max_attempts(ATTEMPTS)
     }
@@ -339,7 +352,7 @@ impl Bedrock {
     async fn client(&self) -> &Client {
         self.client
             .get_or_init(|| async {
-                let config = aws_config::defaults(BehaviorVersion::latest())
+                let config = aws_config::defaults(Self::behavior())
                     .region(Region::new(self.region.clone()))
                     .retry_config(Self::retries())
                     .timeout_config(Self::timeouts())

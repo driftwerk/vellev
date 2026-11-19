@@ -691,7 +691,7 @@ async fn bedrock(seen: Arc<Seen>) -> Bedrock {
         .with_state(seen);
     let retries = Bedrock::retries().with_initial_backoff(Duration::from_millis(5));
     let config = aws_sdk_bedrockruntime::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
+        .behavior_version(Bedrock::behavior())
         .region(Region::new("eu-west-2"))
         .credentials_provider(Credentials::new(
             "AKIDEXAMPLE",
@@ -966,11 +966,24 @@ async fn silent() -> String {
     url
 }
 
+/// An SDK update must not change how Bedrock calls are retried: the
+/// attempts, `UNREACHED_FOR` and the call timeout are tuned for the
+/// January 2026 retry behaviour (a 1 s backoff base for server errors),
+/// and `BehaviorVersion::latest()` moved to Retry Behavior 2.1 (a 50 ms
+/// base, a costlier retry budget) in `aws-smithy-runtime-api` 1.20.
+/// Taking the newer behaviour is a decision to make on its own, with the
+/// timings retuned and these tests run against it.
+#[test]
+#[allow(deprecated)]
+fn bedrock_keeps_the_retry_behaviour_its_timings_were_tuned_for() {
+    assert!(Bedrock::behavior() == BehaviorVersion::v2026_01_12());
+}
+
 /// Titan as it would be reached at `url`, with the tries and the times
 /// the node gives it.
 fn bedrock_at(url: String) -> Bedrock {
     let config = aws_sdk_bedrockruntime::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
+        .behavior_version(Bedrock::behavior())
         .region(Region::new("eu-west-2"))
         .credentials_provider(Credentials::new(
             "AKIDEXAMPLE",
@@ -1547,7 +1560,7 @@ async fn a_region_that_is_not_reached_is_not_tried_again_for_every_text_that_wai
     });
     let retries = Bedrock::retries().with_initial_backoff(Duration::from_millis(5));
     let config = aws_sdk_bedrockruntime::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
+        .behavior_version(Bedrock::behavior())
         .region(Region::new("eu-west-2"))
         .credentials_provider(Credentials::new(
             "AKIDEXAMPLE",
