@@ -154,12 +154,29 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
 
 /// As [`on_disk`], with a cache in `cache` over the store, as a node has:
 /// so that a merge's vectors are gathered there, and nothing the store or
-/// its cache keeps is held in memory.
-async fn cached_on_disk(dir: &std::path::Path, cache: &std::path::Path) -> (Cluster, Writer) {
+/// its cache keeps is held in memory. With `part`, the store's uploads go in
+/// parts of that many bytes, and the cache's disk is told so, as a node's
+/// `upload_part_mib` sets both; else in the default parts.
+async fn cached_on_disk(
+    dir: &std::path::Path,
+    cache: &std::path::Path,
+    part: Option<usize>,
+) -> (Cluster, Writer) {
     let mut cluster = Cluster::new().await;
     let local = object_store::local::LocalFileSystem::new_with_prefix(dir).unwrap();
-    let store: Arc<dyn Blobs> = Arc::new(ObjectBlobs::on_disk(Arc::new(local), dir));
-    cluster.blobs = Arc::new(CachedBlobs::new(store, cache));
+    let store = ObjectBlobs::on_disk(Arc::new(local), dir);
+    cluster.blobs = Arc::new(match part {
+        None => CachedBlobs::new(Arc::new(store), cache),
+        Some(part_bytes) => {
+            let transfers = vellev_storage::Transfers {
+                part_bytes,
+                ..vellev_storage::Transfers::default()
+            };
+            let disk = vellev_storage::Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 64)
+                .fetching(&transfers);
+            CachedBlobs::new(Arc::new(store.transferring(transfers)), cache).on(disk)
+        }
+    });
     let writer = cluster.writer().await;
     (cluster, writer)
 }
@@ -394,6 +411,9 @@ struct Shape {
     collections: usize,
     /// A collection whose rows are spared if a row dying is of another.
     sparing: Option<usize>,
+    /// The bytes of each part a store's upload goes in, gathered on disk,
+    /// if not the default's.
+    part: Option<usize>,
 }
 
 impl Shape {
@@ -409,6 +429,7 @@ impl Shape {
             dying: (0, 0),
             collections: 1,
             sparing: None,
+            part: None,
         }
     }
 
@@ -449,6 +470,14 @@ impl Shape {
     const fn over(self, collections: usize) -> Self {
         Self {
             collections,
+            ..self
+        }
+    }
+
+    /// Gathered on disk, its frame going up in parts of `part` bytes.
+    const fn going_up_in(self, part: usize) -> Self {
+        Self {
+            part: Some(part),
             ..self
         }
     }
@@ -550,7 +579,7 @@ async fn merge_measured(shape: Shape, at_once: usize, gathered: Gathered) -> Mea
     let (_cluster, writer) = within(WRITTEN_WITHIN, "the writer opened", async {
         match gathered {
             Gathered::InMemory => on_disk(dir.path()).await,
-            Gathered::OnDisk => cached_on_disk(dir.path(), cache.path()).await,
+            Gathered::OnDisk => cached_on_disk(dir.path(), cache.path(), shape.part).await,
         }
     })
     .await;
@@ -821,6 +850,27 @@ const RECKONED_WIDE: [Shape; 6] = [
     Shape::of(FEWER, NARROW, Text::Tags(12)),
 ];
 
+/// Merges whose peak is their frame going up: few rows of short text, wide
+/// vectors, and parts of 64 MiB, which a node may be set to upload in.
+/// Going up, a merge holds what was built, the segment's frame and a part
+/// of the vectors' frame: here more than building does, so that a
+/// reckoning that left the part out would read short of the peak by more
+/// than 30%. One frame is under a part, held whole as it goes up; the other
+/// is over one, held at most a part and a piece at a time. At the default
+/// 16 MiB, every shape above builds more than it holds going up, and so
+/// shows nothing of `part`.
+const RECKONED_GOING_UP: [Shape; 2] = [
+    Shape::of(FEWER, WIDER, Text::Short).going_up_in(LARGER_PART),
+    Shape::of(15_000, WIDER, Text::Short).going_up_in(LARGER_PART),
+];
+
+/// Vectors as wide as some models make them.
+const WIDER: usize = 1_536;
+
+/// A part a node's uploads may be set to go in, by `upload_part_mib`, which
+/// takes 5 to 5,120 MiB: larger than its default of 16.
+const LARGER_PART: usize = 64 * 1024 * 1024;
+
 /// A merge reckons what it holds at its peak to within 30% of what it is
 /// measured to hold once its rows are gathered, and to within half as it
 /// is planned, from what its run's segments hold (merge note, §7.6 and
@@ -886,7 +936,8 @@ async fn a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent() 
         .iter()
         .chain(&RECKONED_RUNS)
         .chain(&RECKONED_DEATHS)
-        .chain(&RECKONED_WIDE);
+        .chain(&RECKONED_WIDE)
+        .chain(&RECKONED_GOING_UP);
     for shape in shapes {
         let merge = merge_measured(*shape, AT_ONCE, Gathered::OnDisk).await;
         let off = |by: usize| (by as f64 - merge.peak as f64) / merge.peak as f64 * 100.0;
