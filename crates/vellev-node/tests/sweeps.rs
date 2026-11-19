@@ -637,8 +637,7 @@ async fn swept_while_merging(
 
 /// A keep as held (§9.6): a tenant kept over the budget while its
 /// own maintenance merges it, sweep after sweep, is timed as one spell kept
-/// as held, from the first sweep that kept it to the sweep that takes it
-/// out. The merge is held between its build and its commit, past where a
+/// as held, from the first sweep that kept it to the last. The merge is held between its build and its commit, past where a
 /// stop ends it: its round holds the tenant, but not yet the building lock.
 #[tokio::test(start_paused = true)]
 async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {

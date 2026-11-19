@@ -2071,7 +2071,7 @@ fn kept_over_budget_mark(events: &[Event]) -> Value {
     let mut mark = json!({
         "passed": true,
         "flush_held_p99_s": held_p99,
-        "mark": "longest keep over budget, held or for a busy building lock, first keeping sweep to last, each < 2 x flush hold p99",
+        "mark": "longest keep over budget, held or for a busy building lock, first keeping sweep to last, so to one sweep's resolution, each < 2 x flush hold p99",
     });
     for why in KeptFor::ALL {
         let spells = secs(Timed::Kept(why));
