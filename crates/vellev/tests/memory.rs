@@ -22,34 +22,43 @@ static GLOBAL: vellev::allocator::Allocator = vellev::allocator::Allocator::new(
 pub static OPTIONS: vellev::allocator::Options =
     vellev::allocator::Options(vellev::allocator::OPTIONS.as_ptr());
 
-/// A size_t statistic or setting of jemalloc's, as of now; usize::MAX if
-/// it cannot be read.
+/// A size_t value of jemalloc's (a statistic is as of the last epoch
+/// advanced); usize::MAX if it cannot be read.
 #[cfg(target_os = "linux")]
 fn statistic(name: &str) -> usize {
-    let _ = tikv_jemalloc_ctl::epoch::advance();
     let name = format!("{name}\0");
-    // SAFETY: every name asked is jemalloc's, of a size_t statistic.
+    // SAFETY: every name asked is jemalloc's, of a size_t value.
     unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name.as_bytes()) }.unwrap_or(usize::MAX)
 }
 
 /// Bytes in pages freed and not yet given back, in every arena: what
-/// jemalloc's decay still has to purge.
+/// jemalloc's decay still has to purge, as of the last epoch advanced.
 #[cfg(target_os = "linux")]
 fn dirty() -> u64 {
     let pages = statistic("stats.arenas.4096.pdirty") as u64;
     pages.saturating_mul(statistic("arenas.page") as u64)
 }
 
+/// `dirty()` as of a new epoch.
+#[cfg(target_os = "linux")]
+fn dirty_now() -> u64 {
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    dirty()
+}
+
 /// What jemalloc holds, for a failure to show.
 #[cfg(target_os = "linux")]
 fn jemalloc() -> String {
     const MIB: usize = 1024 * 1024;
+    // One epoch for every figure, so that they add up as of one moment.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    let dirty = dirty();
     format!(
         "jemalloc: allocated {} MiB, active {} MiB, metadata {} MiB, dirty {} MiB, resident {} MiB, retained {} MiB, {} background threads",
         statistic("stats.allocated") / MIB,
         statistic("stats.active") / MIB,
         statistic("stats.metadata") / MIB,
-        dirty() / MIB as u64,
+        dirty / MIB as u64,
         statistic("stats.resident") / MIB,
         statistic("stats.retained") / MIB,
         statistic("stats.background_thread.num_threads"),
@@ -99,7 +108,7 @@ fn memory_freed_among_what_is_kept_is_given_back() {
     // until none are left to give back, or the deadline.
     let freed = std::time::Instant::now();
     let deadline = freed + std::time::Duration::from_secs(60);
-    while dirty() > 0 && std::time::Instant::now() < deadline {
+    while dirty_now() > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let rest = anon();
