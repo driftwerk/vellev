@@ -168,6 +168,7 @@ impl Drop for Name {
             return;
         };
         let (told, frame) = (disk.spills_are_told(), self.frame);
+        let ran = told.clone();
         let counted = disk.spills_counted();
         // Counted as on its way, as an upload's abort is, so that a process
         // that stops waits for it for as long as it gives those.
@@ -184,6 +185,9 @@ impl Drop for Name {
                 Err(error) => tracing::warn!(?path, %error, "a spill could not be removed"),
             }
             counted.gone(frame);
+            if let Some(told) = ran {
+                told.unlinked.fetch_add(1, Ordering::SeqCst);
+            }
         });
     }
 }
@@ -567,6 +571,8 @@ pub struct SpillsTold {
     pub written: AtomicU64,
     /// How long, in milliseconds, a spill's name takes to remove.
     pub unlinking: AtomicU64,
+    /// How many removals of a spill's name have run, whatever came of them.
+    pub unlinked: AtomicU64,
     /// While set, a cache that has taken a spill up waits before it looks
     /// again at what it took.
     pub looks_held: AtomicBool,
@@ -591,6 +597,7 @@ impl Default for SpillsTold {
             reading: AtomicU64::new(0),
             written: AtomicU64::new(0),
             unlinking: AtomicU64::new(0),
+            unlinked: AtomicU64::new(0),
             looks_held: AtomicBool::new(false),
             taken_up_ended: AtomicU64::new(0),
             free: AtomicU64::new(Self::ASK_THE_DISK),
@@ -747,6 +754,73 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(30), wait)
             .await
             .expect("the name stays");
+    }
+
+    /// A spill is counted for as long as it lies on disk: a name whose
+    /// removal fails, as in a directory that cannot be written, stays and
+    /// is counted, and one removed is not.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spill_whose_removal_fails_is_counted_while_it_lies_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let told = Arc::new(SpillsTold::default());
+        let disk =
+            Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 2).spills_told(told.clone());
+        let spills = Spills::in_dir(dir.path().to_path_buf(), disk, None);
+        let spilled = |spills: &Spills| {
+            let spills = spills.clone();
+            let asked = spills.asked(Handle::current(), Stopping::never(), "k".into());
+            tokio::task::spawn_blocking(move || {
+                let mut spilling = asked.begin(64).unwrap().unwrap();
+                assert!(spilling.written(&mut vec![0; 16]).unwrap());
+                spilling.sealed(1).unwrap().unwrap()
+            })
+        };
+        let removed = |count: u64| {
+            let told = told.clone();
+            async move {
+                while told.unlinked.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+        let ran = |count: u64| {
+            let removed = removed(count);
+            async move {
+                tokio::time::timeout(Duration::from_secs(30), removed)
+                    .await
+                    .expect("the removal never ran");
+            }
+        };
+        let kept = spilled(&spills).await.unwrap();
+        let frame = spills.figures().bytes;
+        assert!(frame > 0);
+        let readable = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            std::fs::write(dir.path().join("probe"), b"").is_err(),
+            "the directory can still be written, as by root: the rule shows nothing"
+        );
+        drop(kept);
+        ran(1).await;
+        assert_eq!(
+            names(dir.path()),
+            1,
+            "removed from a directory it cannot be"
+        );
+        assert_eq!(spills.figures().bytes, frame, "on disk, not counted");
+        std::fs::set_permissions(dir.path(), readable).unwrap();
+        let gone = spilled(&spills).await.unwrap();
+        assert_eq!(spills.figures().bytes, 2 * frame);
+        drop(gone);
+        ran(2).await;
+        assert_eq!(names(dir.path()), 1);
+        assert_eq!(
+            spills.figures().bytes,
+            frame,
+            "one gone, the other still counted"
+        );
     }
 
     /// One let go as the runtime shuts down, when nothing is left to do
