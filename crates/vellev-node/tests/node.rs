@@ -2165,6 +2165,89 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
     assert!(!merged, "the merge after shutdown was stopped");
 }
 
+/// Review of 038be00, M1: a hold is lost once, whoever finds it lost. Its
+/// renewal refused, a node loses its hold on a tenant and stops a request's
+/// merge, counted once. A merge a request makes after, on the tenant it
+/// still holds, is neither stopped nor counted when the tenant is next asked
+/// for and its hold is found lost. Real time, as a merge's build is held off
+/// the async threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = Duration::from_secs(3);
+    });
+    let name = tenant("lost");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for from in [10, 20, 30, 40] {
+        held.write(ten_notes(from)).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    // Held at the start of its build, where a stop finds it.
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilStopped));
+    let compacting = || {
+        let held = held.clone();
+        tokio::spawn(async move { held.compact(Duration::from_secs(60 * 60)).await })
+    };
+    let came_to_build = |what: &'static str| {
+        let builds = builds.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while builds.held() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what} never came to build"));
+        }
+    };
+    let first = compacting();
+    came_to_build("the first merge").await;
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    let lost = vellev_node::MergesStopped {
+        lease: 1,
+        ..vellev_node::MergesStopped::default()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while node.merges().stopped != lost {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the refused renewal stopped no merge");
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the stopped merge's request never ended")
+        .unwrap()
+        .unwrap();
+    let second = compacting();
+    came_to_build("the merge after the hold was lost").await;
+    assert_eq!(node.merges().stopped, lost);
+    // The hold found lost as the tenant is asked for again: whatever the
+    // opening afresh comes to.
+    let _ = tokio::time::timeout(Duration::from_secs(5), node.tenant(&name)).await;
+    let stopped = node.merges().stopped;
+    let still_held = builds.held();
+    builds.hold(None);
+    assert_eq!(stopped, lost);
+    assert_eq!(
+        still_held, 1,
+        "the merge after the hold was lost was stopped"
+    );
+    tokio::time::timeout(Duration::from_secs(30), second)
+        .await
+        .expect("the merge after the hold was lost never ended")
+        .unwrap()
+        .unwrap();
+}
+
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
 /// opening resolves. One tenant still opening, its lease's acquire
 /// unanswered, holds up no other tenant's release.
@@ -2577,6 +2660,8 @@ async fn a_node_notices_that_another_took_its_tenant() {
 struct Unrenewing {
     inner: Arc<MemoryCoordinator>,
     failing: AtomicBool,
+    /// Renewals of leases are refused outright, as a lease taken would be.
+    refusing: AtomicBool,
     /// How long each renewal takes to be answered.
     slowly: Duration,
     unanswered_commits: AtomicBool,
@@ -2713,6 +2798,7 @@ impl Unrenewing {
         Self {
             inner,
             failing: AtomicBool::new(false),
+            refusing: AtomicBool::new(false),
             history_forgotten: AtomicUsize::new(0),
             slowly: Duration::ZERO,
             losing_claim: AtomicBool::new(false),
@@ -2830,6 +2916,9 @@ impl Coordinator for Unrenewing {
         self.lease_renewals.fetch_add(1, Ordering::SeqCst);
         if self.failing.load(Ordering::SeqCst) {
             return Err(CoordinatorError::Backend("connection reset".into()));
+        }
+        if self.refusing.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::InvalidArgument("refused".into()));
         }
         tokio::time::sleep(self.slowly).await;
         self.inner.renew(lease, ttl).await
