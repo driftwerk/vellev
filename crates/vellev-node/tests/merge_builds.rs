@@ -850,7 +850,8 @@ fn spills(dir: &std::path::Path) -> usize {
 /// rules say of a store that spills. A store put between them that says
 /// nothing of spills would leave every node gathering on the heap, with every
 /// rule of the storage crate still passing. And what is gathered goes, with
-/// the merge, as the node shuts down.
+/// the merge, as the node shuts down. The node reports the spill as its
+/// store counts it, from when it begins until it goes.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothing_of_it() {
@@ -865,11 +866,20 @@ async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothi
     four_flushes(&node, "merging").await;
     until(30, "the merge never gathered", || builds.held() == 1).await;
     assert_eq!(spills(dir.path()), 1, "gathered on the heap");
+    let gathering = node.spills();
+    assert!(
+        gathering.bytes > 0,
+        "a spill under way not counted: {gathering:?}"
+    );
     node.shutdown().await;
     builds.hold(None);
     builds.let_one_go();
     until(30, "a stopped merge's spill stays", || {
         spills(dir.path()) == 0 && builds.under_way() == 0
+    })
+    .await;
+    until(30, "a spill gone still counted", || {
+        node.spills().bytes == 0
     })
     .await;
 }
@@ -935,6 +945,13 @@ async fn a_round_whose_merge_fails_or_is_skipped_still_cleans_up() {
             node.timings().merges_ended(end) > 0
         })
         .await;
+        // The node reports it as its store counts it.
+        let figures = node.spills();
+        let (counted, other) = match skipped {
+            true => (figures.skipped, figures.failed),
+            false => (figures.failed, figures.skipped),
+        };
+        assert!(counted > 0 && other == 0, "{end:?} reported as {figures:?}");
         // The rounds before it cleaned, having no merge to fail: what counts
         // is one more flush's leavings going, with every round's merge
         // ending as this one did.
