@@ -2002,6 +2002,71 @@ async fn a_sweep_s_releases_are_bounded_in_number_and_in_time() {
     assert_eq!(node.tenant_figures().len(), 0, "not let go");
 }
 
+/// `name` made on `node` with ten notes with vectors, flushed if
+/// `flushed`, and no longer used.
+async fn written_to_let_go(node: &Node, name: &str, flushed: bool) {
+    node.create_tenant(&tenant(name)).await.unwrap();
+    let held = node.tenant(&tenant(name)).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_with_vectors(0)).await.unwrap();
+    if flushed {
+        held.flush().await.unwrap();
+    }
+}
+
+/// Whether another node can take `name`'s lease now: whether this one gave
+/// it up, as the cluster's clock does not move for a lease to run out.
+async fn given_up(cluster: &Cluster, name: &str) -> bool {
+    let other = NodeId::generate("other");
+    let acquired = cluster.coordinator.acquire(&key(name), &other, LEASE).await;
+    matches!(acquired, Ok(Acquired::Lease { .. }))
+}
+
+/// Review of f800a51, M2: a tenant a sweep lets go with nothing to flush
+/// gives its lease up at once, not once the slowest flush of its sweep
+/// ends: another node waits on no lease nobody uses.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_with_nothing_to_flush_is_released_while_another_flushes() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    written_to_let_go(&node, "idle", true).await;
+    written_to_let_go(&node, "slow", false).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    let sweeping = node.sweep_now();
+    tokio::pin!(sweeping);
+    let released = async {
+        while !given_up(&cluster, "idle").await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        () = &mut sweeping => panic!("the sweep ended with a flush held"),
+        released = tokio::time::timeout(Duration::from_secs(10), released) => {
+            released.expect("its lease was held while another tenant flushed");
+        }
+    }
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let bound = LET_GO_FLUSH_WITHIN + RELEASE_WITHIN;
+    tokio::time::timeout(bound, sweeping)
+        .await
+        .expect("the sweep outlasted its bound");
+    let let_go = node.let_go();
+    assert_eq!(
+        (let_go.for_budget, let_go.flushes_skipped),
+        (2, 0),
+        "{let_go:?}"
+    );
+    assert!(
+        given_up(&cluster, "slow").await,
+        "the flushed tenant's lease"
+    );
+}
+
 /// M7-R5b: a let-go's flush cut in its commit closes its writer, which costs
 /// nothing with the hold lost at once. The next opener finds every row,
 /// whether the commit never landed, and it replays them, or landed unheard,
