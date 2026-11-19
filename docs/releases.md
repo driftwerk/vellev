@@ -92,9 +92,9 @@ rather than from its command line, which any user can usually read, or its
 environment, which other processes of the same user can. The flag is not
 listed in `--help`; the README, under Run, gives what the pipe must hold,
 how a supervisor hands it over, and what the pipe still leaves exposed.
-Only these two take the pipe: embedding keys and an object store's
-credentials still come from the environment. A node started without the
-flag takes both as before.
+Only these two take the pipe; the node's other settings, embedding keys
+and an object store's credentials among them, are given as before. A node
+started without the flag takes both as before.
 
 With the flag, the pipe is their only source: **a node also given either
 one on the command line or in the environment does not start**. It exits
@@ -109,12 +109,11 @@ VELLEV_API_KEYS is also set on the command line or in the environment; with --se
 If both are set, it names `VELLEV_DATABASE_URL` alone. A secret given
 empty or blank (for the keys, only commas and whitespace), on the command
 line or in the environment, counts as unset. The pipe is read before this
-check, so a payload the node refuses is named instead, and a start tried
-again needs a fresh pipe. To start such a node, remove both variables from
-its environment, and `--database-url` and `--api-keys` from its command
-line, and hand the values on the pipe alone. A node of an earlier release
-does not know the flag and exits with status 2, as for any option it does
-not take.
+check, so a start tried again needs a fresh pipe. To start such a node,
+remove both variables from its environment, and `--database-url` and
+`--api-keys` from its command line, and hand the values on the pipe alone.
+A node of an earlier release does not know the flag and exits with status
+2, as for any option it does not take.
 
 ### What a node answers
 
