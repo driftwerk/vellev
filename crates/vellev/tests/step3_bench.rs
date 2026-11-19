@@ -2146,12 +2146,16 @@ fn the_keep_mark_holds_each_reason_to_twice_a_flush_s_hold() {
     }
 }
 
-/// The keep mark as a node's own events read it (review of f800a51, M4):
-/// a tenant whose fourth flush holds the building lock for `flush_held`,
-/// its one real flush hold of note, and whose merge then holds the lock in
-/// its commit for `commit_held`, swept over the budget every 30 s, read
-/// while that commit is held: so its spell is still open (M1).
-async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> Value {
+/// A node over the budget, flushing every ten rows, keeping its events,
+/// with tenant `name` made on it, held by the caller, as `before` has set
+/// it up, and written `flushes` times: the last flush held at its adopted
+/// gate for `flush_held`, its one flush hold of note.
+async fn written_with_a_held_flush<T>(
+    name: &str,
+    flushes: u128,
+    flush_held: Duration,
+    before: impl FnOnce(&vellev_node::Tenant) -> T,
+) -> (Node, Arc<vellev_node::Tenant>, T) {
     const ROWS: u128 = 10;
     let notes = CollectionName::new("notes").unwrap();
     let note = |n: u128| Mutation::Upsert {
@@ -2176,11 +2180,11 @@ async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> 
     };
     let node = node(&Arc::default(), &blobs, settings);
     node.timings().keep_events(true);
-    let tenant = TenantId::new("merging").unwrap();
+    let tenant = TenantId::new(name).unwrap();
     node.create_tenant(&tenant).await.unwrap();
     let held = node.tenant(&tenant).await.unwrap();
     let writer = held.writer().clone();
-    let before_commit = held.hold_merges_before_commit();
+    let set_up = before(&held);
     let schema = Collection {
         name: notes.clone(),
         properties: vec![Property::new("title", DataType::Text).searchable()],
@@ -2199,20 +2203,15 @@ async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> 
     held.write(vec![Mutation::CreateCollection(Box::new(schema))])
         .await
         .unwrap();
-    async fn reached(gate: &MergeGate, what: &str) {
-        let reached = gate.reached.notified();
-        tokio::time::timeout(Duration::from_secs(30), reached)
-            .await
-            .expect(what);
-    }
-    for flush in 0..4 {
+    for flush in 0..flushes {
         let flushing = writer.hold_checkpoints_once_adopted();
-        if flush < 3 {
+        let last = flush + 1 == flushes;
+        if !last {
             writer.stop_holding_checkpoints();
         }
         let rows: Vec<Mutation> = (0..ROWS).map(|n| note(flush * ROWS + n)).collect();
         held.write(rows).await.unwrap();
-        if flush == 3 {
+        if last {
             reached(&flushing, "the flush never came to adopt").await;
             tokio::time::sleep(flush_held).await;
             writer.stop_holding_checkpoints();
@@ -2226,6 +2225,28 @@ async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> 
         .await
         .expect("the node never flushed the tenant");
     }
+    (node, held, set_up)
+}
+
+/// Waits for `gate` to be reached, or panics with `what`.
+async fn reached(gate: &MergeGate, what: &str) {
+    let reached = gate.reached.notified();
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect(what);
+}
+
+/// The keep mark as a node's own events read it (review of f800a51, M4):
+/// a tenant whose fourth flush holds the building lock for `flush_held`,
+/// its one real flush hold of note, and whose merge then holds the lock in
+/// its commit for `commit_held`, swept over the budget every 30 s, read
+/// while that commit is held: so its spell is still open (M1).
+async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> Value {
+    let (node, held, before_commit) = written_with_a_held_flush("merging", 4, flush_held, |held| {
+        held.hold_merges_before_commit()
+    })
+    .await;
+    let writer = held.writer().clone();
     reached(&before_commit, "the merge never came to its commit").await;
     let committing = writer.hold_checkpoints_once_adopted();
     writer.stop_holding_merges();
@@ -2260,6 +2281,40 @@ async fn a_node_s_own_long_merge_commit_fails_the_keep_mark() {
     let mark = kept_in_a_merge_commit(Duration::from_secs(100), Duration::from_secs(60)).await;
     assert_eq!(mark["passed"], json!(true), "{mark}");
     assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+}
+
+/// Review of 79b8103, M3: a keep spell runs from the first sweep that kept
+/// the tenant to the last that did. A tenant a request holds through one
+/// sweep over the budget, on a quiet node, and taken out by a sweep 10 s
+/// later, was kept by one sweep: its spell reads near nothing, not the 10 s
+/// to the next sweep, and passes the keep mark against a flush that held the
+/// lock 2 s.
+#[tokio::test(start_paused = true)]
+async fn a_keep_by_one_sweep_on_a_quiet_node_passes_the_keep_mark() {
+    let (node, held, ()) =
+        written_with_a_held_flush("quiet", 1, Duration::from_secs(2), |_| ()).await;
+    // Unused for long enough to be chosen, but held by the caller.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.kept_by_sweeps().held, 1, "{:?}", node.kept_by_sweeps());
+    drop(held);
+    let quiet = Duration::from_secs(10);
+    tokio::time::sleep(quiet).await;
+    assert_eq!(node.let_go().for_budget, 0, "let go before the quiet ended");
+    node.sweep_now().await;
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    let mark = kept_over_budget_mark(&events);
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or(f64::MAX);
+    assert!(
+        longest < 0.5,
+        "a spell of one sweep read {longest} s: {mark}"
+    );
+    let flush_p99 = mark["flush_held_p99_s"].as_f64().unwrap_or_default();
+    assert!((2.0..2.5).contains(&flush_p99), "{mark}");
+    assert_eq!(mark["passed"], json!(true), "{mark}");
 }
 
 /// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
