@@ -638,7 +638,8 @@ impl SpillsTold {
 
     /// A cache about to look again at a spill it took up, as told: held
     /// for a minute at the most, so that a test that never lets go leaves
-    /// no disk thread held for good.
+    /// no disk thread held for good. A rule that holds it waits less than
+    /// that on what it does meanwhile, or the hold goes before it is done.
     pub(crate) fn looks_again(&self) {
         let held = std::time::Instant::now();
         while self.looks_held.load(Ordering::SeqCst) && held.elapsed() < Duration::from_secs(60) {
@@ -803,12 +804,21 @@ pub(crate) mod tests {
         let kept = spilled(&spills).await.unwrap();
         let frame = spills.figures().bytes;
         assert!(frame > 0);
+        // Writable again however the rule ends, before the directory goes,
+        // so that it can go.
+        struct Writable(PathBuf, std::fs::Permissions);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
         let readable = std::fs::metadata(dir.path()).unwrap().permissions();
+        let writable = Writable(dir.path().to_path_buf(), readable);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(
-            std::fs::write(dir.path().join("probe"), b"").is_err(),
-            "the directory can still be written, as by root: the rule shows nothing"
-        );
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            eprintln!("the directory can still be written, as by root: the rule shows nothing");
+            return;
+        }
         drop(kept);
         ran(1).await;
         assert_eq!(
@@ -817,7 +827,7 @@ pub(crate) mod tests {
             "removed from a directory it cannot be"
         );
         assert_eq!(spills.figures().bytes, frame, "on disk, not counted");
-        std::fs::set_permissions(dir.path(), readable).unwrap();
+        drop(writable);
         let gone = spilled(&spills).await.unwrap();
         assert_eq!(spills.figures().bytes, 2 * frame);
         drop(gone);

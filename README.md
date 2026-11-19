@@ -773,31 +773,30 @@ dead connection passes to another node rather than waiting with it:
   file of its own named `<id>.spill`, each 4 MiB write a step as above. As
   that file goes up, a part of it is in memory at a time, rounded up to
   whole 4 MiB pieces, and 4 MiB more, or all of it if that is less:
-  `VELLEV_UPLOAD_PART_MIB` sets how large a part is. It
-  takes the disk the merged segment's copy would take anyway, sooner: once
-  the store has the file it becomes that copy, by a rename, and is not
-  written again. So a node with its cache on a disk it can fill needs room
-  for the vectors of each merge building at once, on top of the segments
-  they replace, from the start of the merge. A merge with too little room
-  for its vectors and as much again, or a gibibyte if that is more, is
-  skipped with nothing written, counted in
-  `vellev_merge_spills_skipped_total` and as `no_room` in
-  `vellev_merges_ended_total`, and tried again in a later round; the round
-  goes on to clean up, which is what frees that disk, as it does when a
-  merge fails. A disk that fills all the same, or stops answering, fails the
-  merge where it gathers, counted in `vellev_merge_spill_failures_total`,
-  and commits nothing. `vellev_merge_spill_bytes` says how much such files
-  hold for as long as they lie on disk: one whose removal failed, or could
-  not run as every thread of a disk that stopped answering was held, stays
-  and is counted until the node next starts on the directory. A merge
-  stopped, dropped or failed takes
-  its file with it, on a thread nothing waits for; one left by a node that
-  was killed goes as a node next starts on the directory, however new,
-  and a file another process is still writing is left alone. Nothing sweeps
-  the directory while a node runs. As a file goes up it is read a piece at a
-  time off the threads that serve requests, so that a disk that stops
-  answering fails the upload and holds up nothing else. A node with no cache
-  directory gathers in memory.
+  `VELLEV_UPLOAD_PART_MIB` sets how large a part is. It takes the disk the
+  merged segment's copy would take anyway, sooner: once the store has the
+  file it becomes that copy, by a rename, and is not written again. So a
+  node with its cache on a disk it can fill needs room for the vectors of
+  each merge building at once, on top of the segments they replace, from the
+  start of the merge. A merge with too little room for its vectors and as
+  much again, or a gibibyte if that is more, is skipped with nothing
+  written, counted in `vellev_merge_spills_skipped_total` and as `no_room`
+  in `vellev_merges_ended_total`, and tried again in a later round; the
+  round goes on to clean up, which is what frees that disk, as it does when
+  a merge fails. A disk that fills all the same, or stops answering, fails
+  the merge where it gathers, counted in
+  `vellev_merge_spill_failures_total`, and commits nothing.
+  `vellev_merge_spill_bytes` says how much such files hold for as long as
+  they lie on disk: one whose removal failed, or could not run as every
+  thread of a disk that stopped answering was held, stays and is counted
+  until the node next starts on the directory. A merge stopped, dropped or
+  failed takes its file with it, on a thread nothing waits for; one left by
+  a node that was killed goes as a node next starts on the directory,
+  however new, and a file another process is still writing is left alone.
+  Nothing sweeps the directory while a node runs. As a file goes up it is
+  read a piece at a time off the threads that serve requests, so that a disk
+  that stops answering fails the upload and holds up nothing else. A node
+  with no cache directory gathers in memory.
 - A flush's, a merge's and a restore's segments are built and go up before
   writes wait on them; a failure there commits nothing, leaves the writer
   as it was and deletes what went up. Writes wait only while a commit is
