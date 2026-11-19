@@ -3040,7 +3040,10 @@ impl Inner {
         deadline: Instant,
     ) {
         match before(deadline, releases.acquire()).await {
-            Some(Ok(_release)) => self.release_by(&lease, deadline).await,
+            Some(Ok(_release)) => {
+                let by = deadline.min(Instant::now() + self.settings.release_within);
+                self.release_by(&lease, by).await;
+            }
             _ => {
                 tracing::warn!(%tenant, "lease not released: the sweep's releases ran out of time")
             }
@@ -3235,10 +3238,9 @@ impl Inner {
         self.release_by(lease, Instant::now() + within).await;
     }
 
-    /// As [`Self::release`], given up by `by` if that is sooner, and not
-    /// sent if it has passed.
+    /// As [`Self::release`], given up by `by`, and not sent if it has
+    /// passed.
     async fn release_by(&self, lease: &Lease, by: Instant) {
-        let by = by.min(Instant::now() + self.settings.release_within);
         match before(by, self.coordinator.release(lease)).await {
             Some(Ok(())) => {}
             Some(Err(error)) => {
