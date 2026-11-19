@@ -420,8 +420,8 @@ its environment, which other processes of the same user can read:
 `serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
 and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
 Both are required, and neither may also be set on the command line or in
-the environment. The descriptor must be an inherited pipe (not
-close-on-exec) that the supervisor wrote the payload to once and closed its
+the environment. The descriptor must be the read end of an inherited pipe
+(not close-on-exec) that the supervisor wrote the payload to once and closed its
 own end of before starting the node, and no other copy of the write end may
 survive, in the supervisor's other children included. The payload may be at
 most 16 KiB less its 4-byte length, so it fits a default fresh pipe written

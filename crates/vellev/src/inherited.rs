@@ -10,8 +10,10 @@
 //! required, and with a pipe it is their only source: either one also set
 //! on the command line or in the environment is refused.
 //!
-//! The descriptor must be a pipe the node inherited (not close-on-exec);
-//! once taken it is made close-on-exec, and blocking. The supervisor writes
+//! The descriptor must be the read end of a pipe the node inherited (not
+//! close-on-exec), and anything else is refused untouched; once taken it is
+//! made close-on-exec, and a non-blocking one is waited for with its flag
+//! (shared with every holder of the pipe) left as it is. The supervisor writes
 //! the payload once and closes its end before the node starts, and no other
 //! copy of the write end may survive anywhere, in other children of the
 //! supervisor included: the node reads the frame and then the pipe's end,
@@ -72,8 +74,10 @@ impl std::fmt::Debug for Inherited {
 
 impl Inherited {
     /// Reads the descriptor `fd`, handed down by a supervisor for this
-    /// alone, and closes it by the time it returns, but at the deadline:
-    /// the reader is then left blocked on it, and the node, refused, exits.
+    /// alone, and closes it by the time it returns (but should a read block
+    /// past the deadline, which only something else draining the pipe can
+    /// cause: the reader is then left holding it, and the node, refused,
+    /// exits).
     ///
     /// The number is looked at without being taken: one that isn't open,
     /// isn't a pipe, or is close-on-exec (so was opened in this process,
@@ -83,7 +87,9 @@ impl Inherited {
     /// # Safety
     ///
     /// If `fd` names an open pipe without close-on-exec, nothing else in
-    /// this process may own it: it is taken, and closed once read.
+    /// this process may own it, and no other thread may close or reopen
+    /// that number while this runs: it is checked, then taken, and closed
+    /// once read.
     pub unsafe fn from_descriptor(fd: RawFd) -> Result<Self> {
         // SAFETY: passed on from this function's own contract.
         let owned = unsafe { Self::adopt(fd) }?;
@@ -112,12 +118,21 @@ impl Inherited {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: as above; `fstat` only writes `st`.
         if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
-            bail!("--secrets-fd {fd} can't be looked at");
+            bail!(
+                "--secrets-fd {fd} can't be looked at: {}",
+                std::io::Error::last_os_error()
+            );
         }
         // SAFETY: `fstat` succeeded, so `st` is written.
         let mode = unsafe { st.assume_init() }.st_mode;
         if mode & libc::S_IFMT != libc::S_IFIFO {
             bail!("--secrets-fd {fd} doesn't name a pipe");
+        }
+        // SAFETY: `F_GETFL` reads the open pipe's status flags; takes
+        // nothing.
+        let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if status == -1 || status & libc::O_ACCMODE != libc::O_RDONLY {
+            bail!("--secrets-fd {fd} isn't open for reading only (a pipe's read end)");
         }
         if flags & libc::FD_CLOEXEC != 0 {
             bail!(
@@ -141,7 +156,7 @@ impl Inherited {
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
     /// closes it.
-    pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
+    pub(crate) fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
         let is_pipe = file
@@ -152,40 +167,28 @@ impl Inherited {
         if !is_pipe {
             bail!("the secrets' descriptor isn't a pipe");
         }
-        // A pipe made non-blocking (the flag belongs to the open pipe, so a
-        // supervisor's choice is shared) would fail the read at once rather
-        // than wait for the deadline: it is made blocking, for every holder
-        // of that open pipe (the supervisor no longer reads it).
-        let raw = file.as_raw_fd();
-        // SAFETY: reads and sets the status flags of the descriptor owned
-        // by `file`.
-        let blocking = unsafe {
-            let flags = libc::fcntl(raw, libc::F_GETFL);
-            flags != -1
-                && (flags & libc::O_NONBLOCK == 0
-                    || libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) != -1)
-        };
-        if !blocking {
-            bail!(
-                "the secrets' descriptor can't be made blocking: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // Read on a thread of its own, so a supervisor that never writes is
-        // an error at the deadline rather than a node that never starts.
+        // Read on a thread of its own that waits for each read with `poll`
+        // against the deadline, so a supervisor that never writes is an
+        // error at the deadline rather than a node that never starts, a
+        // non-blocking pipe is waited for too (its flag, shared with every
+        // holder of the pipe, is left as it is), and the descriptor is
+        // closed by the time this returns. The wait here is a backstop, a
+        // little past the deadline, for a read that blocks after all
+        // (something else holding the pipe draining it between the poll and
+        // the read).
         let (tx, rx) = std::sync::mpsc::channel();
-        // Set once the frame is in, so a pipe that never ends after it is
-        // told from one nothing was written to.
-        let framed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let framed_in = framed.clone();
-        std::thread::spawn(move || {
-            let read = Self::read_frame(&mut file, &framed_in);
-            // Closed before the answer is sent, so it is closed by the time
-            // this returns, not some time after.
-            drop(file);
-            let _ = tx.send(read);
-        });
-        let body = match rx.recv_timeout(within) {
+        let deadline = std::time::Instant::now() + within;
+        std::thread::Builder::new()
+            .name("vellev-secrets".into())
+            .spawn(move || {
+                let read = Self::read_frame(&mut file, deadline);
+                // Closed before the answer is sent, so it is closed by the
+                // time this returns, not some time after.
+                drop(file);
+                let _ = tx.send(read);
+            })
+            .map_err(|e| eyre!("the secrets' reader can't be started: {e}"))?;
+        let body = match rx.recv_timeout(within + BACKSTOP) {
             Ok(Ok(body)) => body,
             Ok(Err(Unread::TooLong)) => bail!(
                 "the secrets' length is over the most the secrets may hold ({MAX_BYTES} bytes)"
@@ -198,18 +201,18 @@ impl Inherited {
                 )
             }
             Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                if framed.load(std::sync::atomic::Ordering::Acquire) =>
-            {
-                bail!(
-                    "the secrets arrived, but the pipe's write end is still open elsewhere \
-                     after {within:?}: the supervisor, and every child of it, must close it \
-                     once they are written"
-                )
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+            Ok(Err(Unread::Late { framed: true })) => bail!(
+                "the secrets arrived, but the pipe's write end is still open elsewhere after \
+                 {within:?}: the supervisor, and every child of it, must close it once they \
+                 are written"
+            ),
+            Ok(Err(Unread::Late { framed: false })) => bail!(
                 "the secrets didn't arrive within {within:?}, nor did the pipe's write end \
                  close"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "reading the secrets didn't finish within {within:?}: a read blocked, so \
+                 something else is reading the pipe"
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("reading the secrets stopped without an answer")
@@ -218,34 +221,25 @@ impl Inherited {
         Self::parse(&body)
     }
 
-    /// The framed payload, and then the end of the pipe: the supervisor
-    /// writes it once and closes its end, so anything after it was written
-    /// by something else.
+    /// The framed payload, and then the end of the pipe, by `deadline`: the
+    /// supervisor writes it once and closes its end, so anything after it
+    /// was written by something else.
     fn read_frame(
         file: &mut std::fs::File,
-        framed: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
     ) -> std::result::Result<Vec<u8>, Unread> {
-        let short = |e: std::io::Error| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => Unread::Short,
-            _ => Unread::Io(e),
-        };
         let mut header = [0u8; 4];
-        file.read_exact(&mut header).map_err(short)?;
+        fill(file, &mut header, deadline, false)?;
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_BYTES {
             return Err(Unread::TooLong);
         }
         let mut body = vec![0u8; len];
-        file.read_exact(&mut body).map_err(short)?;
-        framed.store(true, std::sync::atomic::Ordering::Release);
+        fill(file, &mut body, deadline, false)?;
         let mut after = [0u8; 1];
-        loop {
-            match file.read(&mut after) {
-                Ok(0) => return Ok(body),
-                Ok(_) => return Err(Unread::After),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Unread::Io(e)),
-            }
+        match read_by(file, &mut after, deadline, true)? {
+            0 => Ok(body),
+            _ => Err(Unread::After),
         }
     }
 
@@ -353,11 +347,78 @@ impl<'de> serde::Deserialize<'de> for Pairs {
     }
 }
 
+/// Fills `buf` from `file` by `deadline`; `framed` says whether the frame
+/// is already in, for the error should the deadline pass.
+fn fill(
+    file: &mut std::fs::File,
+    mut buf: &mut [u8],
+    deadline: std::time::Instant,
+    framed: bool,
+) -> std::result::Result<(), Unread> {
+    while !buf.is_empty() {
+        match read_by(file, buf, deadline, framed)? {
+            0 => return Err(Unread::Short),
+            n => buf = &mut buf[n..],
+        }
+    }
+    Ok(())
+}
+
+/// One read from `file` once `poll` says it won't wait, by `deadline`.
+fn read_by(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+    framed: bool,
+) -> std::result::Result<usize, Unread> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(Unread::Late { framed });
+        }
+        // Rounded up, so a wait under a millisecond isn't a busy loop.
+        let ms = libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+        let mut ready = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is one valid `pollfd` for the call's length.
+        match unsafe { libc::poll(&mut ready, 1, ms) } {
+            0 => continue,
+            -1 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(Unread::Io(e));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        match file.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => return Err(Unread::Io(e)),
+        }
+    }
+}
+
+/// How long past its deadline a read that blocked after all is waited for.
+const BACKSTOP: Duration = Duration::from_secs(1);
+
 /// Why a frame couldn't be read.
 enum Unread {
     TooLong,
     Short,
     After,
+    /// The deadline passed, before or after the frame was in.
+    Late {
+        framed: bool,
+    },
     Io(std::io::Error),
 }
 

@@ -24,6 +24,12 @@ static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Starts the node with `payload` on descriptor 3 and only `env` in its
 /// environment, and waits for it to stop.
 fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
+    start(payload, env).wait_with_output().unwrap()
+}
+
+/// Starts the node with `payload` on descriptor 3, listening on a port of
+/// its own, with only `env` in its environment.
+fn start(payload: &[u8], env: &[(&str, &str)]) -> std::process::Child {
     let spawns = SPAWNS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -36,6 +42,7 @@ fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
         .args(["serve", "--store", "memory://", "--secrets-fd", "3"])
         .env_clear()
         .env("VELLEV_DATABASE_TIMEOUT_SECS", "2")
+        .env("VELLEV_LISTEN", "127.0.0.1:0")
         .envs(env.iter().copied());
     // SAFETY: only `dup2` and `fcntl`, which are async-signal-safe, run
     // between fork and exec.
@@ -59,7 +66,7 @@ fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
         .unwrap();
     drop(reader);
     drop(spawns);
-    child.wait_with_output().unwrap()
+    child
 }
 
 fn stderr(output: &Output) -> String {
@@ -93,24 +100,49 @@ fn a_secret_also_in_the_environment_is_refused() {
     }
 }
 
-/// A good payload is taken: the node gets past the pipe to whatever it
-/// does next (here, a database it can't reach), and neither secret shows
-/// in what it says.
+/// A good payload is taken: the node gets past the pipe, its checks and
+/// its keys to listening (then it is stopped, as it would wait for its
+/// database for ever), and neither secret shows in anything it said.
 #[test]
 fn a_good_payload_is_taken_and_never_repeated() {
-    let output = serve(
+    use std::io::BufRead;
+    let mut child = start(
         br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":"k-fixture"}"#,
         &[],
     );
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut said = Vec::new();
+    let listening = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                let done = line.contains("vellev listening");
+                said.push(line);
+                if done {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    said.extend(rx.try_iter());
     let err = stderr(&output);
-    assert!(!output.status.success(), "{err}");
-    assert!(!err.contains("secrets"), "{err}");
-    assert!(!err.contains("--secrets-fd"), "{err}");
+    assert!(listening, "never listened: {err} {said:?}");
+    let said = said.join("\n");
     for secret in ["pw-fixture", "k-fixture"] {
-        assert!(!err.contains(secret), "{err}");
-        assert!(
-            !String::from_utf8_lossy(&output.stdout).contains(secret),
-            "stdout"
-        );
+        assert!(!said.contains(secret), "stdout: {said}");
+        assert!(!err.contains(secret), "stderr: {err}");
     }
 }
