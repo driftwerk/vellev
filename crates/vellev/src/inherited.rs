@@ -10,7 +10,8 @@
 //! required, and with a pipe it is their only source: either one also set
 //! on the command line or in the environment is refused.
 //!
-//! The descriptor must be a pipe. The supervisor writes the payload once
+//! The descriptor must be a pipe the node inherited (not close-on-exec);
+//! once taken it is made close-on-exec, and blocking. The supervisor writes the payload once
 //! and closes its end before the node starts: the node reads the frame and
 //! then the pipe's end, so bytes written after the frame are refused, and
 //! a write end still open elsewhere, like a supervisor that never writes,
@@ -20,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use eyre::{bail, eyre, Result};
@@ -53,25 +54,67 @@ impl std::fmt::Debug for Inherited {
 }
 
 impl Inherited {
-    /// Reads the descriptor `fd`, handed to this process for this alone,
-    /// and closes it.
-    pub fn from_descriptor(fd: RawFd) -> Result<Self> {
+    /// Reads the descriptor `fd`, handed down by a supervisor for this
+    /// alone, and closes it.
+    ///
+    /// The number is looked at without being taken: one that isn't open,
+    /// isn't a pipe, or is close-on-exec (so was opened in this process,
+    /// as Rust and tokio open every descriptor, rather than inherited) is
+    /// refused and left as it was.
+    ///
+    /// # Safety
+    ///
+    /// If `fd` names an open pipe without close-on-exec, nothing else in
+    /// this process may own it: it is taken, and closed once read.
+    pub unsafe fn from_descriptor(fd: RawFd) -> Result<Self> {
+        // SAFETY: passed on from this function's own contract.
+        let owned = unsafe { Self::adopt(fd) }?;
+        Self::read(owned, READ_WITHIN)
+    }
+
+    /// Checks `fd` by number, then takes it and makes it close-on-exec, so
+    /// nothing the node starts inherits it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Inherited::from_descriptor`].
+    unsafe fn adopt(fd: RawFd) -> Result<OwnedFd> {
         if fd < 3 {
             bail!("--secrets-fd {fd} is one of the standard streams");
         }
-        use std::os::unix::fs::FileTypeExt;
-        // Looked at without being owned, so a number that names something
-        // else (nothing was handed over on it) is left open.
-        // SAFETY: the `File` is never dropped, so the descriptor isn't
-        // closed; `fstat` on a number that isn't open fails harmlessly.
-        let peek = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        if !peek.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
+        // SAFETY: `fcntl(F_GETFD)` and `fstat` read about a number, take
+        // nothing, and fail harmlessly on one that isn't open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            bail!("--secrets-fd {fd} isn't open");
+        }
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: as above; `fstat` only writes `st`.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            bail!("--secrets-fd {fd} can't be looked at");
+        }
+        // SAFETY: `fstat` succeeded, so `st` is written.
+        let mode = unsafe { st.assume_init() }.st_mode;
+        if mode & libc::S_IFMT != libc::S_IFIFO {
             bail!("--secrets-fd {fd} doesn't name a pipe");
         }
-        // SAFETY: a pipe handed to this process to be read here, once;
-        // nothing else owns it.
+        if flags & libc::FD_CLOEXEC != 0 {
+            bail!(
+                "--secrets-fd {fd} is close-on-exec, so it was opened in this process \
+                 rather than inherited from a supervisor"
+            );
+        }
+        // SAFETY: an open pipe without close-on-exec, which the caller
+        // promises nothing else in this process owns.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self::read(owned, READ_WITHIN)
+        // SAFETY: sets a flag on the descriptor just taken.
+        if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            bail!(
+                "--secrets-fd {fd} can't be made close-on-exec: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(owned)
     }
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
@@ -86,6 +129,24 @@ impl Inherited {
             .is_fifo();
         if !is_pipe {
             bail!("the secrets' descriptor isn't a pipe");
+        }
+        // A pipe made non-blocking (the flag belongs to the open pipe, so a
+        // supervisor's choice is shared) would fail the read at once rather
+        // than wait for the deadline: it is made blocking.
+        let raw = file.as_raw_fd();
+        // SAFETY: reads and sets the status flags of the descriptor owned
+        // by `file`.
+        let blocking = unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            flags != -1
+                && (flags & libc::O_NONBLOCK == 0
+                    || libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) != -1)
+        };
+        if !blocking {
+            bail!(
+                "the secrets' descriptor can't be made blocking: {}",
+                std::io::Error::last_os_error()
+            );
         }
         // Read on a thread of its own, so a supervisor that never writes is
         // an error at the deadline rather than a node that never starts.
@@ -432,14 +493,14 @@ mod tests {
         use super::*;
         use std::os::fd::{AsRawFd, IntoRawFd};
 
-        fn inode(fd: RawFd) -> Option<(u64, u64)> {
+        fn inode(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
             let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: `fstat` only writes `st`, and fails harmlessly on a
             // number that isn't open.
             (unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0).then(|| {
                 // SAFETY: `fstat` succeeded, so `st` is written.
                 let st = unsafe { st.assume_init() };
-                (st.st_dev as u64, st.st_ino as u64)
+                (st.st_dev, st.st_ino)
             })
         }
 
