@@ -735,7 +735,7 @@ async fn a_node_set_to_one_flush_at_a_time_flushes_one_at_a_time() {
 /// M7-R5c: one deadline for the whole sweep. With every flush hanging, the
 /// two let-gos at the head are cut at it, those behind are not reached and
 /// never begin, each is counted as skipped, and all are let go by then, not
-/// one pair after another. Those not reached replay their rows; one with
+/// one pair after another. Neither of those cut is timed as a flush's hold. Those not reached replay their rows; one with
 /// nothing to flush waits for nothing and is no flush skipped.
 #[tokio::test(start_paused = true)]
 async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
@@ -774,14 +774,15 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     assert_eq!(waited.len(), 4, "{events:?}");
     let whole = waited.iter().filter(|took| **took >= LET_GO_FLUSH_WITHIN);
     assert_eq!(whole.count(), 2, "not reached, so not told: {waited:?}");
-    let begun = events
-        .iter()
-        .filter(|event| event.timed == Timed::BuildingHeld(Holder::Flush));
+    // Review A of #177, L1: the two begun, as `reached` says, were cut, and
+    // a cut hold is no flush's hold, nor a let-go flush's.
+    let held = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
     assert_eq!(
-        begun.count(),
-        LET_GO_FLUSHES_AT_ONCE,
-        "one begun at the deadline"
+        held(Timed::BuildingHeld(Holder::Flush)),
+        0,
+        "a cut flush timed as held"
     );
+    assert_eq!(held(Timed::LetGoFlushHeld), 0, "a cut flush timed as held");
     store.held.lock().unwrap().clear();
     for name in names {
         let opened = node.tenant(&tenant(name)).await.unwrap();
