@@ -861,8 +861,10 @@ async fn a_restore_given_up_lets_merges_on_before_its_lock_goes() {
     drop(restoring);
     letting_go.join().unwrap();
     queued.committed(Some(&gate)).await;
-    // Disarmed, a gate set before holds no restore after.
+    // Disarmed, a gate set before holds no restore after. Let go already,
+    // so that a disarm that does nothing fails the rule, not hangs it.
     let unarmed = writer.hold_refusals();
+    unarmed.let_go();
     writer.stop_holding_refusals();
     let (restore, head) = restore_of(&cluster).await;
     let after = writer
@@ -965,7 +967,8 @@ impl Blobs for PutsRefused {
 }
 
 /// As a restore given up, one whose commit fails lets merges on before its
-/// lock goes, whatever order its commit takes them apart in.
+/// lock goes: a guard on `commit` holding its refusal and lock whole, as
+/// `Restoring`, and never taking them apart again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_whose_commit_fails_lets_merges_on_before_its_lock_goes() {
     let builds = MergeBuilds::new(1);

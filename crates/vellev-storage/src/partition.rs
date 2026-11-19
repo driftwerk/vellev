@@ -4655,7 +4655,9 @@ impl Drop for Refusing<'_> {
     }
 }
 
-/// A restore under way: the building lock held, and writes refused.
+/// A restore under way: the building lock held, and writes refused. Held
+/// and dropped whole, never taken apart, so that its fields' order is the
+/// order they are let go in, wherever a restore ends.
 struct Restoring<'a> {
     // Before the lock, as fields drop in order: a merge waiting for the
     // lock then never finds the restore still refusing it.
