@@ -402,10 +402,16 @@ impl Settings {
     }
 
     /// Why a sweep could not let tenants go by these settings, if it could
-    /// not: with no flush at once, it would skip every one.
+    /// not: with no flush at once, it would skip every one, and with no
+    /// release at once, it would give up no lease.
     pub fn let_go_problem(&self) -> Option<String> {
-        (self.let_go_flushes_at_once == 0)
-            .then(|| "a sweep that flushes no tenant at once would skip every let-go flush".into())
+        if self.let_go_flushes_at_once == 0 {
+            return Some(
+                "a sweep that flushes no tenant at once would skip every let-go flush".into(),
+            );
+        }
+        (self.releases_at_once == 0)
+            .then(|| "a sweep that releases no lease at once would give up no lease".into())
     }
 
     /// The most rows a tenant holds unflushed, as these settings say.
