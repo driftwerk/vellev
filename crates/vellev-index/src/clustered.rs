@@ -2759,7 +2759,7 @@ mod tests {
 
     /// The `count` rows nearest `query`, nearest first and ties in row
     /// order.
-    fn exact<'a>(
+    fn nearest_exactly<'a>(
         metric: Distance,
         query: &[f32],
         rows: impl IntoIterator<Item = (u32, &'a [f32])>,
@@ -2788,7 +2788,7 @@ mod tests {
         let (mut found, mut total) = (0, 0);
         for query in vectors.iter().step_by(vectors.len() / 20) {
             let shortlist = index.shortlist(query, count, None, &[], &in_row_order);
-            found += exact(metric, query, numbered(vectors), 10)
+            found += nearest_exactly(metric, query, numbered(vectors), 10)
                 .iter()
                 .filter(|row| shortlist.contains(row))
                 .count();
@@ -2912,7 +2912,7 @@ mod tests {
                     .take(index.probes())
                     .map(|(_, cluster)| cluster)
                     .collect();
-                exact(Distance::Cosine, &query, numbered(&vectors), 10)
+                nearest_exactly(Distance::Cosine, &query, numbered(&vectors), 10)
                     .into_iter()
                     .filter(|row| {
                         let position = index.position(*row).unwrap();
@@ -2996,7 +2996,7 @@ mod tests {
         let few: RoaringBitmap = (0..6000u32).filter(|row| row % 100 == 0).collect();
         let mut by_rows = index.shortlist(query, 30, Some(&few), &[], &in_row_order);
         by_rows.sort_unstable();
-        let nearest = exact(
+        let nearest = nearest_exactly(
             Distance::L2,
             query,
             few.iter()
@@ -3137,7 +3137,7 @@ mod tests {
                 let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
                 assert_eq!(shortlist.len(), 100);
                 assert!(shortlist.iter().all(|row| *row < 6000), "{metric:?}");
-                found += exact(metric, query, numbered(&vectors[..3000]), 10)
+                found += nearest_exactly(metric, query, numbered(&vectors[..3000]), 10)
                     .iter()
                     .filter(|row| shortlist.contains(row))
                     .count();
