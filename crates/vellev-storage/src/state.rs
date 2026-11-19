@@ -853,6 +853,9 @@ pub(crate) struct Reckoning {
     /// What is in memory of that frame as it goes up, a store's part of it,
     /// beside what was built and the segment's frame.
     pub part: f64,
+    /// The most a store holds of a frame going up, which `part` never
+    /// passes, whatever frame was gathered: none, gathered in memory.
+    pub part_at_most: f64,
     /// What the run's tombstones take, if they are carried on.
     pub tombstones: f64,
     /// Their segment's frame, as [`encoded_bytes`] counts it.
@@ -907,7 +910,10 @@ impl Reckoning {
             rows: copied as f64,
             vectors: vectors.bytes() as f64,
             piece: vectors.piece_bytes() as f64,
-            part: self.part.min(vectors.frame_bytes() as f64),
+            part: match vectors.is_spilled() {
+                true => self.part_at_most.min(vectors.frame_bytes() as f64),
+                false => 0.0,
+            },
             encoded: self.encoded * by,
             indexed: self.indexed * by,
             indexing: self.indexing * by,
@@ -2929,6 +2935,7 @@ impl State {
             reckoning.vectors -= values;
             reckoning.piece = values.min(SPILLED_AT_ONCE as f64);
             reckoning.part = frames.min(going_up as f64);
+            reckoning.part_at_most = going_up as f64;
         }
         let fields: Vec<RunField> = fields.into_values().collect();
         let text: f64 = fields

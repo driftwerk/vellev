@@ -192,6 +192,11 @@ impl Gathering {
         (AHEAD + self.values + 2 * self.offsets.len() + 2) * 4
     }
 
+    /// Whether its frame goes to local disk as it is gathered.
+    pub fn is_spilled(&self) -> bool {
+        self.spilling.is_some()
+    }
+
     /// How many bytes of values went to local disk.
     pub fn spilled_bytes(&self) -> usize {
         match self.spilling {
