@@ -4366,8 +4366,10 @@ mod tests {
     }
 
     /// A gathered frame larger than the one planned, as when the rows that
-    /// died were mostly those with no vector, is reckoned going up at as
-    /// much of it as a store's part holds, not at what was planned.
+    /// died were those with no vector, is reckoned going up at as much of
+    /// it as a store's part holds, not at what was planned. A plan takes
+    /// what dies as dying evenly, so it reckons half the frame of a run half
+    /// of which died, where every row left has a vector.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_gathering_larger_than_planned_goes_up_at_as_much_as_a_part_holds() {
         let mut built = Built::new(&[]);
@@ -4377,7 +4379,7 @@ mod tests {
             object: Object {
                 id: oid(n),
                 properties: BTreeMap::new(),
-                vector: Some(vec![0.5; 4]),
+                vector: (n >= 1_024).then(|| vec![0.5; 4]),
             },
         });
         built.commit(rows.collect());
@@ -4391,16 +4393,18 @@ mod tests {
             .state
             .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1 << 20));
         let dir = tempfile::tempdir().unwrap();
-        let gathering = spilled_gathering(dir.path(), 2_048, 4).await;
+        // The live rows, every one with its vector.
+        let gathering = spilled_gathering(dir.path(), 1_024, 4).await;
         let frame = gathering.frame_bytes() as f64;
         assert!(frame > planned.part, "{frame} against {planned:?}");
-        let gathered = planned.gathered(2_048, &gathering);
+        let copied = planned.rows as usize;
+        let gathered = planned.gathered(copied, &gathering);
         assert_eq!(gathered.part, frame);
         // And never at more than a part holds.
         let capped = built
             .state
             .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
-        assert_eq!(capped.gathered(2_048, &gathering).part, 1_000.0);
+        assert_eq!(capped.gathered(copied, &gathering).part, 1_000.0);
     }
 
     /// An open works out what its segment comes to on that segment's own

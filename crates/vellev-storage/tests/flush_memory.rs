@@ -964,14 +964,15 @@ async fn a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent() 
     }
     // Each merge set by going up is, by more than the bounds: reckoned at
     // the default parts, which hold less of it, it reads more than 30%
-    // short, and without `part` it would read shorter still.
+    // short of the peak measured at its own, so R5 at the default parts
+    // would fail it; without `part` it would read shorter still.
     for (shape, merge) in measured.iter().filter(|(shape, _)| shape.part.is_some()) {
         let default = Shape {
             part: None,
             ..**shape
         };
         let at_default = merge_measured(default, AT_ONCE, Gathered::OnDisk).await;
-        let short = (merge.reckoned as f64 - at_default.reckoned as f64) / merge.peak as f64;
+        let short = (merge.peak as f64 - at_default.reckoned as f64) / merge.peak as f64;
         eprintln!(
             "a merge gathered on disk of {shape:?} reckoned {} at the default parts, \
              {:.0}% of its peak short",

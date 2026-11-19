@@ -911,8 +911,13 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
         "{error}"
     );
     settled("what it wrote stays", || files(cache.path()) == before).await;
-    // Its name gone, and nothing holding its file open: the room is back.
-    settled("the room it took never came back", || room() >= free).await;
+    // Its name gone, and nothing holding its file open: the room is back,
+    // within a few blocks of anything else's on the disk, far less than
+    // the 2 MiB a file held open would keep.
+    settled("the room it took never came back", || {
+        room() + 64 * 1024 >= free
+    })
+    .await;
     assert_eq!(cluster.committed().await.manifest, manifest);
 
     // With the room back the merge commits, told so: a small disk never has
@@ -1112,7 +1117,15 @@ async fn a_rename_given_up_leaves_a_copy_put_in_its_place() {
     let told = Arc::new(SpillsTold::default());
     let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
     let cached = Cached::on(STOPPED, Some(disk)).await;
+    // Let go however the rule ends, so that no disk thread is left held.
+    struct LooksHeld(Arc<SpillsTold>);
+    impl Drop for LooksHeld {
+        fn drop(&mut self) {
+            self.0.looks_held.store(false, Ordering::SeqCst);
+        }
+    }
     told.looks_held.store(true, Ordering::SeqCst);
+    let held = LooksHeld(told.clone());
     let merging = cached.merging();
     let copy = |dir: &Path| -> Option<String> {
         let all = files(dir).into_iter();
@@ -1136,7 +1149,7 @@ async fn a_rename_given_up_leaves_a_copy_put_in_its_place() {
         0,
         "looked too soon"
     );
-    told.looks_held.store(false, Ordering::SeqCst);
+    drop(held);
     let ended = || told.taken_up_ended.load(Ordering::SeqCst) == 1;
     settled("the taking up never looked again", ended).await;
     assert!(

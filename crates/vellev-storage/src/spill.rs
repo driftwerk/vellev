@@ -578,7 +578,7 @@ pub struct SpillsTold {
     /// How many removals of a spill's name have run, whatever came of them.
     pub unlinked: AtomicU64,
     /// While set, a cache that has taken a spill up waits before it looks
-    /// again at what it took.
+    /// again at what it took, for a minute at the most.
     pub looks_held: AtomicBool,
     /// How many takings up of a spill have ended, whatever came of them,
     /// counted on the disk's thread as each step's own locals drop, before
@@ -636,9 +636,12 @@ impl SpillsTold {
         std::thread::sleep(Duration::from_millis(taking));
     }
 
-    /// A cache about to look again at a spill it took up, as told.
+    /// A cache about to look again at a spill it took up, as told: held
+    /// for a minute at the most, so that a test that never lets go leaves
+    /// no disk thread held for good.
     pub(crate) fn looks_again(&self) {
-        while self.looks_held.load(Ordering::SeqCst) {
+        let held = std::time::Instant::now();
+        while self.looks_held.load(Ordering::SeqCst) && held.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
