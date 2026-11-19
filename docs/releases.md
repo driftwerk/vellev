@@ -572,8 +572,12 @@ A node of an earlier release does not know the flag and exits with status
     sent, and runs out. A tenant with nothing to flush gives its lease up
     at once, and a sweep takes at most 35 s. An opening that fails gives
     its lease up within the same 5 s, where it waited on the release with
-    no bound. Shutdown gives its tenants' leases up the same way, four at
-    a time and all within 5 s, where it gave them up one after another.
+    no bound. Shutdown gives its tenants' leases up the same way, each as
+    its opening resolves, four at a time and all within 5 s, where it gave
+    them up one after another. Those not given up by then run out with
+    their lease, as on a node that holds more tenants than four releases
+    at a time get through in 5 s. A sweep or a shutdown logs one warning
+    counting the leases it did not give up, not one for each.
     The 30 s, the two flushes and the four releases at once, and the 5 s
     are fixed at these defaults for a node run as `vellev`, with no
     `VELLEV_*` variable: only an embedder of `vellev_node` sets them, as

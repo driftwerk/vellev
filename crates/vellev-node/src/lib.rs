@@ -2988,15 +2988,25 @@ impl Node {
                     Some(Ok(tenant)) => {
                         tenant.work.hold.lose(Lost::Shutdown);
                         let lease = tenant.work.writer.lease();
-                        self.0.released(tenant.id(), lease, releases).await;
+                        self.0.released(lease, releases).await
                     }
                     // Not opened: what opened it gave its lease up.
-                    Some(Err(_)) => {}
-                    None => lost_once_opened(opening),
+                    Some(Err(_)) => true,
+                    None => {
+                        lost_once_opened(opening);
+                        false
+                    }
                 }
             }
         });
-        join_all(releasing).await;
+        let unsent = join_all(releasing).await.into_iter().filter(|sent| !sent);
+        let unsent = unsent.count();
+        if unsent > 0 {
+            tracing::warn!(
+                unsent,
+                "leases not released: shutdown's releases ran out of time"
+            );
+        }
         if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
             tracing::warn!(%error, "the node could not take itself off the register");
         }
@@ -3138,19 +3148,27 @@ impl Inner {
         let flushes = Semaphore::new(self.settings.let_go_flushes_at_once);
         let releases = Releases::new(&self.settings, deadline, taken.going.len());
         let letting_go = |going| self.let_go_of(going, &flushes, deadline, &releases);
-        join_all(taken.going.into_iter().map(letting_go)).await;
+        let let_go = join_all(taken.going.into_iter().map(letting_go)).await;
+        let unsent = let_go.into_iter().filter(|sent| !sent).count();
+        if unsent > 0 {
+            tracing::warn!(
+                unsent,
+                "leases not released: the sweep's releases ran out of time"
+            );
+        }
     }
 
     /// Flush `going`, then lose the hold on it with its building lock still
     /// held, so that whatever queued for the lock is stopped before it has
-    /// it; then give its lease up, as `releases` lets it.
+    /// it; then give its lease up, as `releases` lets it. Says whether its
+    /// release was sent.
     async fn let_go_of(
         &self,
         going: Going,
         flushes: &Semaphore,
         deadline: Instant,
         releases: &Releases,
-    ) {
+    ) -> bool {
         let Going {
             tenant,
             mut building,
@@ -3176,23 +3194,21 @@ impl Inner {
         drop(building);
         tracing::info!(tenant = %tenant.id(), "let go of a tenant");
         // Only its lease is kept from here, not what the tenant holds.
-        let (id, lease) = (tenant.id().clone(), work.writer.lease().clone());
+        let lease = work.writer.lease().clone();
         drop(tenant);
-        self.released(&id, &lease, releases).await;
+        self.released(&lease, releases).await
     }
 
-    /// Give up the lease of `tenant`, let go, as `releases` lets it: one
-    /// not begun by the end of the releases is not sent, and runs out, as
-    /// one that hangs does.
-    async fn released(&self, tenant: &TenantId, lease: &Lease, releases: &Releases) {
+    /// Give up `lease`, of a tenant let go, as `releases` lets it, saying
+    /// whether it was sent: one not begun by the end of the releases is
+    /// not, and runs out, as one that hangs does.
+    async fn released(&self, lease: &Lease, releases: &Releases) -> bool {
         let release = async {
             let _turn = releases.at_once.acquire().await;
             let by = Instant::now() + self.settings.release_within;
             self.release_by(lease, by).await;
         };
-        if unless(releases.over(), release).await.is_none() {
-            tracing::warn!(%tenant, "lease not released: its releases ran out of time");
-        }
+        unless(releases.over(), release).await.is_some()
     }
 
     /// Sweep soon, one at a time, so that each finds held only what
