@@ -1218,6 +1218,9 @@ impl Blobs for FlushesHeld {
     ) -> vellev_storage::Result<()> {
         self.inner.put_spilled(key, bytes, spill).await
     }
+    fn spilled_up_in_parts_of(&self) -> Option<usize> {
+        self.inner.spilled_up_in_parts_of()
+    }
     async fn get(&self, key: &str) -> vellev_storage::Result<Bytes> {
         self.inner.get(key).await
     }

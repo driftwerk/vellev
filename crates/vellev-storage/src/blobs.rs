@@ -191,6 +191,14 @@ pub trait Blobs: fmt::Debug + Send + Sync {
     fn spills(&self) -> Option<Spills> {
         None
     }
+    /// How many bytes each part is that [`Self::put_spilled`] sends a
+    /// spill up in, a piece at a time, which is all it holds of one in
+    /// memory beside the piece that came after: `None` from a store that
+    /// puts a file whole, as by default, and so may hold all of it. A store
+    /// over another that forwards [`Self::spills`] forwards this too.
+    fn spilled_up_in_parts_of(&self) -> Option<usize> {
+        None
+    }
     /// Put `bytes`, which are all of `spill`, under `key`, as [`Self::put`]
     /// does, and make the spill the store's copy of the file if the store
     /// keeps copies, once and only if the file is there. A store that sends
@@ -602,8 +610,6 @@ pub struct Disk {
     piece_takes: Duration,
     /// None but for tests (see [`Self::spills_told`]).
     spills_told: Option<Arc<SpillsTold>>,
-    /// How large a part of a file going to or from a store is.
-    part_bytes: usize,
     /// What is spilled here.
     spilled: Arc<SpillsCounted>,
 }
@@ -776,7 +782,6 @@ impl Disk {
             loads: Arc::default(),
             piece_takes: Duration::ZERO,
             spills_told: None,
-            part_bytes: 0,
             spilled: Arc::default(),
         }
         .fetching(&Transfers::default())
@@ -837,15 +842,8 @@ impl Disk {
             .saturating_add(written.max(transfers.request_within));
         Self {
             still_for: part.saturating_add(LOADING_STILL_BEYOND),
-            part_bytes: transfers.part_bytes,
             ..self
         }
-    }
-
-    /// How large a part of a file going to or from a store is, as
-    /// [`Self::fetching`] was told.
-    pub(crate) fn part_bytes(&self) -> usize {
-        self.part_bytes
     }
 
     /// How long those waiting for a turn at a large file go on waiting
@@ -1652,6 +1650,11 @@ impl Blobs for ObjectBlobs {
         Some(self.transfers.part_bytes)
     }
 
+    /// The parts [`Self::put_spilled`] sends through [`Self::put_parts`].
+    fn spilled_up_in_parts_of(&self) -> Option<usize> {
+        Some(self.transfers.part_bytes.max(1))
+    }
+
     /// As [`Self::put`] sends the same file, whatever the sizes its parts
     /// come in: parts of [`Transfers::part_bytes`] and a last one of what
     /// is left, each sent once it is known that more follows it, or whole
@@ -2176,7 +2179,12 @@ impl Blobs for CachedBlobs {
     /// Off Unix nothing is read in place (see `Partition::column`), so
     /// nothing is gathered to be.
     fn spills(&self) -> Option<Spills> {
-        cfg!(unix).then(|| Spills::in_dir(self.dir.clone(), self.disk.clone()))
+        let up_in_parts_of = self.inner.spilled_up_in_parts_of();
+        cfg!(unix).then(|| Spills::in_dir(self.dir.clone(), self.disk.clone(), up_in_parts_of))
+    }
+
+    fn spilled_up_in_parts_of(&self) -> Option<usize> {
+        self.inner.spilled_up_in_parts_of()
     }
 
     /// The store first, and the copy only once it has the file, as

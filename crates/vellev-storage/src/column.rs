@@ -676,7 +676,7 @@ mod tests {
         use crate::blobs::Disk;
         use crate::spill::Spills;
         use crate::stopping::Stopping;
-        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
+        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone(), None);
         let runtime = tokio::runtime::Handle::current();
         let asked = spills.asked(runtime, Stopping::never(), "k".into());
         tokio::task::spawn_blocking(move || {

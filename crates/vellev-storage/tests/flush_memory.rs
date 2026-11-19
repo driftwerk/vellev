@@ -155,8 +155,8 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
 /// As [`on_disk`], with a cache in `cache` over the store, as a node has:
 /// so that a merge's vectors are gathered there, and nothing the store or
 /// its cache keeps is held in memory. With `part`, the store's uploads go in
-/// parts of that many bytes, and the cache's disk is told so, as a node's
-/// `upload_part_mib` sets both; else in the default parts.
+/// parts of that many bytes, and the cache's disk fetches in them, as a
+/// node's `upload_part_mib` sets both; else in the default parts.
 async fn cached_on_disk(
     dir: &std::path::Path,
     cache: &std::path::Path,
@@ -172,8 +172,7 @@ async fn cached_on_disk(
                 part_bytes,
                 ..vellev_storage::Transfers::default()
             };
-            let disk = vellev_storage::Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 64)
-                .fetching(&transfers);
+            let disk = vellev_storage::Disk::shared().clone().fetching(&transfers);
             CachedBlobs::new(Arc::new(store.transferring(transfers)), cache).on(disk)
         }
     });

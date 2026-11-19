@@ -87,11 +87,17 @@ fn room_spared(frame: u64) -> u64 {
 pub struct Spills {
     dir: PathBuf,
     disk: Disk,
+    /// The parts the store sends a spill up in, if it sends one in parts.
+    up_in_parts_of: Option<usize>,
 }
 
 impl Spills {
-    pub(crate) fn in_dir(dir: PathBuf, disk: Disk) -> Self {
-        Self { dir, disk }
+    pub(crate) fn in_dir(dir: PathBuf, disk: Disk, up_in_parts_of: Option<usize>) -> Self {
+        Self {
+            dir,
+            disk,
+            up_in_parts_of,
+        }
     }
 
     /// What has been spilled here, so far.
@@ -102,8 +108,9 @@ impl Spills {
     /// How many bytes of a frame are in memory as it goes up, at the most:
     /// pieces enough to hold a part of the store's, and the piece that came
     /// after it, as a part ends in a piece that lives on for the part after.
+    /// All of it, for a store that puts a file whole.
     pub(crate) fn held_going_up(&self) -> usize {
-        held_of_parts(self.disk.part_bytes())
+        self.up_in_parts_of.map_or(usize::MAX, held_of_parts)
     }
 
     /// As asked of by a merge whose gather blocks on `runtime` for each
@@ -218,7 +225,7 @@ impl SpillAsked {
     /// else, and a name drawn at random is no name an open is looking for.
     pub(crate) fn begin(self, frame: u64) -> Result<Option<Spilling>> {
         let Self {
-            spills: Spills { dir, disk },
+            spills: Spills { dir, disk, .. },
             runtime,
             stopping,
             key,
@@ -641,7 +648,7 @@ pub(crate) mod tests {
     /// A spill of a few words in `dir`, sealed, made on a thread that may
     /// wait on the disk.
     pub(crate) async fn spill_in(dir: &Path) -> Arc<Spill> {
-        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone());
+        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone(), None);
         let asked = spills.asked(Handle::current(), Stopping::never(), "k".into());
         let made = tokio::task::spawn_blocking(move || {
             let mut spilling = asked.begin(64).unwrap().unwrap();
@@ -751,7 +758,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_spill_nobody_goes_on_with_leaves_no_name() {
         let dir = tempfile::tempdir().unwrap();
-        let spills = Spills::in_dir(dir.path().to_path_buf(), Disk::shared().clone());
+        let spills = Spills::in_dir(dir.path().to_path_buf(), Disk::shared().clone(), None);
         let asked = spills.asked(Handle::current(), Stopping::never(), "k".into());
         let begun = tokio::task::spawn_blocking(move || asked.begin(64).unwrap().unwrap());
         let spilling = begun.await.unwrap();
