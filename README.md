@@ -428,13 +428,14 @@ supervisor's other children included. The payload may be at most 16 KiB less
 its 4-byte length, so it fits a default fresh pipe written before the node
 starts. On Linux, a user over `pipe-user-pages-soft` gets pipes of as little
 as one page, so keep the payload and its length within 4 KiB. Bytes after
-the payload and a name given twice are refused, and the node gives up after
-10 seconds (about 15 at most). Only these two secrets take the pipe; the
-node's other settings, embedding keys and an object store's credentials
-among them, are given as before. On Linux, another process of the same user
-can open the pipe through `/proc`, from when the supervisor makes it until
-the node has read it, and so copy the payload or replace it whole
-undetected: the pipe shortens the exposure rather than closing it.
+the payload, a name given twice, any other name, and a blank value are
+refused, and the node gives up after 10 seconds (about 15 at most). Only
+these two secrets take the pipe; the node's other settings, embedding keys
+and an object store's credentials among them, are given as before. On Linux,
+another process of the same user can open the pipe through `/proc`, from
+when the supervisor makes it until the node has read it, and so copy the
+payload or replace it whole undetected: the pipe shortens the exposure
+rather than closing it.
 
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,

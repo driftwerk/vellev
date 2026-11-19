@@ -94,7 +94,7 @@ listed in `--help`; the README, under Run, gives what the pipe must hold,
 how a supervisor hands it over, and what the pipe still leaves exposed.
 Only these two take the pipe; the node's other settings, embedding keys
 and an object store's credentials among them, are given as before. A node
-started without the flag takes both as before.
+started without the flag takes the two secrets as before.
 
 With the flag, the pipe is their only source: **a node also given either
 one on the command line or in the environment does not start**. It exits

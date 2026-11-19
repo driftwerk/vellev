@@ -26,15 +26,15 @@
 //! name one of the two variables or a position, never a value, nor a name
 //! the node doesn't take.
 //!
-//! Only these two take the pipe: embedding keys and an object store's
-//! credentials still come from the environment. On Linux another process
-//! of the same user can open the pipe through `/proc/<pid>/fd/<n>`, the
-//! supervisor's or the node's, from when the pipe is made until the node
-//! has read it, so the pipe shortens the exposure the environment had but
-//! does not close it. Such a process can copy the payload without taking
-//! it (`tee(2)`), or replace it whole, and neither is seen; taking it
-//! without writing a whole frame back, adding bytes, or holding a write
-//! end open fails the start. macOS has no such path.
+//! Only these two take the pipe; the node's other settings, embedding keys
+//! and an object store's credentials among them, are given as before. On
+//! Linux another process of the same user can open the pipe through
+//! `/proc/<pid>/fd/<n>`, the supervisor's or the node's, from when the pipe
+//! is made until the node has read it, so the pipe shortens the exposure the
+//! environment had but does not close it. Such a process can copy the
+//! payload without taking it (`tee(2)`), or replace it whole, and neither is
+//! seen; taking it without writing a whole frame back, adding bytes, or
+//! holding a write end open fails the start. macOS has no such path.
 
 use std::collections::BTreeSet;
 use std::io::Read;
