@@ -830,13 +830,73 @@ mod tests {
                 writer.write_all(&framed(BOTH)).unwrap();
                 drop(writer);
                 inherited(&reader);
+                // A second read end, held until the check, keeps the pipe in
+                // being, so no pipe made alongside can come to share its
+                // inode.
+                let pin = reader.try_clone().unwrap();
                 let pipe = inode(reader.as_raw_fd());
                 let fd = reader.into_raw_fd();
                 let read = take(fd).unwrap();
                 assert_eq!(read.api_keys, ["k-fixture"]);
                 // Closed: the number is free, or reused by something else.
                 assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+                drop(pin);
             }
+        }
+
+        /// A write end, or anything else not opened for reading only, is
+        /// refused and left open: reading it would fail, or (a FIFO opened
+        /// read-write) hold its own write end and never see the end.
+        #[test]
+        fn a_descriptor_not_open_for_reading_only_is_refused_and_left_open() {
+            let (reader, writer) = std::io::pipe().unwrap();
+            inherited(&writer);
+            let writer = std::mem::ManuallyDrop::new(writer);
+            let before = inode(writer.as_raw_fd());
+            let err = format!("{:#}", take(writer.as_raw_fd()).unwrap_err());
+            assert!(err.contains("isn't open for reading only"), "{err}");
+            assert_eq!(inode(writer.as_raw_fd()), before);
+            drop(std::mem::ManuallyDrop::into_inner(writer));
+            drop(reader);
+        }
+
+        /// A pipe that turns out not to hold the secrets (another
+        /// program's, named by mistake) is refused without its shared state
+        /// being changed: its non-blocking flag is as it was.
+        #[test]
+        fn a_wrong_pipe_is_refused_without_being_changed() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            // SAFETY: sets a flag on a descriptor this test owns.
+            let flags = unsafe {
+                let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+                libc::fcntl(reader.as_raw_fd(), libc::F_GETFL)
+            };
+            writer.write_all(b"++++").unwrap();
+            drop(writer);
+            inherited(&reader);
+            // A second open of the same pipe sees the flag it shares.
+            let other = reader.try_clone().unwrap();
+            let fd = reader.into_raw_fd();
+            assert!(take(fd).is_err());
+            // SAFETY: reads a flag of a descriptor this test owns.
+            let now = unsafe { libc::fcntl(other.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(now, flags);
+        }
+
+        /// At the deadline too, the descriptor is closed by the time the
+        /// read returns: no reader is left holding it.
+        #[test]
+        fn a_silent_pipe_is_closed_at_the_deadline() {
+            let (reader, writer) = std::io::pipe().unwrap();
+            let pin = reader.try_clone().unwrap();
+            let reader = OwnedFd::from(reader);
+            let fd = reader.as_raw_fd();
+            let pipe = inode(fd);
+            let err = Inherited::read(reader, Duration::from_millis(300)).unwrap_err();
+            assert!(format!("{err:#}").contains("didn't arrive"), "{err:#}");
+            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            drop((pin, writer));
         }
 
         /// A supervisor whose pipe is non-blocking (shared with the node,
