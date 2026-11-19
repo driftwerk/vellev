@@ -825,6 +825,27 @@ async fn a_let_go_s_flush_cut_mid_build_gives_its_build_up() {
     assert_eq!(noted(&opened), 2, "rows lost");
 }
 
+/// Review of 79b8103, M2: the hold a test puts on a flush's build holds no
+/// merge commit's. A merge's commit flushes the rows still in memory under
+/// the building lock, and nothing stops it: held as a flush's, it would wait
+/// out the hold's bound. Real time, as the merge builds off the runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_commit_s_flush_is_not_held_as_a_flush_s() {
+    let (node, held, gate) = merging_held_before_commit().await;
+    let builds = node.merge_builds().clone();
+    held.write(vec![note(1_000)]).await.unwrap();
+    builds.hold(Some(Holding::FlushUntilStopped));
+    gate.release.notify_one();
+    let committed = tokio::time::timeout(Duration::from_secs(20), async {
+        while held.read(State::unflushed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    builds.hold(None);
+    committed.expect("the merge commit's flush was held as a flush's");
+}
+
 /// Review A of #177, M2: a let-go's flush cut by the sweep's deadline after
 /// its checkpoint was committed and adopted, as it frees what it took out,
 /// went through. It is no flush skipped, nor one that failed, and the next
