@@ -22,9 +22,9 @@
 //! frame, or a name given twice in it, are refused, and a write end still
 //! open elsewhere, like a supervisor that never writes, is an error at the
 //! deadline (saying which) rather than a node waiting for ever. The node
-//! then exits refused, and its supervisor sees a start that failed. Errors
-//! name one of the two variables or a position, never a value, nor a name
-//! the node doesn't take.
+//! then exits refused, and its supervisor sees a start that failed. Each
+//! start needs a pipe of its own. Errors name one of the two variables or a
+//! position, never a value, nor a name the node doesn't take.
 //!
 //! Only these two take the pipe. On Linux, another process of the same user
 //! can open the pipe through `/proc/<pid>/fd/<n>`, the supervisor's or the

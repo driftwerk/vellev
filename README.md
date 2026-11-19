@@ -430,12 +430,11 @@ starts. On Linux, a user over `pipe-user-pages-soft` gets pipes of as little
 as one page, so keep the payload and its length within 4 KiB. Bytes after
 the payload, a name given twice, any other name, and a blank value (for the
 keys, only commas and whitespace) are refused, and the node gives up after
-10 seconds (about 15 at most); a pipe is read once, so a start tried again
-needs a fresh one. Only these two secrets take the pipe. On Linux, another
-process of the same user can open the pipe through `/proc`, from when the
-supervisor makes it until the node has read it, and so copy the payload or
-replace it whole undetected: the pipe shortens the exposure rather than
-closing it.
+10 seconds (about 15 at most). Each start, a retry included, needs a pipe of
+its own. Only these two secrets take the pipe. On Linux, another process of
+the same user can open the pipe through `/proc`, from when the supervisor
+makes it until the node has read it, and so copy the payload or replace it
+whole undetected: the pipe shortens the exposure rather than closing it.
 
 `VELLEV_API_KEYS` are admin keys: they reach every tenant, and only they
 create, drop and list tenants. Give each tenant's caller a key of its own,
