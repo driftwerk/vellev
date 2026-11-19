@@ -258,12 +258,11 @@ enum Stop {
 /// its keys to listening, then tries its database (unreachable here) and
 /// warns that it isn't ready, and neither secret shows in anything it
 /// said. It is stopped only after that warning, whose error is the one
-/// from connecting to Postgres with the URL that holds the password. With
-/// nothing listening on that port the cause is a refused connection,
-/// which doesn't quote the URL, so this shows the warning doesn't repeat
-/// it, not that a driver error quoting a URL would be redacted. The
-/// secrets are checked as they are written, so a fixture must keep to
-/// characters that JSON and URLs leave as they are.
+/// from connecting to Postgres with the URL that holds the password. That
+/// shows this warning doesn't repeat it; whether an error that quotes a
+/// URL would be redacted isn't tried here. The secrets are checked as they
+/// are written, so a fixture must keep to characters that JSON and URLs
+/// leave as they are.
 #[test]
 fn a_good_payload_is_taken_and_never_repeated() {
     let mut node = start(
@@ -300,28 +299,26 @@ fn a_good_payload_is_taken_and_never_repeated() {
     let warned = matches!(stop, Stop::Warned);
     // Everything it said to the end, the lines in flight at the kill
     // included.
-    let (said, how) = match stop {
-        Stop::Warned => (
-            rest(&out, said),
-            format!("the test stopped it after the warning: {status}"),
-        ),
-        Stop::Ended => (
-            Ok(said),
-            format!("its stdout ended, as when it exits: {status}"),
-        ),
+    // The node never kills itself, so a kill is the test's.
+    let who = if std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL) {
+        "the test stopped it"
+    } else {
+        "it had exited"
+    };
+    let (said, why) = match stop {
+        Stop::Warned => (rest(&out, said), "after the warning".to_owned()),
+        Stop::Ended => (Ok(said), "its stdout ended".to_owned()),
         Stop::Failed(e) => (
             Err((said, format!("reading it failed: {e}"))),
-            format!("reading its stdout failed, and the test stopped it: {status}"),
+            "reading its stdout failed".to_owned(),
         ),
-        Stop::Minute => (
-            rest(&out, said),
-            format!("the test stopped it after a minute: {status}"),
-        ),
+        Stop::Minute => (rest(&out, said), "a minute passed".to_owned()),
         Stop::ReaderDied => (
             Err((said, "its reader died".into())),
-            format!("its stdout's reader died, and the test stopped it: {status}"),
+            "its stdout's reader died".to_owned(),
         ),
     };
+    let how = format!("{why}; {who}: {status}");
     let err = rest(&err, Vec::new());
     assert!(
         warned,
