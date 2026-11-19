@@ -2053,10 +2053,31 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
 
 /// The busy-lock mark (§9.6; the overseer's ruling on review B of #177,
 /// M2): the longest spell a sweep over the budget kept a tenant for its busy
-/// building lock alone, against twice a flush's hold p99. Not held to
-/// anything yet.
-fn kept_for_building_mark(_events: &[Event]) -> Value {
-    json!({ "passed": true })
+/// building lock alone, against twice a flush's hold p99. The bound is read
+/// from flush holds only. No spell passes; spells with no flush hold to set
+/// them against do not, as the other marks take a missing series.
+fn kept_for_building_mark(events: &[Event]) -> Value {
+    let secs = |want: Timed| {
+        sorted(
+            events
+                .iter()
+                .filter(|event| event.timed == want)
+                .map(|event| event.took.as_secs_f64())
+                .collect(),
+        )
+    };
+    let spells = secs(Timed::KeptForBuilding);
+    let flush_held = secs(Timed::BuildingHeld(Holder::Flush));
+    let (longest, held_p99) = (spells.last().copied(), percentile(&flush_held, 99.0));
+    json!({
+        "passed": match (longest, held_p99) {
+            (None, _) => true,
+            (Some(longest), Some(held)) => longest < 2.0 * held,
+            (Some(_), None) => false,
+        },
+        "spells": spells.len(), "longest_s": longest, "flush_held_p99_s": held_p99,
+        "mark": "longest keep for a busy building lock while over budget < 2 x flush hold p99",
+    })
 }
 
 /// A tenant kept for its busy building lock for longer than flushes hold it
