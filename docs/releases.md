@@ -549,6 +549,9 @@ A node of an earlier release does not know the flag and exits with status
   `vellev_sweep_kept_seconds` is new, with the same `reason` label: each
   spell sweeps over the memory budget kept a tenant for one reason, from
   the first sweep that kept it for that reason to the first that did not.
+  It times only tenants written for and kept over the budget, so it counts
+  fewer keeps than `vellev_sweep_tenants_kept_total`, whose `held` also
+  counts copies and tenants kept as they idled.
   One it takes has that lock from then on, with the flush before letting go
   made under it, so nothing comes in between and whatever queued for the
   lock ends with the hold. The tenants of a sweep go together, two flushing
