@@ -393,7 +393,15 @@ impl Settings {
             .or_else(|| self.request_bounds.claim_problem(self.backup_claim))
             .or_else(|| self.backlog_problem())
             .or_else(|| self.merge_pool.problem(MERGE_BUILDS))
+            .or_else(|| self.let_go_problem())
             .map_or(Ok(()), |problem| Err(NodeError::Settings(problem)))
+    }
+
+    /// Why a sweep could not let tenants go by these settings, if it could
+    /// not: with no flush at once, it would skip every one.
+    pub fn let_go_problem(&self) -> Option<String> {
+        (self.let_go_flushes_at_once == 0)
+            .then(|| "a sweep that flushes no tenant at once would skip every let-go flush".into())
     }
 
     /// The most rows a tenant holds unflushed, as these settings say.
@@ -1686,19 +1694,19 @@ const RESTORE_WAITS: usize = 3;
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
 
-/// How long a sweep gives the flushes of all the tenants it lets go, from
+/// By default, how long a sweep gives the flushes of all the tenants it lets go, from
 /// when it took them out: what is left unflushed by then is in the log, and
 /// the next opener replays it. Sweeps run one at a time, so that a flush
 /// that hangs would hold every let-go of the node.
 pub const LET_GO_FLUSH_WITHIN: Duration = Duration::from_secs(30);
 
-/// How many tenants a sweep flushes at once as it lets them go: enough that
+/// By default, how many tenants a sweep flushes at once as it lets them go: enough that
 /// none waits long on one slow flush, and few enough that a sweep of many
 /// does not build them all together, on top of the merges and flushes of the
 /// tenants that stay.
 pub const LET_GO_FLUSHES_AT_ONCE: usize = 2;
 
-/// How long giving a lease up early is waited for. A lease not given up runs
+/// By default, how long giving a lease up early is waited for. A lease not given up runs
 /// out, and costs the next node to want it that wait, which is little beside
 /// a sweep held, so that this is shorter than a coordinator's own bound on
 /// a call by default.
@@ -2756,8 +2764,8 @@ impl Inner {
     ///
     /// A sweep waits on no lock of a tenant's: one whose building lock is
     /// busy is kept for a later sweep. Those it takes out are let go together,
-    /// [`LET_GO_FLUSHES_AT_ONCE`] flushing at once, for
-    /// [`LET_GO_FLUSH_WITHIN`] among them all. Every one of them goes by then,
+    /// [`Settings::let_go_flushes_at_once`] flushing at once, for
+    /// [`Settings::let_go_flush_within`] among them all. Every one of them goes by then,
     /// with its flush skipped if need be, as what is left is in the log.
     ///
     /// Over the budget, a tenant chosen that something else holds, as a
@@ -2834,8 +2842,8 @@ impl Inner {
                 );
             }
         }
-        let deadline = Instant::now() + LET_GO_FLUSH_WITHIN;
-        let flushes = Semaphore::new(LET_GO_FLUSHES_AT_ONCE);
+        let deadline = Instant::now() + self.settings.let_go_flush_within;
+        let flushes = Semaphore::new(self.settings.let_go_flushes_at_once);
         let letting_go = |going| self.let_go_of(going, &flushes, deadline);
         join_all(taken.going.into_iter().map(letting_go)).await;
     }
@@ -3020,10 +3028,11 @@ impl Inner {
         self.limits.admit(tenant, asked, cost)
     }
 
-    /// Give `lease` up early, waiting at most [`RELEASE_WITHIN`]: left, it
-    /// runs out.
+    /// Give `lease` up early, waiting at most [`Settings::release_within`]:
+    /// left, it runs out.
     async fn release(&self, lease: &Lease) {
-        match tokio::time::timeout(RELEASE_WITHIN, self.coordinator.release(lease)).await {
+        let within = self.settings.release_within;
+        match tokio::time::timeout(within, self.coordinator.release(lease)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(partition = %lease.key, %error, "lease not released");
