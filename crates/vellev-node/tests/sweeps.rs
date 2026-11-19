@@ -216,6 +216,17 @@ fn noted(tenant: &Tenant) -> usize {
     tenant.read(|state| state.count(&notes))
 }
 
+/// The durations of the events of `timed` among `events`.
+fn took(events: &[Event], timed: Timed) -> Vec<Duration> {
+    let of = events.iter().filter(|event| event.timed == timed);
+    of.map(|event| event.took).collect()
+}
+
+/// How many of `events` are of `timed`.
+fn count(events: &[Event], timed: Timed) -> usize {
+    events.iter().filter(|event| event.timed == timed).count()
+}
+
 /// The tenants `node` writes for, by name.
 fn written_for(node: &Node) -> Vec<String> {
     let figures = node.tenant_figures();
@@ -475,10 +486,13 @@ async fn the_flush_before_letting_a_tenant_go_is_timed_under_its_own_name() {
     node.sweep_now().await;
     assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
     let events = node.timings().drain_events();
-    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
-    assert_eq!(named(Timed::LetGoFlushWait), 1, "{events:?}");
-    assert_eq!(named(Timed::LetGoFlushHeld), 1, "{events:?}");
-    assert_eq!(named(Timed::BuildingHeld(Holder::Flush)), 1, "{events:?}");
+    assert_eq!(count(&events, Timed::LetGoFlushWait), 1, "{events:?}");
+    assert_eq!(count(&events, Timed::LetGoFlushHeld), 1, "{events:?}");
+    assert_eq!(
+        count(&events, Timed::BuildingHeld(Holder::Flush)),
+        1,
+        "{events:?}"
+    );
 }
 
 /// M7-R5: a sweep waits on no lock of a tenant's. A tenant whose building
@@ -524,7 +538,7 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
     assert_eq!(opened.read(State::unflushed), 0, "not flushed as it went");
 }
 
-/// The overseer's busy-lock gate: a tenant kept over the budget for its busy
+/// The busy-lock keep (§9.6): a tenant kept over the budget for its busy
 /// building lock, sweep after sweep, is timed as one spell, from the first
 /// sweep that kept it so to the sweep that takes it out. A merge holds the
 /// lock from a round, which holds the tenant, so that it is kept as held:
@@ -554,11 +568,7 @@ async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
     node.sweep_now().await;
     assert_eq!(written_for(&node), Vec::<String>::new(), "not let go");
     let events = node.timings().drain_events();
-    let spells: Vec<Duration> = events
-        .iter()
-        .filter(|event| event.timed == Timed::Kept(KeptFor::Building))
-        .map(|event| event.took)
-        .collect();
+    let spells = took(&events, Timed::Kept(KeptFor::Building));
     assert_eq!(spells.len(), 1, "{events:?}");
     assert!(
         spells[0] >= held_for && spells[0] < held_for + Duration::from_secs(1),
@@ -623,13 +633,7 @@ async fn swept_while_merging(
     kept
 }
 
-/// The durations of the events of `timed` among `events`.
-fn took(events: &[Event], timed: Timed) -> Vec<Duration> {
-    let of = events.iter().filter(|event| event.timed == timed);
-    of.map(|event| event.took).collect()
-}
-
-/// Desk's widened busy-lock gate: a tenant kept over the budget while its
+/// A keep as held (§9.6): a tenant kept over the budget while its
 /// own maintenance merges it, sweep after sweep, is timed as one spell kept
 /// as held, from the first sweep that kept it to the sweep that takes it
 /// out. The merge is held between its build and its commit, past where a
@@ -897,10 +901,8 @@ async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
     );
     assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
     let events = node.timings().drain_events();
-    let held = events
-        .iter()
-        .filter(|event| event.timed == Timed::LetGoFlushHeld);
-    assert_eq!(held.count(), 2, "the superseded let-go flushed: {events:?}");
+    let held = count(&events, Timed::LetGoFlushHeld);
+    assert_eq!(held, 2, "the superseded let-go flushed: {events:?}");
     assert_eq!(noted(&reopened), 2, "rows lost");
 }
 
@@ -941,14 +943,13 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
         .await
         .expect("the sweep ended");
     let events = node.timings().drain_events();
-    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
     assert_eq!(
-        named(Timed::LetGoFlushHeld),
+        count(&events, Timed::LetGoFlushHeld),
         3,
         "a tenant's rows went with a flush of another's making: {events:?}"
     );
     assert_eq!(
-        named(Timed::BuildingWait(Holder::Flush)),
+        count(&events, Timed::BuildingWait(Holder::Flush)),
         0,
         "a flush had the lock between a tenant's taking and its hold lost: {events:?}"
     );
@@ -996,24 +997,15 @@ async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
     assert_eq!(written_for(&node), Vec::<String>::new());
     // What a let-go's flush waited for: the others of its sweep.
     let events = node.timings().drain_events();
-    let waited: Vec<Duration> = events
-        .iter()
-        .filter(|event| event.timed == Timed::LetGoFlushWait)
-        .map(|event| event.took)
-        .collect();
+    let waited = took(&events, Timed::LetGoFlushWait);
     assert_eq!(waited.len(), 3, "{events:?}");
     let least = |at_least: Duration| waited.iter().filter(|took| **took >= at_least).count();
     assert_eq!(least(flush), 1, "one waited behind the others: {waited:?}");
-    // The wait split in two (overseer's ruling on review B of #177, M2):
-    // each that had a slot is queued for as long as its wait, and none was
-    // not reached.
-    let of = |timed: Timed| -> Vec<Duration> {
-        let events = events.iter().filter(|event| event.timed == timed);
-        events.map(|event| event.took).collect()
-    };
-    assert_eq!(of(Timed::LetGoFlushQueued), waited, "{events:?}");
+    // The wait split in two: each that had a slot is queued for as long as
+    // its wait, and none was not reached.
+    assert_eq!(took(&events, Timed::LetGoFlushQueued), waited, "{events:?}");
     assert_eq!(
-        of(Timed::LetGoFlushNotReached),
+        took(&events, Timed::LetGoFlushNotReached),
         Vec::<Duration>::new(),
         "{events:?}"
     );
@@ -1055,8 +1047,9 @@ async fn a_node_set_to_one_flush_at_a_time_flushes_one_at_a_time() {
 /// M7-R5c: one deadline for the whole sweep. With every flush hanging, the
 /// two let-gos at the head are cut at it, those behind are not reached and
 /// never begin, each is counted as skipped, and all are let go by then, not
-/// one pair after another. Neither of those cut is timed as a flush's hold. Those not reached replay their rows; one with
-/// nothing to flush waits for nothing and is no flush skipped.
+/// one pair after another. Neither of those cut is timed as a flush's
+/// hold. Those not reached replay their rows; one with nothing to flush
+/// waits for nothing and is no flush skipped.
 #[tokio::test(start_paused = true)]
 async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     let store = HeldPuts::new();
@@ -1086,22 +1079,15 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     assert_eq!(node.let_go().for_budget, 5, "{:?}", node.let_go());
     assert_eq!(written_for(&node), Vec::<String>::new(), "not let go");
     let events = node.timings().drain_events();
-    let waited: Vec<Duration> = events
-        .iter()
-        .filter(|event| event.timed == Timed::LetGoFlushWait)
-        .map(|event| event.took)
-        .collect();
+    let waited = took(&events, Timed::LetGoFlushWait);
     assert_eq!(waited.len(), 4, "{events:?}");
     let whole = waited.iter().filter(|took| **took >= LET_GO_FLUSH_WITHIN);
     assert_eq!(whole.count(), 2, "not reached, so not told: {waited:?}");
-    // The wait split in two (overseer's ruling on review B of #177, M2): the
-    // two that had a slot are queued, the two the deadline reached first are
-    // not reached, each for the whole of what the flushes are given.
-    let named = |timed: Timed| events.iter().filter(move |event| event.timed == timed);
-    assert_eq!(named(Timed::LetGoFlushQueued).count(), 2, "{events:?}");
-    let not_reached: Vec<Duration> = named(Timed::LetGoFlushNotReached)
-        .map(|event| event.took)
-        .collect();
+    // The wait split in two: the two that had a slot are queued, the two
+    // the deadline reached first are not reached, each for the whole of
+    // what the flushes are given.
+    assert_eq!(count(&events, Timed::LetGoFlushQueued), 2, "{events:?}");
+    let not_reached = took(&events, Timed::LetGoFlushNotReached);
     assert_eq!(not_reached.len(), 2, "{events:?}");
     assert!(
         not_reached.iter().all(|took| *took >= LET_GO_FLUSH_WITHIN),
@@ -1109,13 +1095,16 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     );
     // Review A of #177, L1: the two begun, as `reached` says, were cut, and
     // a cut hold is no flush's hold, nor a let-go flush's.
-    let held = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
     assert_eq!(
-        held(Timed::BuildingHeld(Holder::Flush)),
+        count(&events, Timed::BuildingHeld(Holder::Flush)),
         0,
         "a cut flush timed as held"
     );
-    assert_eq!(held(Timed::LetGoFlushHeld), 0, "a cut flush timed as held");
+    assert_eq!(
+        count(&events, Timed::LetGoFlushHeld),
+        0,
+        "a cut flush timed as held"
+    );
     store.holds.lock().unwrap().clear();
     for name in names {
         let opened = node.tenant(&tenant(name)).await.unwrap();
@@ -1137,10 +1126,8 @@ async fn a_tail_under_a_flush_s_rows_is_flushed_as_its_tenant_is_let_go() {
         .expect("the sweep ended");
     assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
     let events = node.timings().drain_events();
-    let held = events
-        .iter()
-        .filter(|event| event.timed == Timed::LetGoFlushHeld);
-    assert_eq!(held.count(), 1, "no flush made: {events:?}");
+    let held = count(&events, Timed::LetGoFlushHeld);
+    assert_eq!(held, 1, "no flush made: {events:?}");
     let opened = node.tenant(&tenant("tail")).await.unwrap();
     assert_eq!(noted(&opened), 1);
     assert_eq!(opened.read(State::unflushed), 0, "its log was replayed");
@@ -1177,10 +1164,8 @@ async fn a_tenant_whose_last_writes_were_deletes_is_flushed_as_it_is_let_go() {
         .expect("the sweep ended");
     assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
     let events = node.timings().drain_events();
-    let held = events
-        .iter()
-        .filter(|event| event.timed == Timed::LetGoFlushHeld);
-    assert_eq!(held.count(), 1, "its deletes were not flushed: {events:?}");
+    let held = count(&events, Timed::LetGoFlushHeld);
+    assert_eq!(held, 1, "its deletes were not flushed: {events:?}");
     let opened = node.tenant(&tenant("deleted")).await.unwrap();
     assert_eq!(noted(&opened), 1, "the delete was lost");
 }
@@ -1204,7 +1189,6 @@ async fn a_let_go_with_nothing_to_flush_adds_no_sample() {
     assert_eq!(node.let_go().for_budget, 2, "{:?}", node.let_go());
     assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
     let events = node.timings().drain_events();
-    let named = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();
-    assert_eq!(named(Timed::LetGoFlushWait), 1, "{events:?}");
-    assert_eq!(named(Timed::LetGoFlushHeld), 1, "{events:?}");
+    assert_eq!(count(&events, Timed::LetGoFlushWait), 1, "{events:?}");
+    assert_eq!(count(&events, Timed::LetGoFlushHeld), 1, "{events:?}");
 }

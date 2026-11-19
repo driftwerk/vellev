@@ -205,7 +205,7 @@ pub enum Timed {
     /// most it may hold to the commit that took it below.
     Backlog,
     /// A let-go's flush: its wait for one of its sweep's flush slots,
-    /// whether it had one or not. None if there was nothing to flush.
+    /// whether it had one or not. Not recorded if there was nothing to flush.
     LetGoFlushWait,
     /// The same flush's hold of the lock: its whole build and commit.
     LetGoFlushHeld,

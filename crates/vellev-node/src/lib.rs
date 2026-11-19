@@ -1015,9 +1015,7 @@ impl Tenant {
         self.work.settling.rows_passes.load(Ordering::SeqCst)
     }
 
-    /// The tenant's writer, which holds no tenant: what a test holds its
-    /// building lock through, a sweep finding nothing else holding it. For
-    /// tests.
+    /// The tenant's writer. For tests.
     #[doc(hidden)]
     pub fn writer(&self) -> &Arc<Writer> {
         &self.work.writer

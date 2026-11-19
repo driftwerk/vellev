@@ -2051,12 +2051,11 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     })
 }
 
-/// The keep mark (§9.6; the overseer's ruling on review B of #177, M2,
-/// widened by Desk to both reasons): for each reason a sweep over the
-/// budget kept a tenant, held or its building lock busy, the longest spell
-/// against twice a flush's hold p99. The bound is read from flush holds
-/// only. A reason with no spell passes; spells with no flush hold to set
-/// them against do not, as the other marks take a missing series.
+/// The keep mark (§9.6): for each reason a sweep over the budget kept a
+/// tenant, held or its building lock busy, the longest spell against twice
+/// a flush's hold p99. The bound is read from flush holds only. A reason
+/// with no spell passes; spells with no flush hold to set them against do
+/// not, as the other marks take a missing series.
 fn kept_over_budget_mark(events: &[Event]) -> Value {
     let secs = |want: Timed| {
         sorted(
@@ -2091,64 +2090,56 @@ fn kept_over_budget_mark(events: &[Event]) -> Value {
     mark
 }
 
-/// A tenant kept for its busy building lock for longer than flushes hold it
-/// fails the keep mark; one kept for less, or none kept, passes; and
-/// the bound is a flush's hold, whatever else holds the lock longer.
+/// A keep, of either reason, longer than twice a flush's hold fails the
+/// keep mark, and a shorter one passes; a short keep of one reason passes
+/// no long one of the other; the bound is a flush's hold, however long
+/// anything else holds the lock; no keep passes; and keeps with no flush
+/// hold to set them against do not, as the other marks take a missing
+/// series.
 #[test]
-fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
+fn the_keep_mark_holds_each_reason_to_twice_a_flush_s_hold() {
+    let flush = Timed::BuildingHeld(Holder::Flush);
+    let commit = Timed::BuildingHeld(Holder::MergeCommit);
+    let (held, building) = (Timed::Kept(KeptFor::Held), Timed::Kept(KeptFor::Building));
+    let cases: [(&str, &[(Timed, f64)], bool); 11] = [
+        ("building 300 s", &[(flush, 40.0), (building, 300.0)], false),
+        ("building 50 s", &[(flush, 40.0), (building, 50.0)], true),
+        ("held 300 s", &[(flush, 40.0), (held, 300.0)], false),
+        ("held 50 s", &[(flush, 40.0), (held, 50.0)], true),
+        ("none kept", &[(flush, 40.0)], true),
+        ("none kept, nothing flushed", &[], true),
+        (
+            "bound read from other holds than a flush's",
+            &[(flush, 40.0), (commit, 400.0), (building, 300.0)],
+            false,
+        ),
+        (
+            "a short building keep does not pass a long held one",
+            &[(flush, 40.0), (building, 50.0), (held, 300.0)],
+            false,
+        ),
+        (
+            "a short held keep does not pass a long building one",
+            &[(flush, 40.0), (held, 50.0), (building, 300.0)],
+            false,
+        ),
+        ("building, no flush hold", &[(building, 50.0)], false),
+        ("held, no flush hold", &[(held, 50.0)], false),
+    ];
     let at = Instant::now();
-    let event = |timed: Timed, took: f64| Event {
-        timed,
-        took: Duration::from_secs_f64(took),
-        partition: "t0/0".into(),
-        at,
-    };
-    let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
-    let spell = |took: f64| event(Timed::Kept(KeptFor::Building), took);
-    let passed = |events: &[Event]| kept_over_budget_mark(events)["passed"] == json!(true);
-    assert!(!passed(&[flush_held(40.0), spell(300.0)]), "kept 300 s");
-    assert!(passed(&[flush_held(40.0), spell(50.0)]), "kept 50 s");
-    assert!(passed(&[flush_held(40.0)]), "none kept");
-    assert!(passed(&[]), "none kept, nothing flushed");
-    // A merge's long commit holds the lock far longer than flushes do: the
-    // bound is a flush's hold all the same.
-    let merge_commit = event(Timed::BuildingHeld(Holder::MergeCommit), 400.0);
-    assert!(
-        !passed(&[flush_held(40.0), merge_commit, spell(300.0)]),
-        "bound read from other holds than a flush's"
-    );
-    // Kept, with no flush to set it against: not passed, as the other marks
-    // take a series missing.
-    assert!(!passed(&[spell(50.0)]), "no flush hold");
-}
-
-/// Desk's widened gate: a tenant kept as held, as by its own merge, for
-/// longer than flushes hold the lock fails the same mark; one kept for
-/// less passes; each reason is held to the bound on its own.
-#[test]
-fn a_keep_as_held_past_twice_a_flush_s_hold_fails_the_mark() {
-    let at = Instant::now();
-    let event = |timed: Timed, took: f64| Event {
-        timed,
-        took: Duration::from_secs_f64(took),
-        partition: "t0/0".into(),
-        at,
-    };
-    let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
-    let held = |took: f64| event(Timed::Kept(KeptFor::Held), took);
-    let building = |took: f64| event(Timed::Kept(KeptFor::Building), took);
-    let passed = |events: &[Event]| kept_over_budget_mark(events)["passed"] == json!(true);
-    assert!(!passed(&[flush_held(40.0), held(300.0)]), "held 300 s");
-    assert!(passed(&[flush_held(40.0), held(50.0)]), "held 50 s");
-    assert!(
-        !passed(&[flush_held(40.0), building(50.0), held(300.0)]),
-        "a short building keep does not pass a long held one"
-    );
-    assert!(
-        !passed(&[flush_held(40.0), held(50.0), building(300.0)]),
-        "a short held keep does not pass a long building one"
-    );
-    assert!(!passed(&[held(50.0)]), "held, no flush hold");
+    for (case, events, passes) in cases {
+        let events: Vec<Event> = events
+            .iter()
+            .map(|&(timed, took)| Event {
+                timed,
+                took: Duration::from_secs_f64(took),
+                partition: "t0/0".into(),
+                at,
+            })
+            .collect();
+        let mark = kept_over_budget_mark(&events);
+        assert_eq!(mark["passed"], json!(passes), "{case}: {mark}");
+    }
 }
 
 /// The keep mark as a node's own events read it (review of f800a51, M4):
