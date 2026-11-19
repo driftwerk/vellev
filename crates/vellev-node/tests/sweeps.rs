@@ -636,6 +636,59 @@ async fn a_let_go_s_flush_cut_once_adopted_is_no_flush_skipped() {
     assert_eq!(opened.read(State::unflushed), 0, "its rows replayed");
 }
 
+/// Review A of #177, L4: a tenant reopened on this node while its let-go
+/// waits for one of the sweep's flushes fences the let-go's lease, and the
+/// hold on it is lost at its next renewal. The let-go, given its turn, finds
+/// it superseded: it flushes nothing, as its commit would be refused, and
+/// counts no flush failed and none skipped. The reopened tenant has every row.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
+    let store = TenantPuts::new();
+    let node = node_on(store.clone(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = 1_000_000;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+        // Renewed every second: the fenced hold is lost long before the
+        // two flushes ahead of it end.
+        settings.lease = Duration::from_secs(3);
+    });
+    node.timings().keep_events(true);
+    for name in ["first", "second"] {
+        written(&node, name, 1).await;
+    }
+    written(&node, "third", 2).await;
+    node.timings().drain_events();
+    unused_long_enough().await;
+    let flush = Duration::from_secs(10);
+    store.hold("first", flush);
+    store.hold("second", flush);
+    let sweep = tokio::spawn({
+        let node = node.clone();
+        async move { node.sweep_now().await }
+    });
+    until(5, "the two flushes ahead came to the store", || {
+        store.reached() == 2
+    })
+    .await;
+    let reopened = node.tenant(&tenant("third")).await.unwrap();
+    tokio::time::timeout(LET_GO_FLUSH_WITHIN, sweep)
+        .await
+        .expect("the sweep ended")
+        .unwrap();
+    assert_eq!(
+        node.flushing().failed,
+        0,
+        "a superseded let-go counted as failed"
+    );
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+    let events = node.timings().drain_events();
+    let held = events
+        .iter()
+        .filter(|event| event.timed == Timed::LetGoFlushHeld);
+    assert_eq!(held.count(), 2, "the superseded let-go flushed: {events:?}");
+    assert_eq!(noted(&reopened), 2, "rows lost");
+}
+
 /// M7-R5b, nothing else in the gap: the tenant's own flush task comes to try
 /// again as the tenant waits among those a sweep flushes, its building lock
 /// taken as it was taken out. It queues behind that lock, and never has it:
