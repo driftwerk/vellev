@@ -1345,7 +1345,8 @@ impl Drop for Building<'_> {
 
 /// A writer's building lock, held from outside the writer for as long as
 /// this is kept, and the writer whose lock it is, which flushes under it:
-/// see [`Writer::building_if_free`].
+/// see [`Writer::building_if_free`]. For a node and its tests.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct BuildingHeld {
     writer: Arc<Writer>,
@@ -1407,15 +1408,6 @@ impl Default for FlushFirst<'_> {
             tried: &|_| {},
         }
     }
-}
-
-/// How long a flush waited for its partition's building lock, and then
-/// held it: its whole build and commit, or `None` if it found nothing to
-/// flush and so built nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FlushTimes {
-    pub waited: Duration,
-    pub held: Option<Duration>,
 }
 
 /// The rows a build is of, ready to index, with what else their making
@@ -2153,7 +2145,8 @@ impl Writer {
     /// checkpoint was committed at, or the current one when nothing needed
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
-        self.flush_timed().await.map(|(position, _)| position)
+        let mut building = self.building(Holder::Flush).await;
+        self.flushing_held(&mut building).await
     }
 
     /// As [`Self::flush`], if it still holds `rows` rows unflushed once it
@@ -2171,7 +2164,9 @@ impl Writer {
     }
 
     /// The building lock, if nothing holds it or queues for it this moment,
-    /// to hold for as long as what is returned is kept. It never waits.
+    /// to hold for as long as what is returned is kept. It never waits. For
+    /// a node and its tests.
+    #[doc(hidden)]
     pub fn building_if_free(self: &Arc<Self>) -> Option<BuildingHeld> {
         let guard = self.building.clone().try_lock_owned().ok()?;
         let writer = self.clone();
@@ -2192,17 +2187,6 @@ impl Writer {
             writer,
             _guard: guard,
         }
-    }
-
-    /// As [`Self::flush`], saying how long it waited for the building lock
-    /// and then held it.
-    pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
-        let asked = Instant::now();
-        let mut building = self.building(Holder::Flush).await;
-        let waited = asked.elapsed().saturating_sub(building.held());
-        let position = self.flushing_held(&mut building).await?;
-        let held = building.timed.then(|| building.held());
-        Ok((position, FlushTimes { waited, held }))
     }
 
     /// What [`Self::flush`] does once it holds the building lock, as

@@ -173,8 +173,7 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     writer.flush().await.unwrap();
     timings.drain_events();
     // Nothing written since: nothing to flush.
-    let (_, times) = writer.flush_timed().await.unwrap();
-    assert_eq!(times.held, None, "{times:?}");
+    writer.flush().await.unwrap();
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
     assert_eq!(
@@ -184,8 +183,7 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     );
     // One that flushes is held, and timed so.
     writer.commit(notes(10, 3)).await.unwrap();
-    let (_, times) = writer.flush_timed().await.unwrap();
-    assert!(times.held.is_some(), "{times:?}");
+    writer.flush().await.unwrap();
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
