@@ -1475,10 +1475,13 @@ impl TenantWork {
         let partition = &self.writer.lease().key;
         let asked = Instant::now();
         let flush = before(deadline, flushes.acquire()).await;
-        timings.record(Timed::LetGoFlushWait, partition, asked.elapsed());
+        let waited = asked.elapsed();
+        timings.record(Timed::LetGoFlushWait, partition, waited);
         let Some(Ok(_flush)) = flush else {
+            timings.record(Timed::LetGoFlushNotReached, partition, waited);
             return Ok(LetGoFlush::Skipped);
         };
+        timings.record(Timed::LetGoFlushQueued, partition, waited);
         if superseded() {
             return Ok(LetGoFlush::Superseded);
         }

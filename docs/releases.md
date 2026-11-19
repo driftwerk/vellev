@@ -536,6 +536,9 @@ and say what the caller then answers for.
   to flush adds no sample, as before. So compare neither that series nor a
   bench's eviction flush mark across the change: three tenants with rows in
   one sweep, each flush over 2 s, now read as a wait over 2 s.
+  That wait is also told in its two halves, as
+  `vellev_flush_to_let_go_seconds{part="queued"}`, for a let-go that had a
+  slot, and `{part="not_reached"}`, for one the deadline came to first.
 
 ### Numbers are read exactly
 

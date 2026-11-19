@@ -2371,6 +2371,15 @@ fn reported(
         "let_go_flush.wait".into(),
         summary(of(Timed::LetGoFlushWait)),
     );
+    // The wait in its two halves, reported and held to no mark.
+    timings.insert(
+        "let_go_flush.queued".into(),
+        summary(of(Timed::LetGoFlushQueued)),
+    );
+    timings.insert(
+        "let_go_flush.not_reached".into(),
+        summary(of(Timed::LetGoFlushNotReached)),
+    );
     timings.insert(
         "let_go_flush.held".into(),
         summary(of(Timed::LetGoFlushHeld)),

@@ -1233,7 +1233,7 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         let ended = sample(&text, "vellev_merges_ended_total", &[("outcome", outcome)]);
         assert!(ended.is_some(), "{outcome}: {text}");
     }
-    for part in ["wait", "held"] {
+    for part in ["wait", "queued", "not_reached", "held"] {
         let count = sample(
             &text,
             "vellev_flush_to_let_go_seconds_count",

@@ -485,10 +485,12 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "flush_to_let_go_seconds",
-        "The flush made before a tenant is let go, if it had rows to flush: how long it waited, with the building lock held from when its sweep took the tenant out, for one of the flushes a sweep makes at once, and how long its flush then took",
+        "The flush before a tenant is let go: its wait for a sweep's flush slot (wait), that wait split into one that got a slot (queued) and one the deadline cut first (not_reached), and the flush (held)",
         "part",
         [
             ("wait", timings.seconds(Timed::LetGoFlushWait)),
+            ("queued", timings.seconds(Timed::LetGoFlushQueued)),
+            ("not_reached", timings.seconds(Timed::LetGoFlushNotReached)),
             ("held", timings.seconds(Timed::LetGoFlushHeld)),
         ],
     )?;
