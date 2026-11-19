@@ -1174,9 +1174,10 @@ pub struct Writer {
     /// A gate a merge waits at between its build and its commit, if a test
     /// has set one: see [`Self::hold_merges_before_commit`].
     merge_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
-    /// Where a restore given up waits before it lets writes and merges on,
-    /// if a test has set one: see [`Self::hold_refusals`].
-    refusal_gate: Arc<std::sync::Mutex<Option<Arc<RefusalGate>>>>,
+    /// Where every restore waits as it stops refusing writes, given up,
+    /// committed or failed, if a test has set one: see
+    /// [`Self::hold_refusals`].
+    refusal_gate: std::sync::Mutex<Option<Arc<RefusalGate>>>,
     /// A gate a checkpoint waits at once adopted, with what it took out of
     /// memory, if a test has set one: where one may be dropped.
     #[cfg(test)]
@@ -1269,7 +1270,8 @@ pub struct MergeGate {
 /// Where a test holds a restore as it lets writes and merges on again:
 /// `reached` is set when one arrives, and it waits, blocking its thread,
 /// until [`Self::let_go`]. A restore lets them on as it is dropped, which
-/// can wait on nothing else.
+/// can wait on nothing else: so `let_go` must come from a thread of its
+/// own, never one a restore may be held on.
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct RefusalGate {
@@ -1281,14 +1283,15 @@ pub struct RefusalGate {
 impl RefusalGate {
     /// Let the restore held here, and any that comes, go on.
     pub fn let_go(&self) {
-        *self.released.lock().expect("gate lock") = true;
+        *lock(&self.released) = true;
         self.told.notify_all();
     }
 
     fn passed(&self) {
         self.reached.store(true, Ordering::SeqCst);
-        let released = self.released.lock().expect("gate lock");
-        drop(self.told.wait_while(released, |released| !*released));
+        let released = lock(&self.released);
+        let waited = self.told.wait_while(released, |released| !*released);
+        drop(waited.unwrap_or_else(std::sync::PoisonError::into_inner));
     }
 }
 
@@ -1499,7 +1502,7 @@ impl Writer {
             merge_build: Mutex::new(()),
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
-            refusal_gate: Arc::default(),
+            refusal_gate: std::sync::Mutex::default(),
             #[cfg(test)]
             adopted_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2309,8 +2312,7 @@ impl Writer {
         restore: Option<Restore>,
         adopting: Option<Lineage>,
     ) -> Result<LogPosition> {
-        let _building = self.building(Holder::Restore).await;
-        let _refusing = Refusing::writes(self).await;
+        let _restoring = Restoring::begun(self).await;
         self.abreast().await?;
         let at = Committed {
             generation: self.lease.generation,
@@ -2422,8 +2424,7 @@ impl Writer {
         adopting: Option<Lineage>,
         held: &dyn Held,
     ) -> Result<RestoreFrom<'a>> {
-        let building = self.building(Holder::Restore).await;
-        let refusing = Refusing::writes(self).await;
+        let restoring = Restoring::begun(self).await;
         self.abreast().await?;
         // With writes refused and the building lock held nothing commits
         // and no checkpoint is made, so the copies, named at the position
@@ -2539,8 +2540,7 @@ impl Writer {
         let target = Partition::load_reusing(key, Arc::new(overlay), &at, loading).await?;
         Ok(RestoreFrom {
             writer: self,
-            _building: building,
-            _refusing: refusing,
+            _restoring: restoring,
             staged,
             target,
             put,
@@ -3962,8 +3962,15 @@ impl Writer {
     #[doc(hidden)]
     pub fn hold_refusals(&self) -> Arc<RefusalGate> {
         let gate = Arc::new(RefusalGate::default());
-        *self.refusal_gate.lock().expect("gate lock") = Some(gate.clone());
+        *lock(&self.refusal_gate) = Some(gate.clone());
         gate
+    }
+
+    /// Hold no restore from now on, as before [`Self::hold_refusals`]. One
+    /// held already waits until its gate is let go.
+    #[doc(hidden)]
+    pub fn stop_holding_refusals(&self) {
+        *lock(&self.refusal_gate) = None;
     }
 
     /// Delete the partition's files that nothing needs any more: a stale
@@ -4624,10 +4631,7 @@ fn told_again(first: &mut Result<Receipt>) -> Result<Receipt> {
 }
 
 /// Writes refused for as long as this lives.
-struct Refusing<'a>(
-    &'a AtomicBool,
-    &'a std::sync::Mutex<Option<Arc<RefusalGate>>>,
-);
+struct Refusing<'a>(&'a Writer);
 
 impl<'a> Refusing<'a> {
     /// Refuse `writer`'s writes from now on, once any commit under way has
@@ -4635,7 +4639,7 @@ impl<'a> Refusing<'a> {
     /// no longer.
     async fn writes(writer: &'a Writer) -> Refusing<'a> {
         writer.restoring.store(true, Ordering::SeqCst);
-        let refusing = Refusing(&writer.restoring, &writer.refusal_gate);
+        let refusing = Refusing(writer);
         drop(writer.writing.lock().await);
         refusing
     }
@@ -4643,11 +4647,29 @@ impl<'a> Refusing<'a> {
 
 impl Drop for Refusing<'_> {
     fn drop(&mut self) {
-        let gate = self.1.lock().expect("gate lock").clone();
+        let gate = lock(&self.0.refusal_gate).clone();
         if let Some(gate) = gate {
             gate.passed();
         }
-        self.0.store(false, Ordering::SeqCst);
+        self.0.restoring.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A restore under way: the building lock held, and writes refused.
+struct Restoring<'a> {
+    // Before the lock, as fields drop in order: a merge waiting for the
+    // lock then never finds the restore still refusing it.
+    _refusing: Refusing<'a>,
+    _building: Building<'a>,
+}
+
+impl<'a> Restoring<'a> {
+    async fn begun(writer: &'a Writer) -> Restoring<'a> {
+        let building = writer.building(Holder::Restore).await;
+        Restoring {
+            _refusing: Refusing::writes(writer).await,
+            _building: building,
+        }
     }
 }
 
@@ -4657,10 +4679,7 @@ impl Drop for Refusing<'_> {
 /// deletes the copies.
 pub struct RestoreFrom<'a> {
     writer: &'a Writer,
-    // Before the lock, as fields drop in order: a merge or write waiting
-    // for the lock then never finds the restore still refusing it.
-    _refusing: Refusing<'a>,
-    _building: Building<'a>,
+    _restoring: Restoring<'a>,
     staged: Staged,
     /// The state put back, loaded from the copies.
     target: Partition,
@@ -4748,8 +4767,7 @@ impl RestoreFrom<'_> {
     pub async fn commit(self) -> Result<LogPosition> {
         let Self {
             writer,
-            _building,
-            _refusing,
+            _restoring,
             mut staged,
             target,
             mut put,

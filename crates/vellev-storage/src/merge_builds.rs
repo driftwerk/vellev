@@ -187,8 +187,8 @@ pub struct MergeBuilds {
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
     last_reckoned: AtomicUsize,
-    /// How many merges are in the queue for a turn: see [`Self::asking`].
-    asking: Arc<AtomicUsize>,
+    /// How many places are in the queue for a turn: see [`Self::asking`].
+    queued: Arc<AtomicUsize>,
     /// Whether each build's output carries a [`Probe`], as a test asks.
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
@@ -336,7 +336,7 @@ impl MergeBuilds {
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
-            asking: Arc::default(),
+            queued: Arc::default(),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
             slots_free: Mutex::new((0..pools.len()).rev().collect()),
@@ -434,12 +434,18 @@ impl MergeBuilds {
         self.let_go.notify_all();
     }
 
-    /// How many merges are in the queue for a turn now, each past all it
-    /// looks at before it asks for one. For tests that order what they do
-    /// on a merge being there.
+    /// How many places are in the queue for a turn now. A merge makes its
+    /// place once it has looked for a restore under way, as it takes its
+    /// turn and building lock, so a test that counts one more place than it
+    /// made knows a merge is past that look. Each is counted from when it is
+    /// made until its turn is had, the turns are closed, or its place goes:
+    /// one granted at once is counted for the moment its task takes to
+    /// acquire the turn, and one a merge keeps as it gives way to a flush
+    /// is counted as it waits. For tests that order what they do on a merge
+    /// being there.
     #[doc(hidden)]
     pub fn asking(&self) -> usize {
-        self.asking.load(Ordering::SeqCst)
+        self.queued.load(Ordering::SeqCst)
     }
 
     /// How many builds wait where a test holds them now. For tests.
@@ -674,7 +680,7 @@ impl Reservation {
         let kept = Arc::new(Kept::default());
         let parked = *lock(&builds.parked_at_most);
         let (turns, granted) = (builds.turns.clone(), kept.clone());
-        let counted = Asking::counted(&builds.asking);
+        let counted = Queued::counted(&builds.queued);
         let asking = tokio::spawn(async move {
             let acquired = turns.acquire_owned().await;
             drop(counted);
@@ -725,17 +731,17 @@ impl Drop for Reservation {
 }
 
 /// A place in the queue for a turn, counted from when it is made until its
-/// turn is had, or the task asking for it is aborted.
-struct Asking(Arc<AtomicUsize>);
+/// turn is had, the turns are closed, or the task asking for it is aborted.
+struct Queued(Arc<AtomicUsize>);
 
-impl Asking {
-    fn counted(asking: &Arc<AtomicUsize>) -> Self {
-        asking.fetch_add(1, Ordering::SeqCst);
-        Self(asking.clone())
+impl Queued {
+    fn counted(queued: &Arc<AtomicUsize>) -> Self {
+        queued.fetch_add(1, Ordering::SeqCst);
+        Self(queued.clone())
     }
 }
 
-impl Drop for Asking {
+impl Drop for Queued {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
