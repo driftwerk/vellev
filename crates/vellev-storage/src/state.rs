@@ -4309,7 +4309,9 @@ mod tests {
         let gathered = planned.gathered(2_048, &gathering);
         assert_eq!(gathered.part, frame);
         // And never at more than a part holds.
-        let capped = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+        let capped = built
+            .state
+            .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
         assert_eq!(capped.gathered(2_048, &gathering).part, 1_000.0);
     }
 
