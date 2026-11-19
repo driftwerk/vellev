@@ -9883,6 +9883,64 @@ fn settings_that_release_no_lease_at_once_are_refused() {
     );
 }
 
+/// A sweep given no time for its let-go flushes would skip every one, as
+/// its deadline has passed before the first begins. Such settings are
+/// refused.
+#[test]
+fn settings_that_give_let_go_flushes_no_time_are_refused() {
+    let within = |let_go_flush_within| Settings {
+        let_go_flush_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(within(Duration::from_millis(1)).check().is_ok());
+    let refused = within(Duration::ZERO).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// A sweep given no time for its releases would send none. Such settings
+/// are refused.
+#[test]
+fn settings_that_give_releases_no_time_are_refused() {
+    let within = |release_within| Settings {
+        release_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(within(Duration::from_millis(1)).check().is_ok());
+    let refused = within(Duration::ZERO).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// More flushes or releases at once than a semaphore can hold would panic
+/// in the sweep that makes one. Such settings are refused, the most it can
+/// hold allowed.
+#[test]
+fn settings_that_do_more_at_once_than_a_sweep_can_count_are_refused() {
+    let most = tokio::sync::Semaphore::MAX_PERMITS;
+    let flushes = |let_go_flushes_at_once| Settings {
+        let_go_flushes_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let releases = |releases_at_once| Settings {
+        releases_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(flushes(most).check().is_ok());
+    assert!(releases(most).check().is_ok());
+    for refused in [flushes(most + 1), releases(most + 1)] {
+        let refused = refused.check();
+        assert!(
+            matches!(refused, Err(NodeError::Settings(_))),
+            "{refused:?}"
+        );
+    }
+}
+
 /// Track 2, V3: a property embedded but not stored is new in format 2.
 /// A node refuses a schema with one until the cluster writes format 2,
 /// which it does once every node registered reads it and the nodes are
