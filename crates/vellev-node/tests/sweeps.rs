@@ -566,6 +566,72 @@ async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
     );
 }
 
+/// Desk's widened busy-lock gate: a tenant kept over the budget while its
+/// own maintenance merges it, sweep after sweep, is timed as one spell kept
+/// as held, from the first sweep that kept it to the sweep that takes it
+/// out. The merge is held between its build and its commit, past where a
+/// stop ends it, as a merge's long commit is: its round holds the tenant.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {
+    const ROWS: u128 = 10;
+    let node = node_on(memory(), |settings| {
+        settings.memory = Some(1);
+        settings.flush_rows = ROWS as usize;
+        settings.tenant_idle = Duration::from_secs(60 * 60);
+    });
+    node.timings().keep_events(true);
+    node.create_tenant(&tenant("merging")).await.unwrap();
+    let held = node.tenant(&tenant("merging")).await.unwrap();
+    let gate = held.hold_merges_before_commit();
+    held.write(vec![notes()]).await.unwrap();
+    for flush in 0..4 {
+        let rows: Vec<Mutation> = (0..ROWS).map(|n| note(flush * ROWS + n)).collect();
+        held.write(rows).await.unwrap();
+        until(30, "the node never flushed the tenant", || {
+            held.read(State::unflushed) == 0
+        })
+        .await;
+    }
+    tokio::time::timeout(Duration::from_secs(30), gate.reached.notified())
+        .await
+        .expect("the merge never came to its commit");
+    drop(held);
+    unused_long_enough().await;
+    node.timings().drain_events();
+    let swept_from = tokio::time::Instant::now();
+    // Five minutes merging, swept every 30 s.
+    let held_for = Duration::from_secs(5 * 60);
+    let every = Duration::from_secs(30);
+    for _ in 0..held_for.as_secs() / every.as_secs() {
+        node.sweep_now().await;
+        tokio::time::sleep(every).await;
+    }
+    let kept = node.kept_by_sweeps();
+    assert!(kept.held >= 10 && kept.building == 0, "{kept:?}");
+    gate.release.notify_one();
+    let let_go = async {
+        while !written_for(&node).is_empty() {
+            node.sweep_now().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), let_go)
+        .await
+        .expect("never let go once its merge ended");
+    let spanned = swept_from.elapsed();
+    let events = node.timings().drain_events();
+    let spells: Vec<Duration> = events
+        .iter()
+        .filter(|event| event.timed == Timed::Kept(KeptFor::Held))
+        .map(|event| event.took)
+        .collect();
+    assert_eq!(spells.len(), 1, "{events:?}");
+    assert!(
+        spells[0] >= held_for && spells[0] <= spanned,
+        "{spells:?}, swept over {spanned:?}"
+    );
+}
+
 /// A tenant a request holds, chosen to be let go, is kept as held, not as
 /// one whose building lock is busy: what keeps it is looked at first.
 #[tokio::test(start_paused = true)]
