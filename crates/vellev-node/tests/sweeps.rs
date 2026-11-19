@@ -19,8 +19,8 @@ use vellev_node::{
 };
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
-use vellev_storage::timings::{Holder, KeptFor, Timed};
-use vellev_storage::{Holding, Mutation, State, StorageError, Writer};
+use vellev_storage::timings::{Event, Holder, KeptFor, Timed};
+use vellev_storage::{Holding, MergeGate, Mutation, State, StorageError, Writer};
 
 fn tenant(name: &str) -> TenantId {
     TenantId::new(name).unwrap()
@@ -566,13 +566,11 @@ async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
     );
 }
 
-/// Desk's widened busy-lock gate: a tenant kept over the budget while its
-/// own maintenance merges it, sweep after sweep, is timed as one spell kept
-/// as held, from the first sweep that kept it to the sweep that takes it
-/// out. The merge is held between its build and its commit, past where a
-/// stop ends it, as a merge's long commit is: its round holds the tenant.
-#[tokio::test(start_paused = true)]
-async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {
+/// A node over the budget, flushing every ten rows, with tenant "merging"
+/// made on it and its maintenance merging it, that merge held between its
+/// build and its commit, past where a stop ends it; and the tenant, still
+/// held by the caller.
+async fn merging_held_before_commit() -> (Node, Arc<Tenant>, Arc<MergeGate>) {
     const ROWS: u128 = 10;
     let node = node_on(memory(), |settings| {
         settings.memory = Some(1);
@@ -595,22 +593,26 @@ async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {
     tokio::time::timeout(Duration::from_secs(30), gate.reached.notified())
         .await
         .expect("the merge never came to its commit");
-    drop(held);
-    unused_long_enough().await;
-    node.timings().drain_events();
-    let swept_from = tokio::time::Instant::now();
-    // Five minutes merging, swept every 30 s.
-    let held_for = Duration::from_secs(5 * 60);
+    (node, held, gate)
+}
+
+/// Sweep `node` every 30 s for `held_for`, then, once `release` lets its
+/// tenant's merge go on, until it is let go. Says what sweeps had kept by
+/// the release.
+async fn swept_while_merging(
+    node: &Node,
+    held_for: Duration,
+    release: impl FnOnce(),
+) -> KeptBySweeps {
     let every = Duration::from_secs(30);
     for _ in 0..held_for.as_secs() / every.as_secs() {
         node.sweep_now().await;
         tokio::time::sleep(every).await;
     }
     let kept = node.kept_by_sweeps();
-    assert!(kept.held >= 10 && kept.building == 0, "{kept:?}");
-    gate.release.notify_one();
+    release();
     let let_go = async {
-        while !written_for(&node).is_empty() {
+        while !written_for(node).is_empty() {
             node.sweep_now().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -618,13 +620,75 @@ async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {
     tokio::time::timeout(Duration::from_secs(30), let_go)
         .await
         .expect("never let go once its merge ended");
+    kept
+}
+
+/// The durations of the events of `timed` among `events`.
+fn took(events: &[Event], timed: Timed) -> Vec<Duration> {
+    let of = events.iter().filter(|event| event.timed == timed);
+    of.map(|event| event.took).collect()
+}
+
+/// Desk's widened busy-lock gate: a tenant kept over the budget while its
+/// own maintenance merges it, sweep after sweep, is timed as one spell kept
+/// as held, from the first sweep that kept it to the sweep that takes it
+/// out. The merge is held between its build and its commit, past where a
+/// stop ends it: its round holds the tenant, but not yet the building lock.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_its_merge_holds_is_timed_as_one_held_spell() {
+    let (node, held, gate) = merging_held_before_commit().await;
+    drop(held);
+    unused_long_enough().await;
+    node.timings().drain_events();
+    let swept_from = tokio::time::Instant::now();
+    let held_for = Duration::from_secs(5 * 60);
+    let kept = swept_while_merging(&node, held_for, || gate.release.notify_one()).await;
+    assert!(kept.held >= 10 && kept.building == 0, "{kept:?}");
     let spanned = swept_from.elapsed();
     let events = node.timings().drain_events();
-    let spells: Vec<Duration> = events
-        .iter()
-        .filter(|event| event.timed == Timed::Kept(KeptFor::Held))
-        .map(|event| event.took)
-        .collect();
+    let spells = took(&events, Timed::Kept(KeptFor::Held));
+    assert_eq!(spells.len(), 1, "{events:?}");
+    assert!(
+        spells[0] >= held_for && spells[0] <= spanned,
+        "{spells:?}, swept over {spanned:?}"
+    );
+}
+
+/// As above, with the merge held in its commit, under the building lock,
+/// for 150 s. That is under what the writer allows the commit's turn
+/// before the node gives the tenant up as stuck ([`Writer::stalled`]):
+/// about 235 s on a 30 s lease, its 5 s in memory, one upload request's
+/// 187 s, 20 s on local disk and three tries to commit of 7.5 s.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_its_merge_commit_holds_under_the_lock_is_timed_as_one_held_spell() {
+    let (node, held, gate) = merging_held_before_commit().await;
+    let writer = held.writer().clone();
+    let committing = writer.hold_checkpoints_once_adopted();
+    writer.stop_holding_merges();
+    node.timings().drain_events();
+    let swept_from = tokio::time::Instant::now();
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), committing.reached.notified())
+        .await
+        .expect("the merge never came into its commit");
+    drop(held);
+    unused_long_enough().await;
+    let held_for = Duration::from_secs(150);
+    let release = || {
+        writer.stop_holding_checkpoints();
+        committing.release.notify_one();
+    };
+    let kept = swept_while_merging(&node, held_for, release).await;
+    assert!(kept.held >= 5 && kept.building == 0, "{kept:?}");
+    let spanned = swept_from.elapsed();
+    let events = node.timings().drain_events();
+    let commits = took(&events, Timed::BuildingHeld(Holder::MergeCommit));
+    assert_eq!(commits.len(), 1, "{events:?}");
+    assert!(
+        commits[0] >= held_for && commits[0] <= spanned,
+        "the lock was not held through the keep: {commits:?}, swept over {spanned:?}"
+    );
+    let spells = took(&events, Timed::Kept(KeptFor::Held));
     assert_eq!(spells.len(), 1, "{events:?}");
     assert!(
         spells[0] >= held_for && spells[0] <= spanned,
