@@ -1996,9 +1996,11 @@ async fn a_let_go_s_flush_cut_in_its_commit_costs_no_row() {
 }
 
 /// Review of f800a51, L1: a let-go of a tenant whose writer closed with its
-/// hold intact, as by a flush whose commit was never answered, is no
-/// superseded one: its rows replay unless that commit landed, and its
-/// flush is counted as skipped.
+/// hold intact is no superseded one: its rows replay unless the commit that
+/// closed it landed, and its flush is counted as skipped. A write whose
+/// caller went is committed all the same, and one never answered closes
+/// the writer with no caller to lose the hold: it stays until the lease's
+/// next renewal finds the writer closed.
 #[tokio::test(start_paused = true)]
 async fn a_let_go_of_a_tenant_whose_writer_closed_counts_a_skip() {
     let cluster = Cluster::new();
@@ -2011,14 +2013,22 @@ async fn a_let_go_of_a_tenant_whose_writer_closed_counts_a_skip() {
         .await
         .unwrap();
     held.write(ten_notes(0)).await.unwrap();
+    let writer = held.writer().clone();
     coordinator.unanswered_commits.store(true, Ordering::SeqCst);
-    assert!(held.flush().await.is_err());
+    let gone = tokio::time::timeout(Duration::from_secs(1), held.write(ten_notes(10))).await;
+    assert!(gone.is_err(), "the write was answered: {gone:?}");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !writer.is_closed() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the writer never closed");
     coordinator
         .unanswered_commits
         .store(false, Ordering::SeqCst);
-    assert!(held.writer().is_closed());
-    drop(held);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    drop(writer);
     node.sweep_now().await;
     let let_go = node.let_go();
     assert_eq!(
