@@ -84,6 +84,30 @@ Whoever builds on `vellev-node` gets the same refusal from
 as they are. `Writer::clean` and `Tenant::compact` take any grace still,
 and say what the caller then answers for.
 
+### Secrets on a pipe
+
+New: `vellev serve --secrets-fd <n>` takes `VELLEV_DATABASE_URL` and
+`VELLEV_API_KEYS` from a pipe the node inherits on descriptor `<n>`,
+rather than from its environment or command line, which other processes
+of the same user can read. The README, under Run, gives what the pipe
+must hold and how a supervisor hands it over. A node started without the
+flag takes both as before.
+
+With the flag, the pipe is their only source: **a node also given either
+one on the command line or in the environment does not start**. It exits
+with status 1 and names the variable, never its value:
+
+```
+VELLEV_DATABASE_URL is also set on the command line or in the environment; with --secrets-fd it comes only on the pipe
+VELLEV_API_KEYS is also set on the command line or in the environment; with --secrets-fd they come only on the pipe
+```
+
+A variable set empty or blank counts as unset. To start such a node,
+remove the variable from its environment, and `--database-url` or
+`--api-keys` from its command line, and hand the value on the pipe
+alone. A node of an earlier release does not know the flag and exits
+with status 2, as for any option it does not take.
+
 ### What a node answers
 
 - **A tenant's vector indexes now count in what it is reckoned to take
