@@ -94,8 +94,9 @@ impl Inherited {
     }
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
-    /// closes it by the time it returns, but at the deadline: the reader is
-    /// then left holding it, blocked, until the process exits.
+    /// closes it by the time it returns, except at the deadline: the
+    /// reader's thread then keeps it until its read ends (the pipe ends, or
+    /// more arrives) or the process exits.
     pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
