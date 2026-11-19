@@ -328,8 +328,14 @@ mod tests {
         let mut twice = framed(BOTH);
         twice.extend(framed(br#"{"VELLEV_API_KEYS":"forged-fixture"}"#));
         let err = format!("{:#}", through_pipe(&twice).unwrap_err());
-        assert!(err.contains("after"), "{err}");
+        assert!(err.contains("more was written"), "{err}");
         assert!(!err.contains("forged-fixture"), "{err}");
+        for stray in 1..=3 {
+            let mut trailer = framed(BOTH);
+            trailer.extend(std::iter::repeat_n(b'x', stray));
+            let err = format!("{:#}", through_pipe(&trailer).unwrap_err());
+            assert!(err.contains("more was written"), "{stray}: {err}");
+        }
     }
 
     /// A name the node doesn't take is refused, and is not repeated: a
@@ -351,17 +357,73 @@ mod tests {
     }
 
     /// Keys handed over on the pipe that come to none once trimmed are
-    /// refused, rather than leaving the command line's or environment's
-    /// keys in force.
+    /// refused as such, beside a good database URL.
     #[test]
     fn a_key_list_that_is_empty_once_trimmed_is_refused() {
         for keys in [" ", ",", " , ,"] {
-            let payload = format!(r#"{{"VELLEV_API_KEYS":"{keys}"}}"#);
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"{keys}"}}"#);
             let err = format!(
                 "{:#}",
                 through_pipe(&framed(payload.as_bytes())).unwrap_err()
             );
-            assert!(err.contains("VELLEV_API_KEYS"), "{err}");
+            assert!(
+                err.contains("VELLEV_API_KEYS was handed over with no key in it"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A database URL handed over blank is refused as such, not left for
+    /// `checked()` to call missing.
+    #[test]
+    fn a_blank_database_url_is_refused() {
+        for url in ["", " ", "\t "] {
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"{url}","VELLEV_API_KEYS":"k-fixture"}}"#);
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(payload.as_bytes())).unwrap_err()
+            );
+            assert!(
+                err.contains("VELLEV_DATABASE_URL was handed over empty"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A name given twice is refused, as anything after the frame is: the
+    /// supervisor writes each once. Only a known name is repeated.
+    #[test]
+    fn a_name_given_twice_is_refused() {
+        let twice = br#"{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"a-fixture","VELLEV_API_KEYS":"b-fixture"}"#;
+        let err = format!("{:#}", through_pipe(&framed(twice)).unwrap_err());
+        assert!(
+            err.contains("VELLEV_API_KEYS was handed over twice"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("a-fixture") && !err.contains("b-fixture"),
+            "{err}"
+        );
+        let unknown = br#"{"postgres://u:pw-fixture@h/db":"x","postgres://u:pw-fixture@h/db":"y"}"#;
+        let err = format!("{:#}", through_pipe(&framed(unknown)).unwrap_err());
+        assert!(!err.contains("pw-fixture"), "{err}");
+    }
+
+    /// Blank values clap leaves from an empty or comma-only variable count
+    /// as unset, as they do for `keys()` and `checked()`.
+    #[test]
+    fn blank_values_from_the_environment_are_not_a_second_source() {
+        for (url, keys) in [("", vec![""]), ("  ", vec![" ", ""]), ("", vec![])] {
+            let mut config = bare_config();
+            config.database_url = url.into();
+            config.api_keys = keys.into_iter().map(String::from).collect();
+            through_pipe(&framed(BOTH))
+                .unwrap()
+                .apply(&mut config)
+                .unwrap();
+            assert_eq!(config.api_keys, ["k-fixture"]);
         }
     }
 
@@ -397,17 +459,21 @@ mod tests {
     #[test]
     fn a_silent_pipe_or_a_held_write_end_is_refused_at_the_deadline() {
         let (reader, writer) = std::io::pipe().unwrap();
-        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+        let silent = Inherited::read(reader.into(), Duration::from_millis(200))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("within"), "{err}");
+        assert!(silent.contains("didn't arrive within"), "{silent}");
         drop(writer);
+        // The payload is in, but the pipe never ends: the error says so,
+        // as this is a supervisor (or a child of it) still holding a copy
+        // of the write end, not one that never wrote.
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(&framed(BOTH)).unwrap();
-        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+        let held = Inherited::read(reader.into(), Duration::from_millis(200))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("within"), "{err}");
+        assert!(held.contains("write end is still open"), "{held}");
+        assert!(!held.contains("didn't arrive"), "{held}");
         drop(writer);
     }
 
