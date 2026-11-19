@@ -515,6 +515,9 @@ and say what the caller then answers for.
   `vellev_sweep_tenants_kept_total` gains a `reason` label: `held`, as
   before, for one something else holds, and `building` for one kept only
   for its busy lock. Their sum is the count the unlabelled series gave.
+  `vellev_kept_for_building_seconds` is new: each spell sweeps over the
+  memory budget kept a tenant for its busy building lock alone, from the
+  first sweep that kept it so to the first that did not.
   One it takes has that lock from then on, with the flush before letting go
   made under it, so nothing comes in between and whatever queued for the
   lock ends with the hold. The tenants of a sweep go together, two flushing

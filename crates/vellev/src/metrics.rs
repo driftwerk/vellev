@@ -478,6 +478,11 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
             "Each spell a tenant held as many rows unflushed as it may, refusing writes: from reaching that to the commit that took it below",
             Timed::Backlog,
         ),
+        (
+            "kept_for_building_seconds",
+            "Each spell sweeps over the memory budget kept a tenant for its busy building lock, nothing else holding it",
+            Timed::KeptForBuilding,
+        ),
     ] {
         let seconds = ConstSeconds(timings.seconds(timed));
         seconds.encode(encoder.encode_descriptor(name, help, None, MetricType::Histogram)?)?;
