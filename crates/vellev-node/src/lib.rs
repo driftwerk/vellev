@@ -270,6 +270,9 @@ pub struct Settings {
     /// How long giving a lease up early is waited for:
     /// [`RELEASE_WITHIN`] unless told otherwise.
     pub release_within: Duration,
+    /// How many leases a sweep gives up at once, at least one:
+    /// [`RELEASES_AT_ONCE`] unless told otherwise.
+    pub releases_at_once: usize,
 }
 
 /// The threads a node builds its merges on.
@@ -379,6 +382,7 @@ impl Settings {
             let_go_flush_within: LET_GO_FLUSH_WITHIN,
             let_go_flushes_at_once: LET_GO_FLUSHES_AT_ONCE,
             release_within: RELEASE_WITHIN,
+            releases_at_once: RELEASES_AT_ONCE,
         }
     }
 
@@ -1752,6 +1756,11 @@ pub const LET_GO_FLUSHES_AT_ONCE: usize = 2;
 /// a sweep held, so that this is shorter than a coordinator's own bound on
 /// a call by default.
 pub const RELEASE_WITHIN: Duration = Duration::from_secs(5);
+
+/// By default, how many leases a sweep gives up at once: few beside the
+/// coordinator's pool of connections, which live tenants' renewals and
+/// commits share.
+pub const RELEASES_AT_ONCE: usize = 4;
 
 /// The least time from the start of one clean beside a tenant's merges to
 /// the start of the next, whatever [`Settings::clean_at_least_every`] says,

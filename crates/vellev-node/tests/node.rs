@@ -19,7 +19,7 @@ use vellev_core::{
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
     ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings, Tenant,
-    LET_GO_FLUSH_WITHIN, LOOKED_OVER_EVERY, RELEASE_WITHIN, REMEMBERED,
+    LET_GO_FLUSH_WITHIN, LOOKED_OVER_EVERY, RELEASES_AT_ONCE, RELEASE_WITHIN, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
 use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
@@ -1902,6 +1902,55 @@ async fn a_release_that_hangs_holds_up_no_sweep() {
     assert!(opened.held_until() > tokio::time::Instant::now());
 }
 
+/// Review A of #177, M3, and review B, M1: a sweep's releases share the
+/// coordinator's pool with every live tenant's renewals and commits. Of a
+/// hundred tenants let go with nothing to flush, on a coordinator whose
+/// release hangs, at most [`RELEASES_AT_ONCE`] are released at once, and
+/// all of them within one [`RELEASE_WITHIN`]: a release not begun by then is
+/// not sent, and its lease runs out. Every tenant is let go.
+#[tokio::test(start_paused = true)]
+async fn a_sweep_s_releases_are_bounded_in_number_and_in_time() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        Settings {
+            memory: Some(1),
+            flush_rows: 1_000_000,
+            tenant_idle: Duration::from_secs(60 * 60),
+            ..cluster.settings()
+        },
+    );
+    let tenants = 100;
+    for n in 0..tenants {
+        let name = tenant(&format!("idle-{n}"));
+        node.create_tenant(&name).await.unwrap();
+        let held = node.tenant(&name).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+        // Nothing to flush as it is let go: straight to its release.
+        held.flush().await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep's releases outlasted their one bound");
+    let most = coordinator
+        .most_lease_releases_in_flight
+        .load(Ordering::SeqCst);
+    assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
+    assert_eq!(node.let_go().for_budget, tenants, "{:?}", node.let_go());
+    assert_eq!(node.tenant_figures().len(), 0, "not let go");
+}
+
 /// M7-R5b: a let-go's flush cut in its commit closes its writer, which costs
 /// nothing with the hold lost at once. The next opener finds every row,
 /// whether the commit never landed, and it replays them, or landed unheard,
@@ -2206,12 +2255,34 @@ struct Unrenewing {
     claim_renewals_slowly: Duration,
     /// Whether giving a lease up early goes unanswered.
     lease_releases_hang: AtomicBool,
+    /// How many lease releases are being answered now, and the most that
+    /// ever were at once.
+    lease_releases_in_flight: AtomicUsize,
+    most_lease_releases_in_flight: AtomicUsize,
     /// Whether commits fail as a backend would, none of them landing.
     commits_failing: AtomicBool,
     /// What happens once, just after a claim on a backup is next taken.
     backup_claimed: Hook,
     /// How many claims on backups were asked for.
     claims: AtomicUsize,
+}
+
+/// A call counted in flight until it ends, however it ends.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    /// Counted in `now`, with the most at once kept in `most`.
+    fn counted(now: &'a AtomicUsize, most: &AtomicUsize) -> Self {
+        let at_once = now.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(at_once, Ordering::SeqCst);
+        Self(now)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Unrenewing {
@@ -2258,6 +2329,8 @@ impl Unrenewing {
             release_let_through: tokio::sync::Notify::new(),
             claim_renewals_slowly: Duration::ZERO,
             lease_releases_hang: AtomicBool::new(false),
+            lease_releases_in_flight: AtomicUsize::new(0),
+            most_lease_releases_in_flight: AtomicUsize::new(0),
             commits_failing: AtomicBool::new(false),
             backup_claimed: Hook::default(),
             claims: AtomicUsize::new(0),
@@ -2338,6 +2411,10 @@ impl Coordinator for Unrenewing {
         self.inner.renew(lease, ttl).await
     }
     async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
+        let _in_flight = InFlight::counted(
+            &self.lease_releases_in_flight,
+            &self.most_lease_releases_in_flight,
+        );
         if self.lease_releases_hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
