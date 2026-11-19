@@ -72,8 +72,9 @@ impl std::fmt::Debug for Inherited {
 }
 
 impl Inherited {
-    /// Reads the descriptor `fd`, handed to this process for this alone,
-    /// and closes it.
+    /// Reads the pipe `fd`, handed to this process for this alone, and
+    /// closes it as [`Inherited::read`] does. A number below 3, or one that
+    /// doesn't name a pipe, is refused and left open.
     pub fn from_descriptor(fd: RawFd) -> Result<Self> {
         if fd < 3 {
             bail!("--secrets-fd {fd} is one of the standard streams");
@@ -95,8 +96,8 @@ impl Inherited {
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
     /// closes it by the time it returns, except at the deadline: the
-    /// reader's thread then keeps it until its read of the frame ends,
-    /// whatever ends it, or the process exits.
+    /// reader's thread then keeps it until its read of the pipe (the frame,
+    /// then the pipe's end) ends, however it ends, or the process exits.
     pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
