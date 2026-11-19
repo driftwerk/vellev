@@ -21,6 +21,28 @@ fn framed(payload: &[u8]) -> Vec<u8> {
 /// would never see its pipe end (as a supervisor's `SPAWNS` guards).
 static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Reads all of `from` on a thread of its own, so a child saying a lot
+/// can't block on a full pipe; the answer comes on the returned channel,
+/// with a marker if the read failed.
+fn drain(mut from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        if let Err(e) = from.read_to_end(&mut all) {
+            all.extend_from_slice(format!("\n[reading this failed: {e}]").as_bytes());
+        }
+        let _ = tx.send(all);
+    });
+    rx
+}
+
+/// What `drain` read, waited for a few seconds at most: the node's ends
+/// close when it stops, unless something else kept a copy of them.
+fn drained(rx: &std::sync::mpsc::Receiver<Vec<u8>>, name: &str) -> Vec<u8> {
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("the node's {name} stayed open after it stopped"))
+}
+
 /// Starts the node with `payload` on descriptor 3 and only `env` in its
 /// environment, and waits for it to stop, for a minute at most: a node
 /// that wrongly took the payload would wait for its database for ever, so
@@ -28,41 +50,38 @@ static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Its output is drained while it runs, so a node saying a lot can't block
 /// on a full pipe and look like one that never stopped.
 fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
-    use std::io::Read;
     let mut child = start(payload, env);
-    let drain = |mut from: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut all = Vec::new();
-            let _ = from.read_to_end(&mut all);
-            all
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().unwrap()));
-    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let out = drain(child.stdout.take().unwrap());
+    let err = drain(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let status = loop {
+    let (status, stopped) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break (status, true),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            _ => break None,
-        }
-    };
-    let stopped = status.is_some();
-    let status = match status {
-        Some(status) => status,
-        None => {
-            let _ = child.kill();
-            child.wait().unwrap()
+            Ok(None) => {
+                let _ = child.kill();
+                break (child.wait().unwrap(), false);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("waiting on the node failed: {e}");
+            }
         }
     };
     let output = Output {
         status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
+        stdout: drained(&out, "stdout"),
+        stderr: drained(&err, "stderr"),
     };
-    assert!(stopped, "the node didn't stop: {}", self::stderr(&output));
+    assert!(
+        stopped,
+        "the node didn't stop: stderr: {} stdout: {}",
+        stderr(&output),
+        String::from_utf8_lossy(&output.stdout)
+    );
     output
 }
 
@@ -150,6 +169,7 @@ fn a_good_payload_is_taken_and_never_repeated() {
         &[],
     );
     let stdout = child.stdout.take().unwrap();
+    let err = drain(child.stderr.take().unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
@@ -175,9 +195,9 @@ fn a_good_payload_is_taken_and_never_repeated() {
         }
     };
     let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
+    child.wait().unwrap();
+    let err = String::from_utf8_lossy(&drained(&err, "stderr")).into_owned();
     said.extend(rx.try_iter());
-    let err = stderr(&output);
     assert!(listening, "never listened: {err} {said:?}");
     let said = said.join("\n");
     for secret in ["pw-fixture", "k-fixture"] {

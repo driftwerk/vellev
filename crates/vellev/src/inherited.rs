@@ -48,9 +48,9 @@ use crate::config::Config;
 /// The most a payload may hold: a conservative cap, so that with its 4-byte
 /// length it fits a default fresh pipe (16 KiB on macOS, 64 KiB on Linux),
 /// as the supervisor writes it all before the node starts to read. A
-/// Linux user over `pipe-user-pages-soft` gets smaller pipes; supervisors
-/// should keep the payload far below this (Desk Helper's is a few hundred
-/// bytes).
+/// Linux user over `pipe-user-pages-soft` gets pipes of as little as one
+/// page, so supervisors should keep the payload and its length within
+/// 4 KiB (Desk Helper's is a few hundred bytes).
 pub const MAX_BYTES: usize = 16 * 1024 - 4;
 const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
@@ -78,10 +78,10 @@ impl std::fmt::Debug for Inherited {
 
 impl Inherited {
     /// Reads the descriptor `fd`, handed down by a supervisor for this
-    /// alone, and closes it by the time it returns (but should a read block
-    /// well past the deadline, through something else draining the pipe or
-    /// the reader starved, the reader may be left holding it while the node,
-    /// refused, exits).
+    /// alone, and closes it by the time it returns (but should the read not
+    /// finish well past the deadline, blocked by something else draining
+    /// the pipe or with the reader starved, the reader may be left holding
+    /// it while the node, refused, exits).
     ///
     /// The number is looked at without being taken: one that isn't open,
     /// isn't a pipe, or is close-on-exec (so was opened in this process,
