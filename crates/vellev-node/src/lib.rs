@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -267,8 +267,9 @@ pub struct Settings {
     /// How many tenants a sweep flushes at once as it lets them go, at
     /// least one: [`LET_GO_FLUSHES_AT_ONCE`] unless told otherwise.
     pub let_go_flushes_at_once: usize,
-    /// How long giving a lease up early is waited for:
-    /// [`RELEASE_WITHIN`] unless told otherwise.
+    /// How long giving a lease up early is waited for, and how long a
+    /// sweep's releases go on past its flushes: [`RELEASE_WITHIN`] unless
+    /// told otherwise.
     pub release_within: Duration,
     /// How many leases a sweep gives up at once, at least one:
     /// [`RELEASES_AT_ONCE`] unless told otherwise.
@@ -1744,10 +1745,61 @@ enum LetGoFlush {
 /// `tokio::time::timeout_at`, it never polls `work` once the deadline has
 /// passed, so that work that has yet to begin does not.
 async fn before<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
+    unless(tokio::time::sleep_until(deadline), work).await
+}
+
+/// What `work` comes to, if it ends before `over` does: never polled once
+/// `over` has ended.
+async fn unless<T>(over: impl Future<Output = ()>, work: impl Future<Output = T>) -> Option<T> {
     tokio::select! {
         biased;
-        () = tokio::time::sleep_until(deadline) => None,
+        () = over => None,
         done = work => Some(done),
+    }
+}
+
+/// The releases of a sweep's let-gos: at most [`Settings::releases_at_once`]
+/// at once, each as it is let go, and all of them over
+/// [`Settings::release_within`] after the last of the sweep's flushes ends,
+/// or after the flushes' deadline if that comes first.
+struct Releases {
+    at_once: Semaphore,
+    within: Duration,
+    flush_deadline: Instant,
+    /// How many of the sweep's let-gos have yet to end their flush.
+    flushing: AtomicUsize,
+    /// When the last of them did.
+    flushed: watch::Sender<Option<Instant>>,
+}
+
+impl Releases {
+    fn new(settings: &Settings, flush_deadline: Instant, flushing: usize) -> Self {
+        Self {
+            at_once: Semaphore::new(settings.releases_at_once),
+            within: settings.release_within,
+            flush_deadline,
+            flushing: AtomicUsize::new(flushing),
+            flushed: watch::Sender::new(None),
+        }
+    }
+
+    /// One of the sweep's let-gos has ended its flush.
+    fn flush_ended(&self) {
+        if self.flushing.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.flushed.send_replace(Some(Instant::now()));
+        }
+    }
+
+    /// Ends as the sweep's releases are over.
+    async fn over(&self) {
+        let mut flushed = self.flushed.subscribe();
+        let ended = tokio::select! {
+            biased;
+            at = flushed.wait_for(Option::is_some) => at.ok().and_then(|at| *at),
+            () = tokio::time::sleep_until(self.flush_deadline) => None,
+        };
+        let ended = ended.map_or(self.flush_deadline, |at| at.min(self.flush_deadline));
+        tokio::time::sleep_until(ended + self.within).await;
     }
 }
 
@@ -2893,9 +2945,10 @@ impl Inner {
     ///
     /// A sweep waits on no lock of a tenant's: one whose building lock is
     /// busy is kept for a later sweep. Those it takes out are flushed within
-    /// [`Settings::let_go_flush_within`], and their leases then given up
-    /// within [`Settings::release_within`]: what is left unflushed is in the
-    /// log, and a lease not given up runs out.
+    /// [`Settings::let_go_flush_within`], each giving its lease up as it is
+    /// let go, all within [`Settings::release_within`] of the flushes'
+    /// end: what is left unflushed is in the log, and a lease not given up
+    /// runs out.
     ///
     /// Over the budget, a tenant chosen that something else holds, as a
     /// request or its maintenance does while it merges, has its merge
@@ -2976,25 +3029,21 @@ impl Inner {
         }
         let deadline = Instant::now() + self.settings.let_go_flush_within;
         let flushes = Semaphore::new(self.settings.let_go_flushes_at_once);
-        let letting_go = |going| self.let_go_of(going, &flushes, deadline);
-        let gone = join_all(taken.going.into_iter().map(letting_go)).await;
-        // Once every flush has ended: so that a sweep is bounded by what its
-        // flushes are given and what its releases are, one after the other.
-        let deadline = Instant::now() + self.settings.release_within;
-        let releases = Semaphore::new(self.settings.releases_at_once);
-        let releasing = |(tenant, lease)| self.released(tenant, lease, &releases, deadline);
-        join_all(gone.into_iter().map(releasing)).await;
+        let releases = Releases::new(&self.settings, deadline, taken.going.len());
+        let letting_go = |going| self.let_go_of(going, &flushes, deadline, &releases);
+        join_all(taken.going.into_iter().map(letting_go)).await;
     }
 
     /// Flush `going`, then lose the hold on it with its building lock still
     /// held, so that whatever queued for the lock is stopped before it has
-    /// it. Its lease is returned, to give up once every flush has ended.
+    /// it; then give its lease up, as `releases` lets it.
     async fn let_go_of(
         &self,
         going: Going,
         flushes: &Semaphore,
         deadline: Instant,
-    ) -> (TenantId, Lease) {
+        releases: &Releases,
+    ) {
         let Going {
             tenant,
             mut building,
@@ -3021,30 +3070,27 @@ impl Inner {
                 tracing::warn!(tenant = %tenant.id(), %error, "flush before letting go failed");
             }
         }
+        releases.flush_ended();
         work.hold.lose(Lost::LetGo);
         drop(building);
         tracing::info!(tenant = %tenant.id(), "let go of a tenant");
-        (tenant.id().clone(), work.writer.lease().clone())
+        // Only its lease is kept from here, not what the tenant holds.
+        let (id, lease) = (tenant.id().clone(), work.writer.lease().clone());
+        drop(tenant);
+        self.released(&id, &lease, releases).await;
     }
 
-    /// Give up the lease of `tenant`, let go, as `releases` and `deadline`,
-    /// the sweep's for all its releases, let it: one not begun by then is
-    /// not sent, and runs out, as one that hangs does.
-    async fn released(
-        &self,
-        tenant: TenantId,
-        lease: Lease,
-        releases: &Semaphore,
-        deadline: Instant,
-    ) {
-        match before(deadline, releases.acquire()).await {
-            Some(Ok(_release)) => {
-                let by = deadline.min(Instant::now() + self.settings.release_within);
-                self.release_by(&lease, by).await;
-            }
-            _ => {
-                tracing::warn!(%tenant, "lease not released: the sweep's releases ran out of time")
-            }
+    /// Give up the lease of `tenant`, let go, as `releases` lets it: one
+    /// not begun by the end of the sweep's releases is not sent, and runs
+    /// out, as one that hangs does.
+    async fn released(&self, tenant: &TenantId, lease: &Lease, releases: &Releases) {
+        let release = async {
+            let _turn = releases.at_once.acquire().await;
+            let by = Instant::now() + self.settings.release_within;
+            self.release_by(lease, by).await;
+        };
+        if unless(releases.over(), release).await.is_none() {
+            tracing::warn!(%tenant, "lease not released: the sweep's releases ran out of time");
         }
     }
 

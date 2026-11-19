@@ -541,45 +541,51 @@ A node of an earlier release does not know the flag and exits with status
   `vellev_tenants_given_up_total` counts a panic on either task, two at
   once on one tenant counting twice, and the line logged for it now reads
   "a tenant's task panicked" with the task named.
-- **A sweep waits on no tenant, and its flushes are bounded.** A tenant
-  chosen to be let go whose building lock is busy is kept for a later sweep.
-  `vellev_sweep_tenants_kept_total` gains a `reason` label: `held`, as
-  before, for one something else holds, and `building` for one kept only
-  for its busy lock. Their sum is the count the unlabelled series gave.
-  `vellev_sweep_kept_seconds` is new, with the same `reason` label: each
-  spell sweeps over the memory budget kept a tenant for one reason, from
-  the first sweep that kept it for that reason to the first that did not.
-  It times only tenants written for and kept over the budget, so it counts
-  fewer keeps than `vellev_sweep_tenants_kept_total`, whose `held` also
-  counts copies and tenants kept as they idled.
-  One it takes has that lock from then on, with the flush before letting go
-  made under it, so nothing comes in between and whatever queued for the
-  lock ends with the hold. The tenants of a sweep go together, two flushing
-  at a time, with 30 s for all those flushes between them. A flush cut at
-  that, or not reached by then, is skipped: the tenant goes all the same,
-  and whoever opens it next replays its rows from the log, which costs that
-  open more, unless the flush was cut in its commit and that commit landed.
-  A flush cut once its checkpoint was adopted went through, and is not
-  skipped. `vellev_let_go_flushes_skipped_total` is new and counts those
-  skipped; none is a flush that failed. Once all of a sweep's flushes have
-  ended, the leases of the tenants it let go are given up, four at a time,
-  within 5 s among them all; one not begun by then is not sent, and runs
-  out. So a tenant with nothing to flush gives its lease up only once its
-  sweep's flushes end, and a sweep takes at most 30 s and then 5 s. The 30
-  s, the two flushes and the four releases at once, and the 5 s are node
-  settings. An opening that fails gives its lease up within the same 5 s,
-  where it waited on the release with no bound.
-  `vellev_flush_to_let_go_seconds{part="wait"}` no longer reads a wait for
-  the building lock, which a sweep tries and never waits for. It reads the
-  wait, with that lock held, for one of the sweep's two flushes: nothing for
-  the first two tenants of a sweep with rows to flush, as long as those take
-  for each after them, and 30 s for one never reached. A tenant with nothing
-  to flush adds no sample, as before. So compare neither that series nor a
-  bench's eviction flush mark across the change: three tenants with rows in
-  one sweep, each flush over 2 s, now read as a wait over 2 s.
-  That wait is also told in its two halves, as
-  `vellev_flush_to_let_go_seconds{part="queued"}`, for a let-go that had a
-  slot, and `{part="not_reached"}`, for one the deadline came to first.
+- **A sweep waits on no tenant, and its flushes and releases are
+  bounded.**
+  - *Keeps.* A tenant chosen to be let go whose building lock is busy is
+    kept for a later sweep. `vellev_sweep_tenants_kept_total` gains a
+    `reason` label: `held`, as before, for one something else holds, and
+    `building` for one kept only for its busy lock. Their sum is the count
+    the unlabelled series gave. It counts copies, under `held`, and
+    tenants kept as they idled.
+  - *Keep spells.* `vellev_sweep_kept_seconds` is new, with the same
+    `reason` label: each spell sweeps over the memory budget kept a tenant
+    for one reason, from the first sweep that kept it for that reason to
+    the first that did not. It times only tenants written for and kept
+    over the budget, so it counts fewer keeps than
+    `vellev_sweep_tenants_kept_total`.
+  - *Flushes.* A tenant taken out has its building lock from then on,
+    with the flush before letting go made under it, so nothing comes in
+    between and whatever queued for the lock ends with the hold. A sweep's
+    tenants go together, two flushing at a time, with 30 s for all those
+    flushes. A flush cut at that, or not reached by then, is skipped: the
+    tenant goes all the same, and whoever opens it next replays its rows
+    from the log, unless the flush was cut in its commit and that commit
+    landed. A flush cut once its checkpoint was adopted went through, and
+    is not skipped; nor is one not made because the tenant's writer had
+    closed. `vellev_let_go_flushes_skipped_total` is new and counts those
+    skipped; none is a flush that failed.
+  - *Releases.* Each tenant gives its lease up as it is let go, four at a
+    time, and a sweep's releases are over 5 s after its last flush ends,
+    or after the 30 s if that comes first; one not begun by then is not
+    sent, and runs out. A tenant with nothing to flush gives its lease up
+    at once, and a sweep takes at most 35 s. An opening that fails gives
+    its lease up within the same 5 s, where it waited on the release with
+    no bound. The 30 s, the two flushes and the four releases at once, and
+    the 5 s are node settings.
+  - *The flush wait.* `vellev_flush_to_let_go_seconds{part="wait"}` no
+    longer reads a wait for the building lock, which a sweep tries and
+    never waits for. It reads the wait, with that lock held, for one of
+    the sweep's two flushes: nothing for the first two tenants of a sweep
+    with rows to flush, as long as those take for each after them, and 30
+    s for one never reached. A tenant with nothing to flush adds no
+    sample, as before. So compare neither that series nor a bench's
+    eviction flush mark across the change: three tenants with rows in one
+    sweep, each flush over 2 s, now read as a wait over 2 s. That wait is
+    also told in its two halves, as `{part="queued"}`, for a let-go that
+    had a slot, and `{part="not_reached"}`, for one the deadline came to
+    first.
 
 ### Numbers are read exactly
 
