@@ -2067,6 +2067,43 @@ async fn a_let_go_with_nothing_to_flush_is_released_while_another_flushes() {
     );
 }
 
+/// Review of f800a51, M2, as Desk asked: a flush that ends just short of
+/// the flush deadline still has its release tried, and the release phase,
+/// a release that hangs included, is over by the flush deadline and
+/// [`RELEASE_WITHIN`] after it: the sweep stays within its 35 s.
+#[tokio::test(start_paused = true)]
+async fn a_release_after_a_flush_near_its_deadline_ends_within_the_sweep_s_bound() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    written_to_let_go(&node, "slow", false).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let asked = tokio::time::Instant::now();
+    let sweeping = node.sweep_now();
+    tokio::pin!(sweeping);
+    let near = LET_GO_FLUSH_WITHIN - Duration::from_secs(1);
+    tokio::select! {
+        () = &mut sweeping => panic!("the sweep ended with its flush held"),
+        () = tokio::time::sleep(near) => {}
+    }
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let bound = LET_GO_FLUSH_WITHIN + RELEASE_WITHIN;
+    tokio::time::timeout_at(asked + bound, sweeping)
+        .await
+        .expect("the sweep outlasted its bound");
+    let took = asked.elapsed();
+    assert!(
+        took >= near + RELEASE_WITHIN,
+        "its release was not tried: {took:?}"
+    );
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+}
+
 /// M7-R5b: a let-go's flush cut in its commit closes its writer, which costs
 /// nothing with the hold lost at once. The next opener finds every row,
 /// whether the commit never landed, and it replays them, or landed unheard,
