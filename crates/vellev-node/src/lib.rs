@@ -2818,6 +2818,9 @@ impl Inner {
     /// [`Settings::let_go_flushes_at_once`] flushing at once, for
     /// [`Settings::let_go_flush_within`] among them all. Every one of them goes by then,
     /// with its flush skipped if need be, as what is left is in the log.
+    /// Their leases are then given up, [`Settings::releases_at_once`] at once,
+    /// within [`Settings::release_within`] among them all: one not begun by
+    /// then runs out.
     ///
     /// Over the budget, a tenant chosen that something else holds, as a
     /// request or its maintenance does while it merges, has its merge
@@ -2896,15 +2899,26 @@ impl Inner {
         let deadline = Instant::now() + self.settings.let_go_flush_within;
         let flushes = Semaphore::new(self.settings.let_go_flushes_at_once);
         let letting_go = |going| self.let_go_of(going, &flushes, deadline);
-        join_all(taken.going.into_iter().map(letting_go)).await;
+        let gone = join_all(taken.going.into_iter().map(letting_go)).await;
+        // Once every flush has ended: so that a sweep is bounded by what its
+        // flushes are given and what its releases are, one after the other.
+        let deadline = Instant::now() + self.settings.release_within;
+        let releases = Semaphore::new(self.settings.releases_at_once);
+        let releasing = |(tenant, lease)| self.released(tenant, lease, &releases, deadline);
+        join_all(gone.into_iter().map(releasing)).await;
     }
 
     /// Flush `going` as far as `flushes` and `deadline` let it, then lose the
     /// hold on it with its building lock still held, so that no commit is cut
-    /// and whatever queued for the lock is stopped before it has it. Only
-    /// then is its lease given up: every let-go gets there, and waits for no
-    /// other's.
-    async fn let_go_of(&self, going: Going, flushes: &Semaphore, deadline: Instant) {
+    /// and whatever queued for the lock is stopped before it has it. What is
+    /// left of it is its lease, to give up once the sweep's flushes end:
+    /// the tenant itself is let go of here.
+    async fn let_go_of(
+        &self,
+        going: Going,
+        flushes: &Semaphore,
+        deadline: Instant,
+    ) -> (TenantId, Lease) {
         let Going {
             tenant,
             mut building,
@@ -2929,8 +2943,26 @@ impl Inner {
         }
         work.hold.lose(Lost::LetGo);
         drop(building);
-        self.release(work.writer.lease()).await;
         tracing::info!(tenant = %tenant.id(), "let go of a tenant");
+        (tenant.id().clone(), work.writer.lease().clone())
+    }
+
+    /// Give up the lease of `tenant`, let go, as `releases` and `deadline`,
+    /// the sweep's for all its releases, let it: one not begun by then is
+    /// not sent, and runs out, as one that hangs does.
+    async fn released(
+        &self,
+        tenant: TenantId,
+        lease: Lease,
+        releases: &Semaphore,
+        deadline: Instant,
+    ) {
+        match before(deadline, releases.acquire()).await {
+            Some(Ok(_release)) => self.release_by(&lease, deadline).await,
+            _ => {
+                tracing::warn!(%tenant, "lease not released: the sweep's releases ran out of time")
+            }
+        }
     }
 
     /// Sweep soon, one at a time, so that each finds held only what
@@ -3093,12 +3125,19 @@ impl Inner {
     /// left, it runs out.
     async fn release(&self, lease: &Lease) {
         let within = self.settings.release_within;
-        match tokio::time::timeout(within, self.coordinator.release(lease)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        self.release_by(lease, Instant::now() + within).await;
+    }
+
+    /// As [`Self::release`], given up by `by` if that is sooner, and not
+    /// sent if it has passed.
+    async fn release_by(&self, lease: &Lease, by: Instant) {
+        let by = by.min(Instant::now() + self.settings.release_within);
+        match before(by, self.coordinator.release(lease)).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
                 tracing::warn!(partition = %lease.key, %error, "lease not released");
             }
-            Err(_) => tracing::warn!(partition = %lease.key, "releasing a lease took too long"),
+            None => tracing::warn!(partition = %lease.key, "releasing a lease took too long"),
         }
     }
 

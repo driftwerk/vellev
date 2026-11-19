@@ -521,8 +521,13 @@ and say what the caller then answers for.
   open more, unless the flush was cut in its commit and that commit landed.
   A flush cut once its checkpoint was adopted went through, and is not
   skipped. `vellev_let_go_flushes_skipped_total` is new and counts those
-  skipped; none is a flush that failed. A lease is given up within 5 s, or left to
-  run out.
+  skipped; none is a flush that failed. Once all of a sweep's flushes have
+  ended, the leases of the tenants it let go are given up, four at a time,
+  within 5 s among them all; one not begun by then is not sent, and runs
+  out. So a tenant with nothing to flush gives its lease up only once its
+  sweep's flushes end, and a sweep takes at most 30 s and then 5 s. The 30
+  s, the two flushes and the four releases at once, and the 5 s are node
+  settings.
   `vellev_flush_to_let_go_seconds{part="wait"}` no longer reads a wait for
   the building lock, which a sweep tries and never waits for. It reads the
   wait, with that lock held, for one of the sweep's two flushes: nothing for
