@@ -89,9 +89,11 @@ jobs:
       # measures over a score of merges, gathered in memory and on disk, what
       # a merge's, a flush's and an open's whole build holds tokenized in
       # chunks, weighed against every row tokenized at once, up to 200,000
-      # rows, and what a merge gathered on disk holds, weighed against the
-      # same merge in memory: built for debugging they take far too long, so
-      # the rules are left out above and run here.
+      # rows, what a merge gathered on disk holds, weighed against the same
+      # merge in memory, and what a clustered index's file holds as it is
+      # encoded, against what a merge reckons it to (M8-R17): built for
+      # debugging they take far too long, so the rules are left out above
+      # and run here.
       - name: Merge reckoning and tokenizing, optimised
         run: |
           rules=(
