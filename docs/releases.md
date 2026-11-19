@@ -552,7 +552,8 @@ A node of an earlier release does not know the flag and exits with status
   - *Keep spells.* `vellev_sweep_kept_seconds` is new, with the same
     `reason` label: each spell sweeps over the memory budget kept a tenant
     for one reason, from the first sweep that kept it for that reason to
-    the first that did not. It times only tenants written for and kept
+    the last: to a sweep's resolution, so a keep by one sweep reads 0 s,
+    however long to the next. It times only tenants written for and kept
     over the budget, so it counts fewer keeps than
     `vellev_sweep_tenants_kept_total`.
   - *Flushes.* A tenant taken out has its building lock from then on,

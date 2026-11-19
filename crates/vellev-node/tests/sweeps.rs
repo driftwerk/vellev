@@ -540,7 +540,7 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
 
 /// The busy-lock keep (§9.6): a tenant kept over the budget for its busy
 /// building lock, sweep after sweep, is timed as one spell, from the first
-/// sweep that kept it so to the sweep that takes it out. A merge holds the
+/// sweep that kept it so to the last, at five minutes. A merge holds the
 /// lock from a round, which holds the tenant, so that it is kept as held:
 /// only what holds the lock and not the tenant, as a sweep's race with a
 /// task or this test's seam, keeps it for its lock.
@@ -552,15 +552,17 @@ async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
     unused_long_enough().await;
     let building = writer.building_when_free().await;
     node.timings().drain_events();
-    // Five minutes held, as by a merge's long commit, swept every 30 s.
+    // Five minutes held, as by a merge's long commit, swept every 30 s,
+    // the last sweep as the five minutes end.
     let held_for = Duration::from_secs(5 * 60);
     let every = Duration::from_secs(30);
     for _ in 0..held_for.as_secs() / every.as_secs() {
         node.sweep_now().await;
         tokio::time::sleep(every).await;
     }
+    node.sweep_now().await;
     let kept = KeptBySweeps {
-        building: 10,
+        building: 11,
         held: 0,
     };
     assert_eq!(node.kept_by_sweeps(), kept);

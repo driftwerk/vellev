@@ -1956,6 +1956,23 @@ impl Taken {
     }
 }
 
+/// A spell of a tenant kept by sweeps over the budget, for one reason: from
+/// the first sweep that kept it so to the last, as far as sweeps saw it.
+#[derive(Debug)]
+struct KeptSpell {
+    why: KeptFor,
+    first: Instant,
+    last: Instant,
+    partition: String,
+}
+
+impl KeptSpell {
+    /// How long it has run, to the last sweep that kept it.
+    fn took(&self) -> Duration {
+        self.last.saturating_duration_since(self.first)
+    }
+}
+
 /// A tenant written for that a sweep over the budget kept, and why.
 struct KeptForBudget {
     tenant: Arc<Tenant>,
@@ -2028,9 +2045,10 @@ struct Inner {
     started: Instant,
     /// How many tenants sweeps chose to let go but kept, by why.
     kept_by_sweeps: Mutex<KeptBySweeps>,
-    /// Why, and since when, each tenant sweeps over the budget have kept
-    /// has been kept so, and its partition: see [`Self::kept_spells`].
-    kept_since: Mutex<HashMap<TenantId, (KeptFor, Instant, String)>>,
+    /// Why each tenant sweeps over the budget have kept has been kept so,
+    /// when the first and the last sweep to keep it so ran, and its
+    /// partition: see [`Self::kept_spells`].
+    kept_since: Mutex<HashMap<TenantId, KeptSpell>>,
     /// How many merges sweeps have stopped so that a tenant over the
     /// budget could be let go.
     stopped_for_budget: AtomicU64,
@@ -2456,15 +2474,16 @@ impl Node {
     }
 
     /// The keep spells not yet ended, each as an event of how long it has
-    /// run so far, as no event of an ended spell tells it: so that a bench
-    /// holds a tenant kept to the end of its run to the keep mark.
+    /// run so far, to the last sweep that kept it, as no event of an ended
+    /// spell tells it: so that a bench holds a tenant kept to the end of
+    /// its run to the keep mark.
     pub fn kept_spells_open(&self) -> Vec<Event> {
-        let (now, at) = (Instant::now(), std::time::Instant::now());
+        let at = std::time::Instant::now();
         let since = self.0.kept_since.lock().expect("kept since lock");
-        let open = since.values().map(|(why, began, partition)| Event {
-            timed: Timed::Kept(*why),
-            took: now.saturating_duration_since(*began),
-            partition: partition.clone(),
+        let open = since.values().map(|spell| Event {
+            timed: Timed::Kept(spell.why),
+            took: spell.took(),
+            partition: spell.partition.clone(),
             at,
         });
         open.collect()
@@ -3213,27 +3232,37 @@ impl Inner {
     }
 
     /// Go on with the spell of each tenant in `kept`, kept by this sweep
-    /// over the budget, for the same reason as the last, or begin one; and
-    /// end, timed, that of each not kept so now: taken out, kept for the
-    /// other reason, or not over the budget any more.
+    /// over the budget, for the same reason as the last, to now, or begin
+    /// one; and end, timed to the last sweep that kept it, that of each not
+    /// kept so now: taken out, kept for the other reason, or not over the
+    /// budget any more. So a spell is timed to a sweep's resolution: one
+    /// sweep's keep reads nothing, however long to the next.
     fn kept_spells(&self, kept: &[KeptForBudget]) {
         let now = Instant::now();
         let mut since = self.kept_since.lock().expect("kept since lock");
-        since.retain(|tenant, (why, began, partition)| {
+        since.retain(|tenant, spell| {
             let goes_on = kept
                 .iter()
-                .any(|kept| kept.tenant.id() == tenant && kept.why == *why);
-            if !goes_on {
-                let spell = now.saturating_duration_since(*began);
-                self.timings.record(Timed::Kept(*why), partition, spell);
+                .any(|kept| kept.tenant.id() == tenant && kept.why == spell.why);
+            match goes_on {
+                true => spell.last = now,
+                false => {
+                    let took = spell.took();
+                    self.timings
+                        .record(Timed::Kept(spell.why), &spell.partition, took);
+                }
             }
             goes_on
         });
         for KeptForBudget { tenant, why } in kept {
-            since.entry(tenant.id().clone()).or_insert_with(|| {
-                let partition = tenant.work.writer.lease().key.to_string();
-                (*why, now, partition)
-            });
+            since
+                .entry(tenant.id().clone())
+                .or_insert_with(|| KeptSpell {
+                    why: *why,
+                    first: now,
+                    last: now,
+                    partition: tenant.work.writer.lease().key.to_string(),
+                });
         }
     }
 

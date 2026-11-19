@@ -485,7 +485,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "sweep_kept_seconds",
-        "Spells sweeps over budget kept a tenant written for, by reason: held or building",
+        "Spells sweeps over budget kept a tenant written for, first keeping sweep to last, by reason: held or building",
         "reason",
         KeptFor::ALL.map(|why| (why.name(), timings.seconds(Timed::Kept(why)))),
     )?;

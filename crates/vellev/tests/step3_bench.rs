@@ -2052,8 +2052,8 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
 }
 
 /// The keep mark (§9.6): for each reason a sweep over the budget kept a
-/// tenant, held or its building lock busy, the longest spell against twice
-/// a flush's hold p99. The bound is read from flush holds only. A reason
+/// tenant, held or its building lock busy, the longest spell, from the
+/// first sweep that kept it to the last, against twice a flush's hold p99. The bound is read from flush holds only. A reason
 /// with no spell passes; spells with no flush hold to set them against do
 /// not, as the other marks take a missing series.
 fn kept_over_budget_mark(events: &[Event]) -> Value {
@@ -2071,7 +2071,7 @@ fn kept_over_budget_mark(events: &[Event]) -> Value {
     let mut mark = json!({
         "passed": true,
         "flush_held_p99_s": held_p99,
-        "mark": "longest keep over budget, held or for a busy building lock, each < 2 x flush hold p99",
+        "mark": "longest keep over budget, held or for a busy building lock, first keeping sweep to last, each < 2 x flush hold p99",
     });
     for why in KeptFor::ALL {
         let spells = secs(Timed::Kept(why));
@@ -2239,8 +2239,9 @@ async fn reached(gate: &MergeGate, what: &str) {
 /// The keep mark as a node's own events read it (review of f800a51, M4):
 /// a tenant whose fourth flush holds the building lock for `flush_held`,
 /// its one real flush hold of note, and whose merge then holds the lock in
-/// its commit for `commit_held`, swept over the budget every 30 s, read
-/// while that commit is held: so its spell is still open (M1).
+/// its commit for `commit_held`, swept over the budget every 30 s and as
+/// it ends, read while that commit is held: so its spell is still open
+/// (M1).
 async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> Value {
     let (node, held, before_commit) = written_with_a_held_flush("merging", 4, flush_held, |held| {
         held.hold_merges_before_commit()
@@ -2258,6 +2259,7 @@ async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> 
         node.sweep_now().await;
         tokio::time::sleep(every).await;
     }
+    node.sweep_now().await;
     let mut events = node.timings().drain_events();
     events.extend(node.kept_spells_open());
     writer.stop_holding_checkpoints();
