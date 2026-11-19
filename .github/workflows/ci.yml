@@ -101,6 +101,7 @@ jobs:
             a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them \
             a_merge_gathered_on_disk_holds_none_of_its_vectors_on_the_heap \
             a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent \
+            an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to \
             | tee reckoning.log
           # The rules ran, all five: not left out by their names or their ignore.
           grep -q "test result: ok. 5 passed" reckoning.log

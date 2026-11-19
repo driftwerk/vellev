@@ -987,6 +987,61 @@ async fn a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent() 
     }
 }
 
+/// What a merge reckons its index file's encoding holds, as it reckons its
+/// segment's frame's: `ENCODED_AT_PEAK` (state.rs) times the file.
+const INDEX_ENCODED_AT_PEAK: f64 = 2.5;
+
+/// M8-R17: a clustered index's file, encoded as a merge encodes it once its
+/// build is done, holds at its peak what the merge reckons it to, within
+/// thirty percent: the body as it grows and the frame it is copied into,
+/// at files that fall at different points of the body's doubling.
+///
+/// As the rules above: run optimised, in CI's Test job.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "measured optimised, in CI's Test job"]
+async fn an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to() {
+    use vellev_core::Distance;
+    use vellev_index::clustered::ClusteredIndex;
+    let _alone = ALONE.lock().await;
+    for (rows, width) in [(5_000, 4), (4_096, 384), (20_000, 64), (12_000, 768)] {
+        let vectors: Vec<Vec<f32>> = (0..rows)
+            .map(|n| {
+                (0..width)
+                    .map(|at| ((n * 31 + at * 17) % 97) as f32 / 97.0 - 0.5)
+                    .collect()
+            })
+            .collect();
+        let rows_of: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(n, vector)| (n as u32, vector.as_slice()))
+            .collect();
+        let index = ClusteredIndex::build(Distance::Cosine, &rows_of).unwrap();
+        let file = SegmentIndex {
+            segment: "k".into(),
+            vectors: vec![(CollectionId(0), Arc::new(index))],
+        };
+        COUNTING.reset_peak();
+        let before = COUNTING.now();
+        let encoded = format::encode_as(Kind::Index, format::FORMAT_VERSION, &file).unwrap();
+        let held = COUNTING.peak() - before;
+        let reckoned = encoded.len() as f64 * INDEX_ENCODED_AT_PEAK;
+        let off = (reckoned - held as f64) / held as f64;
+        eprintln!(
+            "an index file of {rows} x {width}, {} bytes, held {held} as it was \
+             encoded, reckoned {reckoned:.0} ({:+.0}%)",
+            encoded.len(),
+            off * 100.0
+        );
+        assert!(
+            off.abs() <= 0.3,
+            "an index file of {rows} x {width} held {held} as it was encoded, \
+             reckoned {reckoned:.0}: {:+.0}%",
+            off * 100.0
+        );
+    }
+}
+
 /// The merges whose vectors' heap is weighed: passages at three sizes, and
 /// a clustered one, whose training reads what is gathered.
 const SPILLED_BUILDS: [Shape; 4] = [
