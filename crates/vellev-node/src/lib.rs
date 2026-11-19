@@ -1758,10 +1758,10 @@ async fn unless<T>(over: impl Future<Output = ()>, work: impl Future<Output = T>
     }
 }
 
-/// The releases of a sweep's let-gos: at most [`Settings::releases_at_once`]
-/// at once, each as it is let go, and all of them over
-/// [`Settings::release_within`] after the last of the sweep's flushes ends,
-/// or after the flushes' deadline if that comes first.
+/// The releases of a sweep's let-gos, or of shutdown: at most
+/// [`Settings::releases_at_once`] at once, each as it is let go, and all of
+/// them over [`Settings::release_within`] after the last of the sweep's
+/// flushes ends, or after the flushes' deadline if that comes first.
 struct Releases {
     at_once: Semaphore,
     within: Duration,
@@ -1781,6 +1781,12 @@ impl Releases {
             flushing: AtomicUsize::new(flushing),
             flushed: watch::Sender::new(None),
         }
+    }
+
+    /// Releases with no flushes before them, as shutdown's: all over
+    /// [`Settings::release_within`] from now.
+    fn flushes_over(settings: &Settings) -> Self {
+        Self::new(settings, Instant::now(), 0)
     }
 
     /// One of the sweep's let-gos has ended its flush.
@@ -2890,7 +2896,9 @@ impl Node {
     }
 
     /// Give up every tenant, so that another node can write for them at
-    /// once rather than when the leases run out, and open no more.
+    /// once rather than when the leases run out, and open no more. Their
+    /// leases are given up as a sweep's are, all within
+    /// [`Settings::release_within`]: one not given up by then runs out.
     pub async fn shutdown(&self) {
         // Warming stopped first, so that what was served until now, and
         // what it had yet to warm, is the last the list is written with.
@@ -2901,13 +2909,20 @@ impl Node {
             open.followers.clear();
             open.tenants.drain().map(|(_, opening)| opening).collect()
         };
+        let mut leases = Vec::new();
         for opening in openings {
             let unopened = || async { Err(NodeError::Stopped) };
             if let Ok(tenant) = opening.get_or_try_init(unopened).await {
                 tenant.work.hold.lose(Lost::Shutdown);
-                self.0.release(tenant.work.writer.lease()).await;
+                leases.push((tenant.id().clone(), tenant.work.writer.lease().clone()));
             }
         }
+        // Given up as a sweep's are: a few at once, all within one bound.
+        let releases = Releases::flushes_over(&self.0.settings);
+        let releasing = leases
+            .iter()
+            .map(|(tenant, lease)| self.0.released(tenant, lease, &releases));
+        join_all(releasing).await;
         if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
             tracing::warn!(%error, "the node could not take itself off the register");
         }
@@ -3099,8 +3114,8 @@ impl Inner {
     }
 
     /// Give up the lease of `tenant`, let go, as `releases` lets it: one
-    /// not begun by the end of the sweep's releases is not sent, and runs
-    /// out, as one that hangs does.
+    /// not begun by the end of the releases is not sent, and runs out, as
+    /// one that hangs does.
     async fn released(&self, tenant: &TenantId, lease: &Lease, releases: &Releases) {
         let release = async {
             let _turn = releases.at_once.acquire().await;
@@ -3108,7 +3123,7 @@ impl Inner {
             self.release_by(lease, by).await;
         };
         if unless(releases.over(), release).await.is_none() {
-            tracing::warn!(%tenant, "lease not released: the sweep's releases ran out of time");
+            tracing::warn!(%tenant, "lease not released: its releases ran out of time");
         }
     }
 
