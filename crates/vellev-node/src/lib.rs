@@ -1846,11 +1846,9 @@ fn warn_unsent(sent: impl IntoIterator<Item = bool>, by: &str) {
     }
 }
 
-/// Lose the hold on what `opening` opens, if it opens, on a task of its
-/// own: for an opening shutdown did not wait for that passed its check of
-/// the node stopped just before shutdown stopped it. It stops the tenant's
-/// tasks at once, not at its next renewal, so that no flush commits
-/// between.
+/// Lose the hold of an opening shutdown did not wait for, once it opens,
+/// on a task of its own: at once, not at its next renewal, so that no
+/// flush commits in between.
 fn lost_once_opened(opening: Opening) {
     tokio::spawn(async move {
         let unopened = || async { Err(NodeError::Stopped) };
@@ -2113,9 +2111,7 @@ struct Inner {
     sweep_on_time: AtomicBool,
     /// Where a test holds each sweep as it is about to take tenants out.
     sweep_hold: Mutex<Option<Arc<SweepHold>>>,
-    /// Set as the node shuts down: from then on it renews no hold. It
-    /// mirrors [`Open::stopped`], which is under the tenants lock, for the
-    /// renewing tasks, which hold no `Inner` to take it.
+    /// Set as the node shuts down: from then on it renews no hold.
     renewals_stopped: Arc<AtomicBool>,
     /// When the node was made: how old its census is until its first sweep.
     started: Instant,
