@@ -1503,7 +1503,7 @@ impl TenantWork {
             return Ok(self.cut_short(building));
         };
         self.flush_tried(flushed.is_ok());
-        let (_, held) = flushed.map_err(|error| self.failed(error))?;
+        let held = flushed.map_err(|error| self.failed(error))?;
         self.settling.flushed.fetch_add(1, Ordering::SeqCst);
         if let Some(held) = held {
             timings.record(Timed::LetGoFlushHeld, partition, held);

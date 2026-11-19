@@ -1315,8 +1315,7 @@ impl RefusalGate {
 /// timed as it is let go.
 struct Building<'a> {
     /// The lock, unless whoever asked holds it, and goes on holding it past
-    /// this: see [`BuildingHeld::flush`]. One type with an optional guard,
-    /// not a borrowed variant, so that `Drop`'s timing is written once.
+    /// this: see [`BuildingHeld::flush`].
     _guard: Option<MutexGuard<'a, ()>>,
     holder: Holder,
     since: Instant,
@@ -1360,11 +1359,20 @@ pub struct BuildingHeld {
 }
 
 impl BuildingHeld {
+    fn new(writer: Arc<Writer>, guard: OwnedMutexGuard<()>) -> Self {
+        Self {
+            writer,
+            _guard: guard,
+            adopted: AtomicBool::new(false),
+        }
+    }
+
     /// As [`Writer::flush`], whatever the rows, under this lock, which is
     /// held on past it. Says how long it held the lock, or `None` if it
     /// found nothing to flush. Its build and upload, off the async threads,
-    /// give up once `stop` is stopped: dropping the flush does not reach them.
-    pub async fn flush(&mut self, stop: &Stop) -> Result<(LogPosition, Option<Duration>)> {
+    /// give up once `stop` is stopped: dropping the flush does not reach
+    /// them. `&mut`, so that one hold makes one flush at a time.
+    pub async fn flush(&mut self, stop: &Stop) -> Result<Option<Duration>> {
         let (writer, adopted) = (&self.writer, &self.adopted);
         adopted.store(false, Ordering::SeqCst);
         let stopping = Stopping::flush(stop.clone());
@@ -1382,17 +1390,13 @@ impl BuildingHeld {
             .flushing_held(&mut flushing.building, &stopping, Some(adopted))
             .await;
         flushing.ended = true;
+        flushed?;
         let building = &flushing.building;
-        Ok((flushed?, building.timed.then(|| building.held())))
+        Ok(building.timed.then(|| building.held()))
     }
-}
 
-impl BuildingHeld {
     /// Whether the last flush under this lock had its checkpoint committed
-    /// and adopted, whether or not it was waited for to its end: as a node
-    /// tells a flush its deadline cut once it went through from one it cut
-    /// before. Nothing else does: the writer's position may move by a commit
-    /// of its own, as one taken into a group before its caller went.
+    /// and adopted, whether or not it was waited for to its end.
     pub fn adopted(&self) -> bool {
         self.adopted.load(Ordering::SeqCst)
     }
@@ -2217,12 +2221,7 @@ impl Writer {
     #[doc(hidden)]
     pub fn building_if_free(self: &Arc<Self>) -> Option<BuildingHeld> {
         let guard = self.building.clone().try_lock_owned().ok()?;
-        let writer = self.clone();
-        Some(BuildingHeld {
-            writer,
-            _guard: guard,
-            adopted: AtomicBool::new(false),
-        })
+        Some(BuildingHeld::new(self.clone(), guard))
     }
 
     /// Test hook: wait for the building lock, and hold it for as long as
@@ -2230,12 +2229,7 @@ impl Writer {
     #[doc(hidden)]
     pub async fn building_when_free(self: &Arc<Self>) -> BuildingHeld {
         let guard = self.building.clone().lock_owned().await;
-        let writer = self.clone();
-        BuildingHeld {
-            writer,
-            _guard: guard,
-            adopted: AtomicBool::new(false),
-        }
+        BuildingHeld::new(self.clone(), guard)
     }
 
     /// What [`Self::flush`] does once it holds the building lock, as

@@ -207,7 +207,7 @@ async fn a_flush_can_be_made_under_a_building_lock_held_already() {
     assert!(writer.building_if_free().is_none(), "held, and free");
     let stop = Stop::new();
     let flushing = held.flush(&stop);
-    let (_, built) = tokio::time::timeout(Duration::from_secs(10), flushing)
+    let built = tokio::time::timeout(Duration::from_secs(10), flushing)
         .await
         .expect("a flush under a lock held waited for that lock")
         .unwrap();
@@ -218,7 +218,7 @@ async fn a_flush_can_be_made_under_a_building_lock_held_already() {
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 0);
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
     // Nothing written since: nothing to flush, and no flush's hold.
-    let (_, built) = held.flush(&stop).await.unwrap();
+    let built = held.flush(&stop).await.unwrap();
     assert_eq!(built, None);
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 0);
