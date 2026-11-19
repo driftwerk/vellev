@@ -1174,6 +1174,9 @@ pub struct Writer {
     /// A gate a merge waits at between its build and its commit, if a test
     /// has set one: see [`Self::hold_merges_before_commit`].
     merge_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
+    /// Where a restore given up waits before it lets writes and merges on,
+    /// if a test has set one: see [`Self::hold_refusals`].
+    refusal_gate: Arc<std::sync::Mutex<Option<Arc<RefusalGate>>>>,
     /// A gate a checkpoint waits at once adopted, with what it took out of
     /// memory, if a test has set one: where one may be dropped.
     #[cfg(test)]
@@ -1261,6 +1264,32 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct MergeGate {
     pub reached: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+}
+
+/// Where a test holds a restore as it lets writes and merges on again:
+/// `reached` is set when one arrives, and it waits, blocking its thread,
+/// until [`Self::let_go`]. A restore lets them on as it is dropped, which
+/// can wait on nothing else.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct RefusalGate {
+    pub reached: AtomicBool,
+    released: std::sync::Mutex<bool>,
+    told: std::sync::Condvar,
+}
+
+impl RefusalGate {
+    /// Let the restore held here, and any that comes, go on.
+    pub fn let_go(&self) {
+        *self.released.lock().expect("gate lock") = true;
+        self.told.notify_all();
+    }
+
+    fn passed(&self) {
+        self.reached.store(true, Ordering::SeqCst);
+        let released = self.released.lock().expect("gate lock");
+        drop(self.told.wait_while(released, |released| !*released));
+    }
 }
 
 /// A writer's building lock held, for whom and since when: the hold is
@@ -1470,6 +1499,7 @@ impl Writer {
             merge_build: Mutex::new(()),
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
+            refusal_gate: Arc::default(),
             #[cfg(test)]
             adopted_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -3926,6 +3956,16 @@ impl Writer {
         *self.merge_gate.lock().expect("gate lock") = None;
     }
 
+    /// Hold every restore from now on as it lets writes and merges on
+    /// again, at the gate given back, until it is let go. For tests that
+    /// make things happen meanwhile.
+    #[doc(hidden)]
+    pub fn hold_refusals(&self) -> Arc<RefusalGate> {
+        let gate = Arc::new(RefusalGate::default());
+        *self.refusal_gate.lock().expect("gate lock") = Some(gate.clone());
+        gate
+    }
+
     /// Delete the partition's files that nothing needs any more: a stale
     /// writer's uploads, and the segments and manifests that merges and
     /// checkpoints have replaced. Everything reached from any head written
@@ -4584,7 +4624,10 @@ fn told_again(first: &mut Result<Receipt>) -> Result<Receipt> {
 }
 
 /// Writes refused for as long as this lives.
-struct Refusing<'a>(&'a AtomicBool);
+struct Refusing<'a>(
+    &'a AtomicBool,
+    &'a std::sync::Mutex<Option<Arc<RefusalGate>>>,
+);
 
 impl<'a> Refusing<'a> {
     /// Refuse `writer`'s writes from now on, once any commit under way has
@@ -4592,7 +4635,7 @@ impl<'a> Refusing<'a> {
     /// no longer.
     async fn writes(writer: &'a Writer) -> Refusing<'a> {
         writer.restoring.store(true, Ordering::SeqCst);
-        let refusing = Refusing(&writer.restoring);
+        let refusing = Refusing(&writer.restoring, &writer.refusal_gate);
         drop(writer.writing.lock().await);
         refusing
     }
@@ -4600,6 +4643,10 @@ impl<'a> Refusing<'a> {
 
 impl Drop for Refusing<'_> {
     fn drop(&mut self) {
+        let gate = self.1.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            gate.passed();
+        }
         self.0.store(false, Ordering::SeqCst);
     }
 }

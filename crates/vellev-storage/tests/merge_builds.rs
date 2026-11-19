@@ -745,6 +745,94 @@ async fn a_restore_under_way_sends_a_turn_waiting_for_its_lock_back_at_once() {
     assert_eq!(builds.turns_free(), 1);
 }
 
+/// A restore given up lets writes and merges on before it lets its lock go:
+/// a merge queued behind it, that takes the lock once it goes, never finds
+/// it still restoring, and is not dropped as stale for a restore that put
+/// nothing back. Held as it lets them on, the restore still holds the lock,
+/// so the merge waits: let go within 2 s if it ends meanwhile, which it
+/// does only if the lock went first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_given_up_lets_merges_on_before_its_lock_goes() {
+    let builds = MergeBuilds::new(1);
+    let (cluster, other) = (Cluster::new().await, Cluster::new().await);
+    builds.hold(Some(Holding::UntilLetGo));
+    let writer = flushed(&cluster, &builds, 2).await;
+    let holder = flushed(&other, &builds, 2).await;
+    let holding = tokio::spawn({
+        let holder = holder.clone();
+        async move { holder.merge().await }
+    });
+    until(60, "the other merge never came to build", || {
+        builds.held() == 1
+    })
+    .await;
+    let ended = Arc::new(AtomicBool::new(false));
+    let merging = tokio::spawn({
+        let (writer, ended) = (writer.clone(), ended.clone());
+        async move {
+            let merged = writer.merge().await;
+            ended.store(true, Ordering::SeqCst);
+            merged
+        }
+    });
+    until(60, "the merge never came to ask for its turn", || {
+        builds.asking() == 1
+    })
+    .await;
+    let at = cluster.committed().await;
+    let restore = Restore {
+        request: RequestId::generate(),
+        asked: [0; 32],
+        from: at.log_position,
+        from_at: cluster.clock.now(),
+    };
+    let restoring = writer
+        .restore_from(
+            cluster.blobs.clone(),
+            at.manifest.as_ref(),
+            restore,
+            None,
+            &Claimed,
+        )
+        .await
+        .unwrap();
+    builds.hold(None);
+    within(60, "the other merge never ended", holding)
+        .await
+        .unwrap()
+        .unwrap();
+    // Waiting for the lock the restore holds, its turn had and given back.
+    until(3, "a turn stayed idle behind a restore", || {
+        builds.turns_free() == 1 && builds.under_way() == 0
+    })
+    .await;
+    assert!(!merging.is_finished(), "the merge ended behind the restore");
+    let gate = writer.hold_refusals();
+    let letting_go = std::thread::spawn({
+        let (gate, ended) = (gate.clone(), ended.clone());
+        move || {
+            let held = std::time::Instant::now();
+            while !ended.load(Ordering::SeqCst) && held.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            gate.let_go();
+        }
+    });
+    drop(restoring);
+    letting_go.join().unwrap();
+    assert!(
+        gate.reached.load(Ordering::SeqCst),
+        "the restore never let writes on"
+    );
+    let merged = within(60, "the merge never ended", merging).await;
+    assert!(
+        merged.unwrap().unwrap().is_some(),
+        "dropped as the restore went"
+    );
+    assert_eq!(writer.timings().merges_ended(MergeEnd::Committed), 1);
+    assert_eq!(writer.timings().merges_ended(MergeEnd::Stale), 0);
+}
+
 /// A merge stopped once it has given its turn back, with no turn to go back,
 /// is counted as one that had a turn and was stopped, as one stopped with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
