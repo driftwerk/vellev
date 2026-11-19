@@ -2051,12 +2051,13 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     })
 }
 
-/// The busy-lock mark (§9.6; the overseer's ruling on review B of #177,
-/// M2): the longest spell a sweep over the budget kept a tenant for its busy
-/// building lock alone, against twice a flush's hold p99. The bound is read
-/// from flush holds only. No spell passes; spells with no flush hold to set
+/// The keep mark (§9.6; the overseer's ruling on review B of #177, M2,
+/// widened by Desk to both reasons): for each reason a sweep over the
+/// budget kept a tenant, held or its building lock busy, the longest spell
+/// against twice a flush's hold p99. The bound is read from flush holds
+/// only. A reason with no spell passes; spells with no flush hold to set
 /// them against do not, as the other marks take a missing series.
-fn kept_for_building_mark(events: &[Event]) -> Value {
+fn kept_over_budget_mark(events: &[Event]) -> Value {
     let secs = |want: Timed| {
         sorted(
             events
@@ -2066,22 +2067,32 @@ fn kept_for_building_mark(events: &[Event]) -> Value {
                 .collect(),
         )
     };
-    let spells = secs(Timed::Kept(KeptFor::Building));
     let flush_held = secs(Timed::BuildingHeld(Holder::Flush));
-    let (longest, held_p99) = (spells.last().copied(), percentile(&flush_held, 99.0));
-    json!({
-        "passed": match (longest, held_p99) {
+    let held_p99 = percentile(&flush_held, 99.0);
+    let mut mark = json!({
+        "passed": true,
+        "flush_held_p99_s": held_p99,
+        "mark": "longest keep over budget, held or for a busy building lock, each < 2 x flush hold p99",
+    });
+    for why in KeptFor::ALL {
+        let spells = secs(Timed::Kept(why));
+        let longest = spells.last().copied();
+        let passed = match (longest, held_p99) {
             (None, _) => true,
             (Some(longest), Some(held)) => longest < 2.0 * held,
             (Some(_), None) => false,
-        },
-        "spells": spells.len(), "longest_s": longest, "flush_held_p99_s": held_p99,
-        "mark": "longest keep for a busy building lock while over budget < 2 x flush hold p99",
-    })
+        };
+        mark[why.name()] =
+            json!({ "passed": passed, "spells": spells.len(), "longest_s": longest });
+        if !passed {
+            mark["passed"] = json!(false);
+        }
+    }
+    mark
 }
 
 /// A tenant kept for its busy building lock for longer than flushes hold it
-/// fails the busy-lock mark; one kept for less, or none kept, passes; and
+/// fails the keep mark; one kept for less, or none kept, passes; and
 /// the bound is a flush's hold, whatever else holds the lock longer.
 #[test]
 fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
@@ -2094,7 +2105,7 @@ fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
     };
     let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
     let spell = |took: f64| event(Timed::Kept(KeptFor::Building), took);
-    let passed = |events: &[Event]| kept_for_building_mark(events)["passed"] == json!(true);
+    let passed = |events: &[Event]| kept_over_budget_mark(events)["passed"] == json!(true);
     assert!(!passed(&[flush_held(40.0), spell(300.0)]), "kept 300 s");
     assert!(passed(&[flush_held(40.0), spell(50.0)]), "kept 50 s");
     assert!(passed(&[flush_held(40.0)]), "none kept");
@@ -2126,7 +2137,7 @@ fn a_keep_as_held_past_twice_a_flush_s_hold_fails_the_mark() {
     let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
     let held = |took: f64| event(Timed::Kept(KeptFor::Held), took);
     let building = |took: f64| event(Timed::Kept(KeptFor::Building), took);
-    let passed = |events: &[Event]| kept_for_building_mark(events)["passed"] == json!(true);
+    let passed = |events: &[Event]| kept_over_budget_mark(events)["passed"] == json!(true);
     assert!(!passed(&[flush_held(40.0), held(300.0)]), "held 300 s");
     assert!(passed(&[flush_held(40.0), held(50.0)]), "held 50 s");
     assert!(
@@ -2473,8 +2484,9 @@ fn reported(
         "let_go_flush.held".into(),
         summary(of(Timed::LetGoFlushHeld)),
     );
+    timings.insert("kept.held".into(), summary(of(Timed::Kept(KeptFor::Held))));
     timings.insert(
-        "kept_for_building".into(),
+        "kept.building".into(),
         summary(of(Timed::Kept(KeptFor::Building))),
     );
 
@@ -2592,7 +2604,7 @@ fn reported(
             "wait_p99_s": percentile(&let_go_wait, 99.0), "flushes": let_go_wait.len(),
             "mark": "p99 wait < 2 s",
         },
-        "kept_for_building": kept_for_building_mark(&events),
+        "kept_over_budget": kept_over_budget_mark(&events),
         "backlog_refusals": { "refused": at_end.backlogged - before.backlogged, "mark": "no more than arm (a)'s" },
     });
     let invalid = NodeValidity {
