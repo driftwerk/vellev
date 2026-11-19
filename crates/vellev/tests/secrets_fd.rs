@@ -44,8 +44,10 @@ fn lines(from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver
             let read = from.read_until(b'\n', &mut line);
             if !line.is_empty() {
                 let text = String::from_utf8_lossy(&line);
-                let text = text.strip_suffix('\n').unwrap_or(&text);
-                let text = text.strip_suffix('\r').unwrap_or(text);
+                let text = match text.strip_suffix('\n') {
+                    Some(text) => text.strip_suffix('\r').unwrap_or(text),
+                    None => &text,
+                };
                 if tx.send(Said::Line(text.to_owned())).is_err() {
                     break;
                 }
@@ -99,12 +101,12 @@ fn shown(said: &Rest) -> String {
 }
 
 /// Both outputs whole, or the test fails saying which isn't and why,
-/// showing both.
-fn outputs(out: Rest, err: Rest) -> (String, String) {
+/// showing both and how the node ended.
+fn outputs(out: Rest, err: Rest, status: std::process::ExitStatus) -> (String, String) {
     match (out, err) {
         (Ok(out), Ok(err)) => (out.join("\n"), err.join("\n")),
         (out, err) => panic!(
-            "the node's output was cut short: stderr: {} stdout: {}",
+            "the node's output wasn't read to its end ({status}): stderr: {} stdout: {}",
             shown(&err),
             shown(&out)
         ),
@@ -154,7 +156,7 @@ fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
         shown(&err),
         shown(&out)
     );
-    let (stdout, stderr) = outputs(out, err);
+    let (stdout, stderr) = outputs(out, err, status);
     Output {
         status,
         stdout: stdout.into_bytes(),
@@ -238,9 +240,11 @@ fn a_secret_also_in_the_environment_is_refused() {
 /// A good payload is taken: the node gets past the pipe, its checks and
 /// its keys to listening, then tries its database (unreachable here) and
 /// says why it isn't ready, and neither secret shows in anything it said.
-/// It is stopped only after that warning: the database's error, about the
-/// URL that holds the password, is where a secret would most likely be
-/// repeated.
+/// It is stopped only after that warning, about Postgres: the database's
+/// error, about the URL that holds the password, is where a secret would
+/// most likely be repeated. The secrets are checked as they are written,
+/// so a fixture must keep to characters that JSON and URLs leave as they
+/// are.
 #[test]
 fn a_good_payload_is_taken_and_never_repeated() {
     let mut node = start(
@@ -257,7 +261,9 @@ fn a_good_payload_is_taken_and_never_repeated() {
         match out.recv_timeout(left) {
             Ok(Said::Line(line)) => {
                 listening |= line.contains("vellev listening");
-                warned |= listening && line.contains("not ready yet");
+                warned |= listening
+                    && line.contains("not ready yet")
+                    && line.contains("connecting to Postgres");
                 said.push(line);
                 if warned {
                     break None;
@@ -271,19 +277,26 @@ fn a_good_payload_is_taken_and_never_repeated() {
     let status = node.0.wait().unwrap();
     // Everything it said to the end, the lines in flight at the kill
     // included.
+    let by_itself = ended.is_some();
     let said = match ended {
         Some(Ok(())) => Ok(said),
         Some(Err(e)) => Err((said, format!("reading it failed: {e}"))),
         None => rest(&out, said),
     };
     let err = rest(&err, Vec::new());
+    let how = if by_itself {
+        format!("it ended by itself: {status}")
+    } else {
+        "the test stopped it".to_owned()
+    };
     assert!(
         listening && warned,
-        "never listened and then warned of its database ({status}): stderr: {} stdout: {}",
+        "listened: {listening}, then warned that it couldn't reach Postgres: {warned} \
+         ({how}): stderr: {} stdout: {}",
         shown(&err),
         shown(&said)
     );
-    let (said, err) = outputs(said, err);
+    let (said, err) = outputs(said, err, status);
     for secret in ["pw-fixture", "k-fixture"] {
         assert!(!said.contains(secret), "stdout: {said}");
         assert!(!err.contains(secret), "stderr: {err}");
