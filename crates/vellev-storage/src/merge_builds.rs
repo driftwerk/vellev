@@ -187,6 +187,8 @@ pub struct MergeBuilds {
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
     last_reckoned: AtomicUsize,
+    /// How many merges are in the queue for a turn: see [`Self::asking`].
+    asking: Arc<AtomicUsize>,
     /// Whether each build's output carries a [`Probe`], as a test asks.
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
@@ -334,6 +336,7 @@ impl MergeBuilds {
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
+            asking: Arc::default(),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
             slots_free: Mutex::new((0..pools.len()).rev().collect()),
@@ -436,7 +439,7 @@ impl MergeBuilds {
     /// on a merge being there.
     #[doc(hidden)]
     pub fn asking(&self) -> usize {
-        0
+        self.asking.load(Ordering::SeqCst)
     }
 
     /// How many builds wait where a test holds them now. For tests.
@@ -671,8 +674,11 @@ impl Reservation {
         let kept = Arc::new(Kept::default());
         let parked = *lock(&builds.parked_at_most);
         let (turns, granted) = (builds.turns.clone(), kept.clone());
+        let counted = Asking::counted(&builds.asking);
         let asking = tokio::spawn(async move {
-            match turns.acquire_owned().await {
+            let acquired = turns.acquire_owned().await;
+            drop(counted);
+            match acquired {
                 Ok(turn) => *lock(&granted.turn) = Granted::Turn(turn),
                 Err(_) => *lock(&granted.turn) = Granted::Gone,
             }
@@ -715,6 +721,23 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         self.asking.abort();
         *lock(&self.kept.turn) = Granted::Gone;
+    }
+}
+
+/// A place in the queue for a turn, counted from when it is made until its
+/// turn is had, or the task asking for it is aborted.
+struct Asking(Arc<AtomicUsize>);
+
+impl Asking {
+    fn counted(asking: &Arc<AtomicUsize>) -> Self {
+        asking.fetch_add(1, Ordering::SeqCst);
+        Self(asking.clone())
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
