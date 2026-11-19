@@ -1995,6 +1995,39 @@ async fn a_let_go_s_flush_cut_in_its_commit_costs_no_row() {
     }
 }
 
+/// Review of f800a51, L1: a let-go of a tenant whose writer closed with its
+/// hold intact, as by a flush whose commit was never answered, is no
+/// superseded one: its rows replay unless that commit landed, and its
+/// flush is counted as skipped.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_of_a_tenant_whose_writer_closed_counts_a_skip() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_notes(0)).await.unwrap();
+    coordinator.unanswered_commits.store(true, Ordering::SeqCst);
+    assert!(held.flush().await.is_err());
+    coordinator
+        .unanswered_commits
+        .store(false, Ordering::SeqCst);
+    assert!(held.writer().is_closed());
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    let let_go = node.let_go();
+    assert_eq!(
+        (let_go.for_budget, let_go.flushes_skipped),
+        (1, 1),
+        "{let_go:?}"
+    );
+}
+
 /// A flush under way keeps its tenant, as a round does: a sweep takes out
 /// only a tenant between rounds, and letting go of one mid-flush would wait
 /// for it with no bound (node memory note, M7b).
