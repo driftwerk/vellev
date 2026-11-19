@@ -238,8 +238,10 @@ async fn a_lock_queued_for_is_not_free() {
         let writer = writer.clone();
         async move { writer.flush().await }
     });
-    // Queued by now, or it would not be a queue this looks at.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    until("the flush never asked for the lock", || {
+        writer.flushes_asked_for_building() == 1
+    })
+    .await;
     assert!(!queued.is_finished(), "a flush went ahead of the lock held");
     drop(held);
     assert!(

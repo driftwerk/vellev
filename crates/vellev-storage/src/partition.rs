@@ -1189,6 +1189,9 @@ pub struct Writer {
     /// committed or failed, if a test has set one: see
     /// [`Self::hold_refusals`].
     refusal_gate: std::sync::Mutex<Option<Arc<RefusalGate>>>,
+    /// How many flushes have asked for the building lock: see
+    /// [`Self::flushes_asked_for_building`].
+    flushes_asked: AtomicUsize,
     /// A gate a checkpoint waits at once adopted, with what it took out of
     /// memory, if a test has set one: where one may be dropped. See
     /// [`Self::hold_checkpoints_once_adopted`].
@@ -1581,6 +1584,7 @@ impl Writer {
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
             refusal_gate: std::sync::Mutex::default(),
+            flushes_asked: AtomicUsize::new(0),
             adopted_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             discarded_probe: std::sync::Mutex::new(None),
@@ -1686,6 +1690,11 @@ impl Writer {
     /// The building lock, for `holder`, its wait and then its hold timed.
     async fn building(&self, holder: Holder) -> Building<'_> {
         let asked = Instant::now();
+        if holder == Holder::Flush {
+            // Counted as it asks, with no await between: once a test sees
+            // the count, the flush waits for the lock, or has it.
+            self.flushes_asked.fetch_add(1, Ordering::SeqCst);
+        }
         let guard = self.building.lock().await;
         self.timed(Timed::BuildingWait(holder), asked.elapsed());
         Building {
@@ -4100,6 +4109,15 @@ impl Writer {
     #[doc(hidden)]
     pub fn kept_while_merging(&self) -> usize {
         self.keeping.lock().expect("keeping lock").len()
+    }
+
+    /// How many flushes have asked for the building lock since the writer
+    /// opened, each counted as it begins to wait for it, not one a node
+    /// makes under a lock it holds already. For tests that need a flush
+    /// to be queued for the lock.
+    #[doc(hidden)]
+    pub fn flushes_asked_for_building(&self) -> usize {
+        self.flushes_asked.load(Ordering::SeqCst)
     }
 
     /// Hold every checkpoint from now on once it is committed and adopted,
