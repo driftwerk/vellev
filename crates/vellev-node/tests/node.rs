@@ -2002,6 +2002,39 @@ async fn a_sweep_s_releases_are_bounded_in_number_and_in_time() {
     assert_eq!(node.tenant_figures().len(), 0, "not let go");
 }
 
+/// Review of 79b8103, L3: shutdown gives its tenants' leases up as a sweep
+/// does. Of twenty tenants held as a node shuts down, on a coordinator whose
+/// release hangs, at most [`RELEASES_AT_ONCE`] are released at once, and all
+/// within one [`RELEASE_WITHIN`], not one after another.
+#[tokio::test(start_paused = true)]
+async fn shutdown_s_releases_are_bounded_in_number_and_in_time() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    for n in 0..20 {
+        let name = tenant(&format!("held-{n}"));
+        node.create_tenant(&name).await.unwrap();
+        let held = node.tenant(&name).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+    }
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("shutdown's releases outlasted their one bound");
+    let most = coordinator
+        .most_lease_releases_in_flight
+        .load(Ordering::SeqCst);
+    assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
+}
+
 /// `name` made on `node` with ten notes with vectors, flushed if
 /// `flushed`, and no longer used.
 async fn written_to_let_go(node: &Node, name: &str, flushed: bool) {
