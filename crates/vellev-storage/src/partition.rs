@@ -2213,9 +2213,9 @@ impl Writer {
             building.built_nothing();
             return Ok(None);
         }
-        let stopping = Stopping::never();
-        let flushed = self.flushing_held(&mut building, &stopping, None).await;
-        flushed.map(Some)
+        self.flushing_held(&mut building, &Stopping::never(), None)
+            .await
+            .map(Some)
     }
 
     /// The building lock, if nothing holds it or queues for it this moment,

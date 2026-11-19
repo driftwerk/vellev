@@ -444,8 +444,7 @@ impl MergeBuilds {
     /// Wait here while a test holds builds `at` this point: see
     /// [`Self::hold`]. At most [`HELD_AT_MOST`].
     pub(crate) fn held_here(&self, stopping: &Stopping, at: HeldAt) {
-        let builds = self;
-        let mut holding = lock(&builds.holding);
+        let mut holding = lock(&self.holding);
         let here = match *holding {
             None => false,
             Some(Holding::BuiltUntilLetGo) => at == HeldAt::Built,
@@ -456,7 +455,7 @@ impl MergeBuilds {
         if !here {
             return;
         }
-        builds.held.fetch_add(1, Ordering::SeqCst);
+        self.held.fetch_add(1, Ordering::SeqCst);
         let until = Instant::now() + HELD_AT_MOST;
         loop {
             let goes_on = match *holding {
@@ -467,7 +466,7 @@ impl MergeBuilds {
                 Some(Holding::UntilStopped | Holding::FlushUntilStopped) => stopping.is_stopped(),
             };
             let one_let_go = !goes_on
-                && builds
+                && self
                     .released
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
@@ -476,13 +475,13 @@ impl MergeBuilds {
             if goes_on || one_let_go || Instant::now() >= until {
                 break;
             }
-            holding = builds
+            holding = self
                 .let_go
                 .wait_timeout(holding, ASKS_EVERY)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        builds.held.fetch_sub(1, Ordering::SeqCst);
+        self.held.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// How many places are in the queue for a turn now. A merge makes its
