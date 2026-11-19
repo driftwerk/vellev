@@ -987,10 +987,6 @@ async fn a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent() 
     }
 }
 
-/// What a merge reckons its index file's encoding holds, as it reckons its
-/// segment's frame's: `ENCODED_AT_PEAK` (state.rs) times the file.
-const INDEX_ENCODED_AT_PEAK: f64 = 2.5;
-
 /// M8-R17: a clustered index's file, encoded as a merge encodes it once its
 /// build is done, holds at its peak what the merge reckons it to, within
 /// thirty percent: the body as it grows and the frame it is copied into,
@@ -1025,7 +1021,8 @@ async fn an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to() {
         let before = COUNTING.now();
         let encoded = format::encode_as(Kind::Index, format::FORMAT_VERSION, &file).unwrap();
         let held = COUNTING.peak() - before;
-        let reckoned = encoded.len() as f64 * INDEX_ENCODED_AT_PEAK;
+        // The very factor the merge reckons it at, as its frame's.
+        let reckoned = encoded.len() as f64 * vellev_storage::ENCODED_AT_PEAK;
         let off = (reckoned - held as f64) / held as f64;
         eprintln!(
             "an index file of {rows} x {width}, {} bytes, held {held} as it was \

@@ -49,6 +49,10 @@ pub use partition::{
 };
 pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
+/// What a merge reckons a frame or index file holds as it is encoded, times
+/// its length: for the rule that measures it. Not for use.
+#[doc(hidden)]
+pub use state::ENCODED_AT_PEAK;
 pub use state::{
     Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM,
     TOKENIZED_AT_ONCE,

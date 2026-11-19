@@ -226,13 +226,14 @@ pub struct Config {
     /// second, about 8 Mbit/s, below which a node is not supported.
     #[arg(long, env = "VELLEV_STORE_MIN_BYTES_PER_SEC", default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub store_min_bytes_per_sec: u64,
-    /// The size of the parts a file larger than it goes up to object storage
-    /// in, and comes down in, in MiB: from 5 to 5120, as S3 takes for every
-    /// part but the last. A file may have at most 10,000 parts, so 16 MiB parts
-    /// carry files up to 156 GiB. A merge whose vectors are gathered in the
-    /// cache directory holds a part of them in memory as they go up, rounded up
-    /// to whole 4 MiB pieces, and 4 MiB more, or all of them if that is less:
-    /// larger parts cost a merge that much more memory at its peak.
+    /// The size of the parts a file larger than it goes up to object
+    /// storage in, and comes down in, in MiB: from 5 to 5120, as S3 takes
+    /// for every part but the last. A file may have at most 10,000 parts,
+    /// so 16 MiB parts carry files up to 156 GiB. A merge whose vectors are
+    /// gathered in the cache directory holds a part of them in memory as
+    /// they go up, rounded up to whole 4 MiB pieces, and 4 MiB more, or all
+    /// of them if that is less: larger parts cost a merge that much more
+    /// memory at its peak.
     #[arg(long, env = "VELLEV_UPLOAD_PART_MIB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(5..=5120))]
     pub upload_part_mib: u64,
     /// How much longer than a tenant's restore window its files that

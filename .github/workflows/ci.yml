@@ -94,17 +94,19 @@ jobs:
       # the rules are left out above and run here.
       - name: Merge reckoning and tokenizing, optimised
         run: |
+          rules=(
+            a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent
+            a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for_it
+            a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them
+            a_merge_gathered_on_disk_holds_none_of_its_vectors_on_the_heap
+            a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent
+            an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to
+          )
           cargo test --release --locked -p vellev-storage --test flush_memory -- \
-            --ignored --nocapture --exact \
-            a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent \
-            a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for_it \
-            a_flush_and_an_open_hold_a_chunk_of_tokens_at_once_and_an_open_saves_them \
-            a_merge_gathered_on_disk_holds_none_of_its_vectors_on_the_heap \
-            a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent \
-            an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to \
-            | tee reckoning.log
-          # The rules ran, all five: not left out by their names or their ignore.
-          grep -q "test result: ok. 5 passed" reckoning.log
+            --ignored --nocapture --exact "${rules[@]}" | tee reckoning.log
+          # The rules ran, every one listed: not left out by their names or
+          # their ignore, however many the list comes to.
+          grep -q "test result: ok. ${#rules[@]} passed" reckoning.log
       # A merge gathering its vectors on a file system that really fills.
       - name: A merge on a full disk
         env:

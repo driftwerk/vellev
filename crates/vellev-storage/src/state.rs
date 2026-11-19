@@ -890,7 +890,7 @@ const CODE_EACH_ROW: f64 = 12.0;
 /// frame at the most either way, which keeps any shape inside the rule's
 /// bounds, where three would pass 30% on rows mostly of frame as the doubling
 /// fell (2.03 to 2.48 measured, all of them counted over).
-const ENCODED_AT_PEAK: f64 = 2.5;
+pub const ENCODED_AT_PEAK: f64 = 2.5;
 
 impl Reckoning {
     /// About how many bytes the merge holds at its peak.
@@ -4369,15 +4369,9 @@ mod tests {
             encoding.peak(),
             (10.0 + 20.0 + 100.0 * ENCODED_AT_PEAK) as usize
         );
-        let built = of_vectors(5_000, 4);
-        let whole = Merge {
-            run: 0..1,
-            keys: Vec::new(),
-        };
-        let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
-        let encoded =
-            clustered.indexed + clustered.encoded + clustered.index_file * ENCODED_AT_PEAK;
-        assert!(clustered.peak() as f64 >= encoded, "{clustered:?}");
+        // No merge small enough for a unit rule has its peak set here (past
+        // about 0.4M rows in one clustered collection): what an encoding
+        // holds is measured by M8-R17, at this very factor.
     }
 
     /// A run with no vectors gathers none on disk, and so is reckoned to
