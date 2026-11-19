@@ -2880,6 +2880,60 @@ mod tests {
         assert!(found * 100 >= total * 95, "{found} of {total} shortlisted");
     }
 
+    /// Queries that lie apart from the rows, as a question's vector lies
+    /// apart from the passages' (recall note, §3): halfway between two rows
+    /// of different groups, jittered. Their neighbours spread over more
+    /// clusters than a row's do, which tuning on rows alone did not see:
+    /// on the benchmark fixture the tuned probes held 0.91 of real
+    /// questions' nearest ten.
+    #[test]
+    fn the_tuned_probes_hold_the_nearest_ten_of_queries_apart_from_the_rows() {
+        let vectors = grouped(5, 20_000, 64, 200, 0.6);
+        let index = indexed(Distance::Cosine, &vectors);
+        let mut noise = Noise(77);
+        let mut random = Random(13);
+        let (mut found, mut total) = (0, 0);
+        for _ in 0..200 {
+            let (a, b) = (random.below(vectors.len()), random.below(vectors.len()));
+            let jitter = noise.vector(64);
+            let query: Vec<f32> = vectors[a]
+                .iter()
+                .zip(&vectors[b])
+                .zip(jitter)
+                .map(|((x, y), e)| (x + y) / 2.0 + 0.1 * e)
+                .collect();
+            let mut exact: Vec<(f32, u32)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(row, v)| (distance(Distance::Cosine, &query, v), row as u32 * 2))
+                .collect();
+            exact.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            let truth: Vec<u32> = exact[..10].iter().map(|(_, row)| *row).collect();
+            let shortlist = index.shortlist(&query, 128, None, &[], &in_row_order);
+            let mut scored: Vec<(f32, u32)> = shortlist
+                .iter()
+                .map(|row| {
+                    (
+                        distance(Distance::Cosine, &query, &vectors[*row as usize / 2]),
+                        *row,
+                    )
+                })
+                .collect();
+            scored.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            found += scored[..10.min(scored.len())]
+                .iter()
+                .filter(|(_, row)| truth.contains(row))
+                .count();
+            total += 10;
+        }
+        assert!(
+            found * 100 >= total * 99,
+            "{found} of {total} at {} probes of {} clusters",
+            index.probes(),
+            index.clusters()
+        );
+    }
+
     #[test]
     fn probes_are_as_few_as_the_recall_floor_allows() {
         let tight = indexed(Distance::L2, &grouped(1, 5000, 64, 50, 0.05));
