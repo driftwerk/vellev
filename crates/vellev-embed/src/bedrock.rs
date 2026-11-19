@@ -328,15 +328,17 @@ impl Bedrock {
     /// The SDK's behaviour version, held rather than `latest()`: an SDK
     /// update must not change how calls are retried. `ATTEMPTS`,
     /// `UNREACHED_FOR` and `CALL_TIMEOUT` are tuned for this one's retries,
-    /// where server errors back off from the configured initial backoff
-    /// (1 s) and a connection that answered 5xx is dropped. `latest()`
-    /// became Retry Behavior 2.1 in `aws-smithy-runtime-api` 1.20: server
-    /// errors back off from a fixed 50 ms whatever is configured, each such
-    /// retry costs 14 of the retry budget rather than 5 (a timeout 14 rather
-    /// than 10), and the connection is kept. Moving to it is its own change,
-    /// with those timings looked at again. The crates are built without
-    /// `behavior-version-latest`, so a client made without this fails to
-    /// build rather than taking `latest()`.
+    /// where an error that is not throttling (a 5xx, a timeout, a
+    /// connection that failed) backs off from the configured initial backoff
+    /// (1 s), costs 10 of the retry budget, and drops a connection that
+    /// answered 5xx. `latest()` became Retry Behavior 2.1 in
+    /// `aws-smithy-runtime-api` 1.20: those errors back off from a fixed
+    /// 50 ms whatever is configured, cost 14, and the connection is kept.
+    /// Moving to it is its own change, with those timings looked at again.
+    /// The crates are built without `behavior-version-latest`, so a client
+    /// made without a behaviour version panics when it is made rather than
+    /// taking `latest()` unseen. (`aws-config`'s own STS and SSO credential
+    /// clients use `latest()` whatever is held here.)
     #[allow(deprecated)]
     pub fn behavior() -> BehaviorVersion {
         BehaviorVersion::v2026_01_12()
