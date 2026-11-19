@@ -13,7 +13,9 @@
 //! The descriptor must be the read end of a pipe the node inherited (not
 //! close-on-exec), and anything else is refused untouched; once taken it is
 //! made close-on-exec, and a non-blocking one is waited for with its flag
-//! (shared with every holder of the pipe) left as it is. The supervisor writes
+//! (the read end's, shared with every copy of that end) left as it is. A
+//! pipe named by mistake that passes these checks loses what is read from
+//! it before it is refused. The supervisor writes
 //! the payload once and closes its end before the node starts, and no other
 //! copy of the write end may survive anywhere, in other children of the
 //! supervisor included: the node reads the frame and then the pipe's end,
@@ -131,7 +133,13 @@ impl Inherited {
         // SAFETY: `F_GETFL` reads the open pipe's status flags; takes
         // nothing.
         let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if status == -1 || status & libc::O_ACCMODE != libc::O_RDONLY {
+        // On Linux an `O_PATH` descriptor reads as `O_RDONLY` but can't be
+        // read.
+        #[cfg(target_os = "linux")]
+        let path_only = status != -1 && status & libc::O_PATH != 0;
+        #[cfg(not(target_os = "linux"))]
+        let path_only = false;
+        if status == -1 || status & libc::O_ACCMODE != libc::O_RDONLY || path_only {
             bail!("--secrets-fd {fd} isn't open for reading only (a pipe's read end)");
         }
         if flags & libc::FD_CLOEXEC != 0 {
@@ -171,11 +179,12 @@ impl Inherited {
         // against the deadline, so a supervisor that never writes is an
         // error at the deadline rather than a node that never starts, a
         // non-blocking pipe is waited for too (its flag, shared with every
-        // holder of the pipe, is left as it is), and the descriptor is
-        // closed by the time this returns. The wait here is a backstop, a
-        // little past the deadline, for a read that blocks after all
-        // (something else holding the pipe draining it between the poll and
-        // the read).
+        // copy of the read end, is left as it is), and the descriptor is
+        // closed by the time this returns. The wait here is a backstop, past
+        // the deadline by half as long again (a second at least), for a
+        // read that blocks after all (something else holding the pipe
+        // draining it between the poll and the read), or a reader starved of
+        // the processor.
         let (tx, rx) = std::sync::mpsc::channel();
         let deadline = std::time::Instant::now() + within;
         std::thread::Builder::new()
@@ -188,7 +197,7 @@ impl Inherited {
                 let _ = tx.send(read);
             })
             .map_err(|e| eyre!("the secrets' reader can't be started: {e}"))?;
-        let body = match rx.recv_timeout(within + BACKSTOP) {
+        let body = match rx.recv_timeout(within + BACKSTOP.max(within / 2)) {
             Ok(Ok(body)) => body,
             Ok(Err(Unread::TooLong)) => bail!(
                 "the secrets' length is over the most the secrets may hold ({MAX_BYTES} bytes)"
@@ -211,8 +220,8 @@ impl Inherited {
                  close"
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
-                "reading the secrets didn't finish within {within:?}: a read blocked, so \
-                 something else is reading the pipe"
+                "reading the secrets didn't finish well past {within:?}: a read blocked \
+                 (something else reading the pipe), or the reader was starved"
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("reading the secrets stopped without an answer")
@@ -376,8 +385,9 @@ fn read_by(
         if left.is_zero() {
             return Err(Unread::Late { framed });
         }
-        // Rounded up, so a wait under a millisecond isn't a busy loop.
-        let ms = libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+        // Rounded up from nanoseconds, so no wait left is polled as none.
+        let ms =
+            libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX);
         let mut ready = libc::pollfd {
             fd: file.as_raw_fd(),
             events: libc::POLLIN,
@@ -407,7 +417,8 @@ fn read_by(
     }
 }
 
-/// How long past its deadline a read that blocked after all is waited for.
+/// The least a read that blocked after all is waited for past its
+/// deadline.
 const BACKSTOP: Duration = Duration::from_secs(1);
 
 /// Why a frame couldn't be read.
