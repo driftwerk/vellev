@@ -733,6 +733,31 @@ async fn a_spell_still_open_when_read_is_reported_as_it_stands() {
     assert_eq!(open[0].partition, "busy/0");
 }
 
+/// Review of 31452e7, tests: a spell still open when read is reported with
+/// its upper end too, from the first sweep that kept it to the read, beside
+/// its figure to the last sweep that kept it.
+#[tokio::test(start_paused = true)]
+async fn a_spell_still_open_when_read_reports_its_upper_end_to_the_read() {
+    let node = over_budget(memory());
+    node.timings().keep_events(true);
+    let writer = written(&node, "busy", 2).await;
+    unused_long_enough().await;
+    let _building = writer.building_when_free().await;
+    node.sweep_now().await;
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    node.sweep_now().await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let open = node.kept_spells_open();
+    let spells = took(&open, Timed::Kept(KeptFor::Building));
+    let upper = took(&open, Timed::KeptUpTo(KeptFor::Building));
+    assert_eq!((spells.len(), upper.len()), (1, 1), "{open:?}");
+    let within = |took: Duration, secs: u64| {
+        took >= Duration::from_secs(secs) && took < Duration::from_secs(secs + 1)
+    };
+    assert!(within(spells[0], 90), "{spells:?}");
+    assert!(within(upper[0], 110), "{upper:?}");
+}
+
 /// A tenant a request holds, chosen to be let go, is kept as held, not as
 /// one whose building lock is busy: what keeps it is looked at first.
 #[tokio::test(start_paused = true)]
