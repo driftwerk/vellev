@@ -84,10 +84,12 @@ impl Inherited {
     /// it while the node, refused, exits).
     ///
     /// The number is looked at without being taken: one below 3, or one
-    /// that isn't open, isn't a pipe, isn't open for reading only (a write
-    /// end, or on Linux an `O_PATH` one), or is close-on-exec (so was opened
-    /// in this process, as Rust and tokio open every descriptor, rather than
-    /// inherited) is refused and left as it was.
+    /// that isn't open, can't be looked at, isn't a pipe, isn't open for
+    /// reading only (a write end, or on Linux an `O_PATH` one), or is
+    /// close-on-exec (so was opened in this process, as Rust and tokio open
+    /// every descriptor, rather than inherited) is refused and left as it
+    /// was. One taken that then can't be made close-on-exec is refused and
+    /// closed.
     ///
     /// # Safety
     ///

@@ -102,11 +102,11 @@ fn shown(said: &Rest) -> String {
 
 /// Both outputs whole, or the test fails saying which isn't and why,
 /// showing both and how the node ended.
-fn outputs(out: Rest, err: Rest, status: std::process::ExitStatus) -> (String, String) {
+fn outputs(out: Rest, err: Rest, how: &str) -> (String, String) {
     match (out, err) {
         (Ok(out), Ok(err)) => (out.join("\n"), err.join("\n")),
         (out, err) => panic!(
-            "the node's output wasn't read to its end ({status}): stderr: {} stdout: {}",
+            "the node's output wasn't read to its end ({how}): stderr: {} stdout: {}",
             shown(&err),
             shown(&out)
         ),
@@ -156,7 +156,7 @@ fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
         shown(&err),
         shown(&out)
     );
-    let (stdout, stderr) = outputs(out, err, status);
+    let (stdout, stderr) = outputs(out, err, &status.to_string());
     Output {
         status,
         stdout: stdout.into_bytes(),
@@ -237,14 +237,33 @@ fn a_secret_also_in_the_environment_is_refused() {
     }
 }
 
+/// The message of a line the node logged (its JSON log's
+/// `fields.message`), and its `fields.error`, if any.
+fn logged(line: &str) -> (String, String) {
+    let line: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+    let field = |name: &str| line["fields"][name].as_str().unwrap_or_default().to_owned();
+    (field("message"), field("error"))
+}
+
+/// Why the good-payload test stopped watching the node's stdout.
+enum Stop {
+    Warned,
+    Ended,
+    Failed(std::io::Error),
+    Minute,
+    ReaderDied,
+}
+
 /// A good payload is taken: the node gets past the pipe, its checks and
 /// its keys to listening, then tries its database (unreachable here) and
-/// says why it isn't ready, and neither secret shows in anything it said.
-/// It is stopped only after that warning, about Postgres: the database's
-/// error, about the URL that holds the password, is where a secret would
-/// most likely be repeated. The secrets are checked as they are written,
-/// so a fixture must keep to characters that JSON and URLs leave as they
-/// are.
+/// warns that it isn't ready, and neither secret shows in anything it
+/// said. It is stopped only after that warning, whose error is the one
+/// from connecting to Postgres with the URL that holds the password. With
+/// nothing listening on that port the cause is a refused connection,
+/// which doesn't quote the URL, so this shows the warning doesn't repeat
+/// it, not that a driver error quoting a URL would be redacted. The
+/// secrets are checked as they are written, so a fixture must keep to
+/// characters that JSON and URLs leave as they are.
 #[test]
 fn a_good_payload_is_taken_and_never_repeated() {
     let mut node = start(
@@ -255,48 +274,63 @@ fn a_good_payload_is_taken_and_never_repeated() {
     let err = lines(node.0.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = Vec::new();
-    let (mut listening, mut warned) = (false, false);
-    let ended = loop {
+    let mut listening = false;
+    let stop = loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match out.recv_timeout(left) {
             Ok(Said::Line(line)) => {
-                listening |= line.contains("vellev listening");
-                warned |= listening
-                    && line.contains("not ready yet")
-                    && line.contains("connecting to Postgres");
+                let (message, error) = logged(&line);
                 said.push(line);
-                if warned {
-                    break None;
+                listening |= message == "vellev listening";
+                if listening
+                    && message == "not ready yet"
+                    && error.starts_with("connecting to Postgres")
+                {
+                    break Stop::Warned;
                 }
             }
-            Ok(Said::End(how)) => break Some(how),
-            Err(_) => break None,
+            Ok(Said::End(Ok(()))) => break Stop::Ended,
+            Ok(Said::End(Err(e))) => break Stop::Failed(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Stop::Minute,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Stop::ReaderDied,
         }
     };
     let _ = node.0.kill();
     let status = node.0.wait().unwrap();
+    let warned = matches!(stop, Stop::Warned);
     // Everything it said to the end, the lines in flight at the kill
     // included.
-    let by_itself = ended.is_some();
-    let said = match ended {
-        Some(Ok(())) => Ok(said),
-        Some(Err(e)) => Err((said, format!("reading it failed: {e}"))),
-        None => rest(&out, said),
+    let (said, how) = match stop {
+        Stop::Warned => (
+            rest(&out, said),
+            format!("the test stopped it after the warning: {status}"),
+        ),
+        Stop::Ended => (
+            Ok(said),
+            format!("its stdout ended, as when it exits: {status}"),
+        ),
+        Stop::Failed(e) => (
+            Err((said, format!("reading it failed: {e}"))),
+            format!("reading its stdout failed, and the test stopped it: {status}"),
+        ),
+        Stop::Minute => (
+            rest(&out, said),
+            format!("the test stopped it after a minute: {status}"),
+        ),
+        Stop::ReaderDied => (
+            Err((said, "its reader died".into())),
+            format!("its stdout's reader died, and the test stopped it: {status}"),
+        ),
     };
     let err = rest(&err, Vec::new());
-    let how = if by_itself {
-        format!("it ended by itself: {status}")
-    } else {
-        "the test stopped it".to_owned()
-    };
     assert!(
-        listening && warned,
+        warned,
         "listened: {listening}, then warned that it couldn't reach Postgres: {warned} \
          ({how}): stderr: {} stdout: {}",
         shown(&err),
         shown(&said)
     );
-    let (said, err) = outputs(said, err, status);
+    let (said, err) = outputs(said, err, &how);
     for secret in ["pw-fixture", "k-fixture"] {
         assert!(!said.contains(secret), "stdout: {said}");
         assert!(!err.contains(secret), "stderr: {err}");
