@@ -6,6 +6,22 @@ node of that release answers differently. The breaking changes are those
 `cargo semver-checks` finds against the release before, and whatever it
 cannot see.
 
+## What stops a release
+
+A release is checked by every gate a commit to main is, and by one more:
+no dependency may have an advisory in the RustSec database that
+`deny.toml` does not ignore. No per-commit gate is held to that, so that
+an advisory reported overnight does not turn unrelated work red; the
+nightly checks it instead, and opens an issue while it fails. An
+advisory reported the morning of a release therefore stops it, until the
+dependency is moved off or the advisory is ignored in `deny.toml` with
+its reason, a date to look at it again, and the owner's OK.
+
+The check reads `deny.toml` as the tagged commit has it, so running the
+stopped release again changes nothing: tag the commit that carries the
+fix, a new version or the same one moved to it. Running Publish by hand
+from main instead publishes the crates but does not name the image.
+
 ## 0.2.0
 
 Bring clients up to this release before the nodes: see
@@ -398,6 +414,23 @@ and say what the caller then answers for.
 - **Vectors are never held in memory by a node with a cache directory.**
   A tenant whose vectors the cache cannot take, or whose disk does not
   answer, does not open, and is `unavailable` until it does.
+- **A merge gathers its vectors in the cache directory**, in a file of its
+  own that becomes the merged segment's copy: what it holds in memory falls
+  by its vectors' bytes at every stage but their upload, where it holds a
+  part of them, rounded up to whole 4 MiB pieces, and 4 MiB more, or all of
+  them if that is less, as `VELLEV_UPLOAD_PART_MIB` sets; and the disk is
+  written as it gathers, not after it uploads, and holds that file for the
+  whole build. A merge with too little room for it, and as much again or a
+  gibibyte, is skipped, as `no_room` in `vellev_merges_ended_total` and in
+  `vellev_merge_spills_skipped_total`; `vellev_merge_spill_bytes` and
+  `vellev_merge_spill_failures_total` are new too. A round now cleans up
+  whether or not its merge failed. Nothing stored changes, and a node with
+  no cache directory gathers in memory as before. `vellev-storage`'s `Blobs`
+  gains `spills`, `put_spilled` and `spilled_up_in_parts_of`. A store over
+  another forwards `spills` for its merges to gather on disk, or they gather
+  in memory; one that forwards `put_spilled` forwards
+  `spilled_up_in_parts_of` too, or its merges are reckoned to hold whole
+  frames as they go up.
 - **Every object read carries `version`**: 32 hexadecimal characters, a
   hash of its properties and vector (docs/compatibility.md says exactly
   how), from `GET …/objects/{id}`, `/list`, `/nearest`, `/keyword` and

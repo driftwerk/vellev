@@ -23,6 +23,7 @@ pub mod prefix;
 mod published;
 mod search;
 pub mod shipper;
+mod spill;
 mod state;
 mod stopping;
 pub mod timings;
@@ -43,11 +44,15 @@ pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
 pub use partition::{
-    Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RestoreFrom, Writer,
-    GATHERED_AT_ONCE,
+    Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RefusalGate, RestoreFrom,
+    Writer, GATHERED_AT_ONCE,
 };
 pub use published::FreesHeld;
 pub use search::{Hit, Query, DEFAULT_OVERSAMPLE};
+/// What a merge reckons a frame or index file holds as it is encoded, times
+/// its length: for the rule that measures it. Not for use.
+#[doc(hidden)]
+pub use state::ENCODED_AT_PEAK;
 pub use state::{
     Figures, Live, MemtableCoding, Merging, Probes, State, TextsApplied, CODE_FROM,
     TOKENIZED_AT_ONCE,

@@ -438,6 +438,27 @@ pub(crate) fn seal(kind: Kind, version: u16, frame: &mut [u8]) {
     frame[HEADER - 4..HEADER].copy_from_slice(&checksum);
 }
 
+/// The header of a frame of `length` bytes of body, which sum as `body`
+/// does: for a frame gathered a piece at a time, whose body is never all in
+/// memory to sum.
+pub(crate) fn header(
+    kind: Kind,
+    version: u16,
+    length: usize,
+    body: &crc32fast::Hasher,
+) -> [u8; HEADER] {
+    let mut header = [0; HEADER];
+    header[..MAGIC.len()].copy_from_slice(&MAGIC);
+    header[4] = kind as u8;
+    header[5..7].copy_from_slice(&version.to_le_bytes());
+    header[7..15].copy_from_slice(&(length as u64).to_le_bytes());
+    let mut sum = crc32fast::Hasher::new();
+    sum.update(&header[MAGIC.len()..HEADER - 4]);
+    sum.combine(body);
+    header[HEADER - 4..].copy_from_slice(&sum.finalize().to_le_bytes());
+    header
+}
+
 /// Where a frame's body starts.
 pub(crate) const BODY: usize = HEADER;
 
@@ -698,6 +719,22 @@ impl Framed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header made from the sum of a body, summed a piece at a time, is
+    /// the one sealing the body whole makes.
+    #[test]
+    fn a_header_made_from_its_body_s_sum_is_the_one_sealing_it_makes() {
+        let body: Vec<u8> = (0..4_099u32).map(|at| (at % 251) as u8).collect();
+        let mut frame = vec![0; BODY];
+        frame.extend_from_slice(&body);
+        seal(Kind::Vectors, FORMAT_VERSION, &mut frame);
+        let mut sum = crc32fast::Hasher::new();
+        body.chunks(1_000).for_each(|piece| sum.update(piece));
+        let made = header(Kind::Vectors, FORMAT_VERSION, body.len(), &sum);
+        assert_eq!(made, frame[..BODY]);
+        frame[..BODY].copy_from_slice(&made);
+        verify("k", &frame).unwrap();
+    }
 
     /// `file` taken as it goes by in parts of `each` bytes.
     fn framed_by(file: &[u8], each: usize) -> Framed {

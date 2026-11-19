@@ -334,7 +334,12 @@ async fn main() -> Result<ExitCode> {
             } = *serve;
             tracing_subscriber::fmt().json().init();
             if let Some(fd) = secrets_fd {
-                vellev::inherited::Inherited::from_descriptor(fd)?.apply(&mut config);
+                // SAFETY: nothing in this process has taken an inherited
+                // descriptor yet, and no other thread is opening one: every
+                // descriptor it opened itself (tokio's) is close-on-exec,
+                // and is refused and left open.
+                let inherited = unsafe { vellev::inherited::Inherited::from_descriptor(fd) }?;
+                inherited.apply(&mut config)?;
             }
             let (limits, store) = config.checked()?;
             let trusted = vellev::identity::IdentityKeys::parse(&config.identity_keys)?;

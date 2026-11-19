@@ -152,6 +152,34 @@ async fn on_disk(dir: &std::path::Path) -> (Cluster, Writer) {
     (cluster, writer)
 }
 
+/// As [`on_disk`], with a cache in `cache` over the store, as a node has:
+/// so that a merge's vectors are gathered there, and nothing the store or
+/// its cache keeps is held in memory. With `part`, the store's uploads go in
+/// parts of that many bytes, and the cache's disk fetches in them, as a
+/// node's `upload_part_mib` sets both; else in the default parts.
+async fn cached_on_disk(
+    dir: &std::path::Path,
+    cache: &std::path::Path,
+    part: Option<usize>,
+) -> (Cluster, Writer) {
+    let mut cluster = Cluster::new().await;
+    let local = object_store::local::LocalFileSystem::new_with_prefix(dir).unwrap();
+    let store = ObjectBlobs::on_disk(Arc::new(local), dir);
+    cluster.blobs = Arc::new(match part {
+        None => CachedBlobs::new(Arc::new(store), cache),
+        Some(part_bytes) => {
+            let transfers = vellev_storage::Transfers {
+                part_bytes,
+                ..vellev_storage::Transfers::default()
+            };
+            let disk = vellev_storage::Disk::shared().clone().fetching(&transfers);
+            CachedBlobs::new(Arc::new(store.transferring(transfers)), cache).on(disk)
+        }
+    });
+    let writer = cluster.writer().await;
+    (cluster, writer)
+}
+
 /// The text each row's title holds.
 #[derive(Debug, Clone, Copy)]
 enum Text {
@@ -382,6 +410,9 @@ struct Shape {
     collections: usize,
     /// A collection whose rows are spared if a row dying is of another.
     sparing: Option<usize>,
+    /// The bytes of each part a store's upload goes in, gathered on disk,
+    /// if not the default's.
+    part: Option<usize>,
 }
 
 impl Shape {
@@ -397,6 +428,7 @@ impl Shape {
             dying: (0, 0),
             collections: 1,
             sparing: None,
+            part: None,
         }
     }
 
@@ -440,15 +472,36 @@ impl Shape {
             ..self
         }
     }
+
+    /// Gathered on disk, its frame going up in parts of `part` bytes.
+    const fn going_up_in(self, part: usize) -> Self {
+        Self {
+            part: Some(part),
+            ..self
+        }
+    }
 }
 
 /// What a merge of four flushed segments of `rows` rows in all, of
 /// `dimensions`, holds at its peak beyond what was held before it.
 async fn merge_peak(rows: usize, dimensions: usize) -> usize {
     let at_once = vellev_storage::TOKENIZED_AT_ONCE;
-    merge_measured(Shape::of(rows, dimensions, Text::Short), at_once)
-        .await
-        .peak
+    merge_measured(
+        Shape::of(rows, dimensions, Text::Short),
+        at_once,
+        Gathered::InMemory,
+    )
+    .await
+    .peak
+}
+
+/// Where a merge's vectors are gathered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gathered {
+    /// In memory, as on a store that keeps no copies of its own.
+    InMemory,
+    /// In a file of the store's cache, read in place.
+    OnDisk,
 }
 
 /// What a merge is measured to hold, and reckoned to.
@@ -462,6 +515,8 @@ struct Measured {
     planned: usize,
     /// How many rows' tokens it held at once, at the most.
     tokenized_at_once: usize,
+    /// How many bytes of vectors it gathered on local disk.
+    spilled: usize,
 }
 
 /// What `work` comes to within `limit`: a merge that never ends fails the
@@ -488,13 +543,45 @@ impl Drop for Tokenizing {
     }
 }
 
+/// Wait until the count stands still: what the merges before this one let
+/// go is freed off the async threads, and nothing waits for it. Measured
+/// while that falls, a merge reads as holding less than it does, by whatever
+/// fell before its peak: 3 collections' merge, the same to the byte alone,
+/// read 13 MB of its 47 MB short in the rule's order, and looked like a
+/// spread as threads fell.
+async fn count_settled() {
+    within(WRITTEN_WITHIN, "the count settled", async {
+        let (mut last, mut still) = (COUNTING.now(), 0);
+        while still < COUNT_STILL_FOR {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = COUNTING.now();
+            still = match now.abs_diff(last) < COUNT_STILL_WITHIN {
+                true => still + 1,
+                false => 0,
+            };
+            last = now;
+        }
+    })
+    .await;
+}
+
+/// How many readings 20 ms apart show the count standing still, and how
+/// little it may move between them: a task's few allocations go on.
+const COUNT_STILL_FOR: usize = 5;
+const COUNT_STILL_WITHIN: usize = 16 * 1024;
+
 /// What a merge of `shape`, `at_once` rows' text tokenized at a time, is
 /// [`Measured`] to hold.
-async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
+async fn merge_measured(shape: Shape, at_once: usize, gathered: Gathered) -> Measured {
     let _tokenizing = Tokenizing::at_once(at_once);
-    let dir = tempfile::tempdir().unwrap();
-    let opened = within(WRITTEN_WITHIN, "the writer opened", on_disk(dir.path()));
-    let (_cluster, writer) = opened.await;
+    let (dir, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (_cluster, writer) = within(WRITTEN_WITHIN, "the writer opened", async {
+        match gathered {
+            Gathered::InMemory => on_disk(dir.path()).await,
+            Gathered::OnDisk => cached_on_disk(dir.path(), cache.path(), shape.part).await,
+        }
+    })
+    .await;
     let builds = vellev_storage::MergeBuilds::new(1);
     let writer = writer
         .merging_with(vellev_storage::Merging {
@@ -541,6 +628,7 @@ async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
         }
     };
     within(WRITTEN_WITHIN, "the rows written and flushed", written).await;
+    count_settled().await;
     COUNTING.reset_peak();
     let before = COUNTING.now();
     let merged = within(MERGED_WITHIN, "the merge ended", writer.merge()).await;
@@ -550,6 +638,7 @@ async fn merge_measured(shape: Shape, at_once: usize) -> Measured {
         reckoned: builds.last_reckoned(),
         planned: builds.last_planned(),
         tokenized_at_once: writer.last_tokenized_at_once(),
+        spilled: writer.last_spilled(),
     }
 }
 
@@ -760,6 +849,28 @@ const RECKONED_WIDE: [Shape; 6] = [
     Shape::of(FEWER, NARROW, Text::Tags(12)),
 ];
 
+/// Merges whose peak is their frame going up: few rows of short text, wide
+/// vectors, and parts of 64 MiB, which a node may be set to upload in.
+/// Going up, a merge holds what was built, the segment's frame and a part
+/// of the vectors' frame: here more than building does, so that a
+/// reckoning that left the part out would read short of the peak by more
+/// than 30%. One frame is under a part, held whole as it goes up; the other
+/// is over one, held at most a part and a piece at a time. At the default
+/// 16 MiB, going up sets the peak of a few shapes above, those of wide
+/// vectors and short text, but by too little for the bounds to tell: left
+/// out, `part` reads them 10 to 12% short (run 41227992644).
+const RECKONED_GOING_UP: [Shape; 2] = [
+    Shape::of(FEWER, WIDER, Text::Short).going_up_in(LARGER_PART),
+    Shape::of(15_000, WIDER, Text::Short).going_up_in(LARGER_PART),
+];
+
+/// Vectors as wide as some models make them.
+const WIDER: usize = 1_536;
+
+/// A part a node's uploads may be set to go in, by `upload_part_mib`, which
+/// takes 5 to 5,120 MiB: larger than its default of 16.
+const LARGER_PART: usize = 64 * 1024 * 1024;
+
 /// A merge reckons what it holds at its peak to within 30% of what it is
 /// measured to hold once its rows are gathered, and to within half as it
 /// is planned, from what its run's segments hold (merge note, §7.6 and
@@ -788,7 +899,7 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
         .chain(&RECKONED_DEATHS)
         .chain(&RECKONED_WIDE);
     for shape in shapes {
-        let merge = merge_measured(*shape, AT_ONCE).await;
+        let merge = merge_measured(*shape, AT_ONCE, Gathered::InMemory).await;
         let off = |by: usize| (by as f64 - merge.peak as f64) / merge.peak as f64 * 100.0;
         eprintln!(
             "a merge of {shape:?} held {} bytes at its peak, reckoned {} ({:+.0}%), planned {} \
@@ -807,6 +918,177 @@ async fn a_merge_reckons_what_it_holds_at_its_peak_within_thirty_percent() {
             merge.peak,
             merge.reckoned,
             merge.planned,
+        );
+    }
+}
+
+/// M8-R5. The same bounds, over the same merges, of a merge whose vectors
+/// are gathered in the store's cache: reckoned, planned and gathered, at
+/// what it holds on the heap, which leaves its vectors out.
+///
+/// As the rule above: run optimised, in CI's Test job.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "measured optimised, in CI's Test job"]
+async fn a_merge_gathered_on_disk_reckons_what_it_holds_within_thirty_percent() {
+    let _alone = ALONE.lock().await;
+    let mut measured = Vec::new();
+    let shapes = RECKONED
+        .iter()
+        .chain(&RECKONED_RUNS)
+        .chain(&RECKONED_DEATHS)
+        .chain(&RECKONED_WIDE)
+        .chain(&RECKONED_GOING_UP);
+    for shape in shapes {
+        let merge = merge_measured(*shape, AT_ONCE, Gathered::OnDisk).await;
+        let off = |by: usize| (by as f64 - merge.peak as f64) / merge.peak as f64 * 100.0;
+        eprintln!(
+            "a merge gathered on disk of {shape:?} held {} bytes at its peak, reckoned {} \
+             ({:+.0}%), planned {} ({:+.0}%), {} bytes spilled",
+            merge.peak,
+            merge.reckoned,
+            off(merge.reckoned),
+            merge.planned,
+            off(merge.planned),
+            merge.spilled,
+        );
+        measured.push((shape, merge));
+    }
+    for (shape, merge) in &measured {
+        assert!(merge.spilled > 0, "{shape:?} gathered in memory");
+        within_bounds(
+            &format!("{shape:?}"),
+            merge.peak,
+            merge.reckoned,
+            merge.planned,
+        );
+    }
+    // Each merge set by going up is, by more than the bounds: reckoned at
+    // the default parts, which hold less of it, it reads more than 30%
+    // short of the peak measured at its own, so R5 at the default parts
+    // would fail it; without `part` it would read shorter still.
+    for (shape, merge) in measured.iter().filter(|(shape, _)| shape.part.is_some()) {
+        let default = Shape {
+            part: None,
+            ..**shape
+        };
+        let at_default = merge_measured(default, AT_ONCE, Gathered::OnDisk).await;
+        let short = (merge.peak as f64 - at_default.reckoned as f64) / merge.peak as f64;
+        eprintln!(
+            "a merge gathered on disk of {shape:?} reckoned {} at the default parts, \
+             {:.0}% of its peak short",
+            at_default.reckoned,
+            short * 100.0
+        );
+        assert!(
+            short > 0.3,
+            "{shape:?} is set by going up by {:.0}% of its peak, within the bounds",
+            short * 100.0
+        );
+    }
+}
+
+/// M8-R17: a clustered index's file, encoded as a merge encodes it once its
+/// build is done, holds at its peak what the merge reckons it to, within
+/// thirty percent: the body as it grows and the frame it is copied into,
+/// at files that fall at different points of the body's doubling.
+///
+/// As the rules above: run optimised, in CI's Test job.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "measured optimised, in CI's Test job"]
+async fn an_index_file_holds_as_it_is_encoded_what_a_merge_reckons_it_to() {
+    use vellev_core::Distance;
+    use vellev_index::clustered::ClusteredIndex;
+    let _alone = ALONE.lock().await;
+    for (rows, width) in [(5_000, 4), (4_096, 384), (20_000, 64), (12_000, 768)] {
+        let vectors: Vec<Vec<f32>> = (0..rows)
+            .map(|n| {
+                (0..width)
+                    .map(|at| ((n * 31 + at * 17) % 97) as f32 / 97.0 - 0.5)
+                    .collect()
+            })
+            .collect();
+        let rows_of: Vec<(u32, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(n, vector)| (n as u32, vector.as_slice()))
+            .collect();
+        let index = ClusteredIndex::build(Distance::Cosine, &rows_of).unwrap();
+        let file = SegmentIndex {
+            segment: "k".into(),
+            vectors: vec![(CollectionId(0), Arc::new(index))],
+        };
+        COUNTING.reset_peak();
+        let before = COUNTING.now();
+        let encoded = format::encode_as(Kind::Index, format::FORMAT_VERSION, &file).unwrap();
+        let held = COUNTING.peak() - before;
+        // The very factor the merge reckons it at, as its frame's.
+        let reckoned = encoded.len() as f64 * vellev_storage::ENCODED_AT_PEAK;
+        let off = (reckoned - held as f64) / held as f64;
+        eprintln!(
+            "an index file of {rows} x {width}, {} bytes, held {held} as it was \
+             encoded, reckoned {reckoned:.0} ({:+.0}%)",
+            encoded.len(),
+            off * 100.0
+        );
+        assert!(
+            off.abs() <= 0.3,
+            "an index file of {rows} x {width} held {held} as it was encoded, \
+             reckoned {reckoned:.0}: {:+.0}%",
+            off * 100.0
+        );
+    }
+}
+
+/// The merges whose vectors' heap is weighed: passages at three sizes, and
+/// a clustered one, whose training reads what is gathered.
+const SPILLED_BUILDS: [Shape; 4] = [
+    Shape::of(20_000, WIDE, Text::Passage),
+    Shape::of(100_000, WIDE, Text::Passage),
+    Shape::of(200_000, WIDE, Text::Passage),
+    Shape::of(20_000, WIDE, Text::Short).clustered(),
+];
+
+/// How much of its vectors' bytes a merge's heap peak must fall by, gathered
+/// on disk: they are all gone from it, but for what is held as the frame's
+/// last piece, where each row starts.
+const SPILL_SAVES_AT_LEAST: f64 = 0.9;
+
+/// M8-R2. A merge gathered on disk holds, at its peak on the heap, less than
+/// the same merge gathered in memory by at least 0.9 of its vectors' bytes,
+/// by the counting allocator: whatever stage sets the peak, its vectors
+/// are held at none of them.
+///
+/// As the reckoning's rule: run optimised, in CI's Test job.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "measured optimised, in CI's Test job"]
+async fn a_merge_gathered_on_disk_holds_none_of_its_vectors_on_the_heap() {
+    let _alone = ALONE.lock().await;
+    let mut measured = Vec::new();
+    for shape in SPILLED_BUILDS {
+        let in_memory = merge_measured(shape, AT_ONCE, Gathered::InMemory).await;
+        let on_disk = merge_measured(shape, AT_ONCE, Gathered::OnDisk).await;
+        let vectors = shape.rows * shape.dimensions * 4;
+        let saved = in_memory.peak as f64 - on_disk.peak as f64;
+        eprintln!(
+            "a merge of {shape:?} held {} bytes in memory and {} on disk, {:.3} of its {vectors} \
+             bytes of vectors less, {} bytes spilled",
+            in_memory.peak,
+            on_disk.peak,
+            saved / vectors as f64,
+            on_disk.spilled,
+        );
+        measured.push((shape, in_memory, on_disk));
+    }
+    for (shape, in_memory, on_disk) in measured {
+        let vectors = shape.rows * shape.dimensions * 4;
+        assert_eq!(in_memory.spilled, 0, "{shape:?}");
+        assert_eq!(on_disk.spilled, vectors, "{shape:?} gathered in memory");
+        let saved = in_memory.peak as f64 - on_disk.peak as f64;
+        assert!(
+            saved >= SPILL_SAVES_AT_LEAST * vectors as f64,
+            "{shape:?} saved {saved} of {vectors} bytes of vectors: {} in memory, {} on disk",
+            in_memory.peak,
+            on_disk.peak
         );
     }
 }
@@ -866,8 +1148,8 @@ async fn a_merge_holds_a_chunk_of_tokens_at_once_and_its_whole_build_no_more_for
     let _alone = ALONE.lock().await;
     let mut measured = Vec::new();
     for shape in WHOLE_BUILDS {
-        let all = merge_measured(shape, usize::MAX).await;
-        let chunked = merge_measured(shape, AT_ONCE).await;
+        let all = merge_measured(shape, usize::MAX, Gathered::InMemory).await;
+        let chunked = merge_measured(shape, AT_ONCE, Gathered::InMemory).await;
         let saved = (all.peak as f64 - chunked.peak as f64) / all.peak as f64;
         let off = |by: usize| (by as f64 - chunked.peak as f64) / chunked.peak as f64 * 100.0;
         eprintln!(
