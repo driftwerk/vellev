@@ -2241,11 +2241,21 @@ async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() 
         still_held, 1,
         "the merge after the hold was lost was stopped"
     );
-    tokio::time::timeout(Duration::from_secs(30), second)
+    let merged = tokio::time::timeout(Duration::from_secs(30), second)
         .await
         .expect("the merge after the hold was lost never ended")
-        .unwrap()
         .unwrap();
+    // Not stopped, it went on to its commit, which the lease taken afresh
+    // fenced.
+    assert!(
+        matches!(
+            merged,
+            Err(NodeError::Storage(StorageError::Coordinator(
+                CoordinatorError::Fenced { .. }
+            )))
+        ),
+        "{merged:?}"
+    );
 }
 
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
