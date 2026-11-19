@@ -898,6 +898,45 @@ async fn a_tail_under_a_flush_s_rows_is_flushed_as_its_tenant_is_let_go() {
     assert_eq!(opened.read(State::unflushed), 0, "its log was replayed");
 }
 
+/// Review B of #177, L6: a tenant whose last writes were deletes, with no
+/// row written since its last flush, still has what a flush takes: its
+/// tombstones. It is flushed as it is let go, and the next opener replays no
+/// log of them.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_whose_last_writes_were_deletes_is_flushed_as_it_is_let_go() {
+    let node = over_budget(memory());
+    node.timings().keep_events(true);
+    let writer = written(&node, "deleted", 2).await;
+    writer.flush().await.unwrap();
+    let held = node.tenant(&tenant("deleted")).await.unwrap();
+    held.write(vec![Mutation::Delete {
+        collection: CollectionName::new("notes").unwrap(),
+        id: ObjectId(uuid::Uuid::from_u128(1)),
+        only_if_version: None,
+    }])
+    .await
+    .unwrap();
+    assert_eq!(
+        held.read(State::unflushed),
+        0,
+        "a row written since the flush"
+    );
+    drop(held);
+    node.timings().drain_events();
+    unused_long_enough().await;
+    tokio::time::timeout(Duration::from_secs(5), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let events = node.timings().drain_events();
+    let held = events
+        .iter()
+        .filter(|event| event.timed == Timed::LetGoFlushHeld);
+    assert_eq!(held.count(), 1, "its deletes were not flushed: {events:?}");
+    let opened = node.tenant(&tenant("deleted")).await.unwrap();
+    assert_eq!(noted(&opened), 1, "the delete was lost");
+}
+
 /// The eviction flush's mark is held to flushes: a let-go with nothing to
 /// flush adds no sample to it, which a run of them would make read better
 /// than it is, and takes up no flush of its sweep's, so that one behind it
