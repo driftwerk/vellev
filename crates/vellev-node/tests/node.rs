@@ -2307,6 +2307,69 @@ async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
     refused("a flush", held.flush().await.map(drop));
 }
 
+/// Review of 97abfe6, L1: a compact looks at the hold before each merge,
+/// not only its first. The hold lost while its first merge waits to
+/// commit, past where a stop ends it, the merge commits, and the next one,
+/// with segments flushed meanwhile to merge, is refused: it takes no turn
+/// among the node's merge builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = Duration::from_secs(3);
+    });
+    let name = tenant("lost");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    let flushed_four = |from: u64| {
+        let held = held.clone();
+        async move {
+            for from in (from..from + 40).step_by(10) {
+                held.write(ten_notes(from)).await.unwrap();
+                held.flush().await.unwrap();
+            }
+        }
+    };
+    flushed_four(10).await;
+    let gate = held.hold_merges_before_commit();
+    let compacting = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+        .await
+        .expect("the first merge never came to its commit");
+    // Enough for a second merge, once the first has committed.
+    flushed_four(50).await;
+    let builds = node.merge_builds().clone();
+    let turns = builds.turns_taken();
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while held.write(ten_notes(90)).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the refused renewal never lost the hold");
+    assert_eq!(node.merges().stopped, vellev_node::MergesStopped::default());
+    held.writer().stop_holding_merges();
+    gate.release.notify_one();
+    let compacted = tokio::time::timeout(Duration::from_secs(30), compacting)
+        .await
+        .expect("the compact never ended")
+        .unwrap();
+    assert_eq!(builds.turns_taken(), turns, "the next merge took a turn");
+    assert!(
+        matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
+        "{compacted:?}"
+    );
+}
+
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
 /// opening resolves. One tenant still opening, its lease's acquire
 /// unanswered, holds up no other tenant's release.
