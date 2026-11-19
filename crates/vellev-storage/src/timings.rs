@@ -222,6 +222,10 @@ pub enum Timed {
     /// out, keeping it for the other reason, or finding the node no longer
     /// over its budget.
     Kept(KeptFor),
+    /// The same spell's upper end: from the first sweep that kept the
+    /// tenant so to the first that did not, or, for a spell still open, to
+    /// when it is read. The keep lay between the two.
+    KeptUpTo(KeptFor),
 }
 
 impl Timed {
@@ -241,6 +245,7 @@ impl Timed {
             Timed::LetGoFlushNotReached,
         ]);
         all.extend(KeptFor::ALL.map(Timed::Kept));
+        all.extend(KeptFor::ALL.map(Timed::KeptUpTo));
         all
     }
 
@@ -262,11 +267,12 @@ impl Timed {
             Timed::LetGoFlushQueued => 2 * holders + 2 * phases + 4,
             Timed::LetGoFlushNotReached => 2 * holders + 2 * phases + 5,
             Timed::Kept(why) => 2 * holders + 2 * phases + 6 + kept(why),
+            Timed::KeptUpTo(why) => 2 * holders + 2 * phases + 6 + KeptFor::ALL.len() + kept(why),
         }
     }
 }
 
-const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 6 + KeptFor::ALL.len();
+const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 6 + 2 * KeptFor::ALL.len();
 
 /// The bucket bounds, in seconds: a millisecond, and twice as long each
 /// time, to 2,097 seconds, about 35 minutes. Past the last is counted only

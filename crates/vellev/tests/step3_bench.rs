@@ -2076,13 +2076,18 @@ fn kept_over_budget_mark(events: &[Event]) -> Value {
     for why in KeptFor::ALL {
         let spells = secs(Timed::Kept(why));
         let longest = spells.last().copied();
+        let longest_upper = secs(Timed::KeptUpTo(why)).last().copied();
         let passed = match (longest, held_p99) {
             (None, _) => true,
             (Some(longest), Some(held)) => longest < 2.0 * held,
             (Some(_), None) => false,
         };
-        mark[why.name()] =
-            json!({ "passed": passed, "spells": spells.len(), "longest_s": longest });
+        mark[why.name()] = json!({
+            "passed": passed,
+            "spells": spells.len(),
+            "longest_s": longest,
+            "longest_upper_s": longest_upper,
+        });
         if !passed {
             mark["passed"] = json!(false);
         }
@@ -2316,6 +2321,37 @@ async fn a_keep_by_one_sweep_on_a_quiet_node_passes_the_keep_mark() {
     );
     let flush_p99 = mark["flush_held_p99_s"].as_f64().unwrap_or_default();
     assert!((2.0..2.5).contains(&flush_p99), "{mark}");
+    assert_eq!(mark["passed"], json!(true), "{mark}");
+}
+
+/// Review of ab07a2e, M1: the mark passes on a spell's first-to-last
+/// figure, and reports its upper end beside it, to the first sweep that did
+/// not keep the tenant, with no rule of its own. On a quiet node, a request
+/// holds a tenant 9.9 s, seen by one sweep, and the next sweep, at 10 s,
+/// takes it out: the spell reads near nothing, and its upper end 10 s, and
+/// the mark passes against a flush that held the lock 2 s.
+#[tokio::test(start_paused = true)]
+async fn a_keep_between_two_sweeps_reports_its_upper_end_beside_the_mark() {
+    let (node, held, ()) =
+        written_with_a_held_flush("between", 1, Duration::from_secs(2), |_| ()).await;
+    // Unused for long enough to be chosen, but held by the caller.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.kept_by_sweeps().held, 1, "{:?}", node.kept_by_sweeps());
+    tokio::time::sleep(Duration::from_millis(9_900)).await;
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(node.let_go().for_budget, 0, "let go before the next sweep");
+    node.sweep_now().await;
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    let mark = kept_over_budget_mark(&events);
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or(f64::MAX);
+    assert!(longest < 0.5, "{mark}");
+    let upper = mark["held"]["longest_upper_s"].as_f64().unwrap_or_default();
+    assert!((10.0..10.5).contains(&upper), "upper end {upper} s: {mark}");
     assert_eq!(mark["passed"], json!(true), "{mark}");
 }
 
@@ -2657,6 +2693,10 @@ fn reported(
         "kept.building".into(),
         summary(of(Timed::Kept(KeptFor::Building))),
     );
+    for why in KeptFor::ALL {
+        let upper = summary(of(Timed::KeptUpTo(why)));
+        timings.insert(format!("kept_up_to.{}", why.name()), upper);
+    }
 
     // Merge debt: each tenant carried forward while let go, from its
     // preload until it is first seen held.
