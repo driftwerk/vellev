@@ -856,8 +856,9 @@ const RECKONED_WIDE: [Shape; 6] = [
 /// reckoning that left the part out would read short of the peak by more
 /// than 30%. One frame is under a part, held whole as it goes up; the other
 /// is over one, held at most a part and a piece at a time. At the default
-/// 16 MiB, every shape above builds more than it holds going up, and so
-/// shows nothing of `part`.
+/// 16 MiB, going up sets the peak of a few shapes above, those of wide
+/// vectors and short text, but by too little for the bounds to tell: left
+/// out, `part` reads them 10 to 12% short.
 const RECKONED_GOING_UP: [Shape; 2] = [
     Shape::of(FEWER, WIDER, Text::Short).going_up_in(LARGER_PART),
     Shape::of(15_000, WIDER, Text::Short).going_up_in(LARGER_PART),

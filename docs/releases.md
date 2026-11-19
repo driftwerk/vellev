@@ -400,7 +400,9 @@ and say what the caller then answers for.
   answer, does not open, and is `unavailable` until it does.
 - **A merge gathers its vectors in the cache directory**, in a file of its
   own that becomes the merged segment's copy: what it holds in memory falls
-  by its vectors' bytes at every stage, and the disk is written as it
+  by its vectors' bytes at every stage but their upload, where it holds a
+  part of them and 4 MiB more, or all of them if that is less, as
+  `VELLEV_UPLOAD_PART_MIB` sets; and the disk is written as it
   gathers, not after it uploads, and holds that file for the whole build. A
   merge with too little room for it, and as much again or a gibibyte, is
   skipped, as `no_room` in `vellev_merges_ended_total` and in
@@ -408,8 +410,9 @@ and say what the caller then answers for.
   `vellev_merge_spill_failures_total` are new too. A round now cleans up
   whether or not its merge failed. Nothing stored changes, and a node with no
   cache directory gathers in memory as before. `vellev-storage`'s `Blobs`
-  gains `spills` and `put_spilled`, which a store over another forwards for
-  its merges to gather on disk; one that does not gathers in memory.
+  gains `spills`, `put_spilled` and `spilled_up_in_parts_of`, which a store
+  over another forwards for its merges to gather on disk and to be reckoned
+  as they go up; one that does not gathers in memory.
 - **Every object read carries `version`**: 32 hexadecimal characters, a
   hash of its properties and vector (docs/compatibility.md says exactly
   how), from `GET …/objects/{id}`, `/list`, `/nearest`, `/keyword` and
