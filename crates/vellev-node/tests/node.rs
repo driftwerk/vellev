@@ -2095,7 +2095,11 @@ async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
         .await
         .expect("shutdown waited for the stuck opening");
     let renewed = coordinator.lease_renewals.load(Ordering::SeqCst);
-    tokio::time::sleep(LEASE * 2).await;
+    // The cluster's clock goes on with the node's, a second at a time.
+    for _ in 0..(LEASE * 2).as_secs() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cluster.clock.advance(Duration::from_secs(1));
+    }
     assert!(!opening.is_finished(), "the opening ended");
     assert_eq!(
         coordinator.lease_renewals.load(Ordering::SeqCst),
