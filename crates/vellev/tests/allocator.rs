@@ -41,12 +41,20 @@ fn the_node_binary_gives_jemalloc_its_options() {
         .expect("nm, from binutils");
     let listing = std::io::BufReader::new(nm.stdout.take().expect("nm's output"));
     let export = listing
-        .lines()
-        .map_while(Result::ok)
-        .find(|line| line.ends_with(" _rjem_malloc_conf"));
-    let _ = nm.kill();
-    let _ = nm.wait();
-    let export = export.unwrap_or_else(|| panic!("{binary} does not export _rjem_malloc_conf"));
+        .split(b'\n')
+        .map(|line| line.expect("nm's output"))
+        .find(|line| line.ends_with(b" _rjem_malloc_conf"))
+        .map(|line| String::from_utf8_lossy(&line).into_owned());
+    // Found, nm is stopped and its status says nothing; not found, nm
+    // must have listed the whole binary, or the export may be there unseen.
+    if export.is_some() {
+        let _ = nm.kill();
+    }
+    let status = nm.wait().expect("nm's status");
+    let export = export.unwrap_or_else(|| {
+        assert!(status.success(), "nm could not list {binary}: {status}");
+        panic!("{binary} does not export _rjem_malloc_conf")
+    });
     let kind = export.split_whitespace().nth(1).unwrap_or_default();
     assert!(
         matches!(kind, "D" | "d" | "R" | "r"),
