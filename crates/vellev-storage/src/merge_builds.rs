@@ -248,8 +248,8 @@ pub enum Holding {
     /// Part way through gathering its rows, at each chunk of them it comes
     /// to with some copied, until let go, stopped or not: a long gather.
     GatheringUntilLetGo,
-    /// A flush's build, not a merge's, at its start, until its flush is
-    /// stopped: a build that would otherwise run on.
+    /// A flush's build, at its start, until its flush is stopped: a build
+    /// that would otherwise run on. No merge's or restore's.
     FlushUntilStopped,
 }
 

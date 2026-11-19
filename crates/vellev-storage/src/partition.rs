@@ -2374,7 +2374,8 @@ impl Writer {
             tokio::task::yield_now().await;
         }
         let named_at = snapshot.position;
-        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping);
+        let at = Some(HeldAt::Flush);
+        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping, at);
         let segment = match uploaded.await? {
             Some(prepared) => {
                 let prepared = FreedOff::new(prepared);
@@ -2466,7 +2467,13 @@ impl Writer {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match self
-                    .uploaded(&mut snapshot, restored, &mut staged, &Stopping::never())
+                    .uploaded(
+                        &mut snapshot,
+                        restored,
+                        &mut staged,
+                        &Stopping::never(),
+                        None,
+                    )
                     .await?
                 {
                     Some(prepared) => {
@@ -2900,13 +2907,15 @@ impl Writer {
     /// Build and upload a segment of the rows taken out of `snapshot` and
     /// its tombstones, its files named at `named_at`; none if it has
     /// neither. Given up, a failure, once `stopping` is stopped: asked as
-    /// the rows are indexed, and before and while each file goes up.
+    /// the rows are indexed, and before and while each file goes up. Its
+    /// build is held at `held_at`, if a test holds builds there.
     async fn uploaded(
         &self,
         snapshot: &mut Snapshot,
         named_at: LogPosition,
         staged: &mut Staged,
         stopping: &Stopping,
+        held_at: Option<HeldAt>,
     ) -> Result<Option<Prepared>> {
         if snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
             return Ok(None);
@@ -2927,7 +2936,8 @@ impl Writer {
             Ok(Some((file, Some(vectors), ())))
         };
         let catalog = snapshot.catalog.clone();
-        let built = self.built_stopping(rows, catalog, stopping, None).await?;
+        let built = self.built_stopping(rows, catalog, stopping, None, held_at);
+        let built = built.await?;
         let Some((built, ())) = built else {
             return Err(stopped());
         };
@@ -2977,18 +2987,20 @@ impl Writer {
     /// column; then encode both, sealing the gathered frame, off the async
     /// threads and out of the state's lock, before anything is written, so
     /// that neither readers nor commits wait while a large segment is
-    /// indexed. With what else `rows` says, giving up, `None`, if it comes to none, or once `stopping` is
-    /// stopped: asked as the rows are indexed, and before and after they
-    /// are encoded. `rows` is the work's first step, in the same turn off
-    /// the async threads, with no lock held: a merge gathers there, where
-    /// nothing waits on it. A merge's `build` is held by the work until it
-    /// ends, whoever stops waiting for it.
+    /// indexed. With what else `rows` says, giving up, `None`, if it comes
+    /// to none, or once `stopping` is stopped: asked as the rows are
+    /// indexed, and before and after they are encoded. `rows` is the work's
+    /// first step, in the same turn off the async threads, with no lock
+    /// held: a merge gathers there, where nothing waits on it. A merge's
+    /// `build` is held by the work until it ends, whoever stops waiting for
+    /// it. The work is held at `held_at`, if a test holds builds there.
     async fn built_stopping<T: Send + 'static>(
         &self,
         rows: impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<T> + Send + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
+        held_at: Option<HeldAt>,
     ) -> Result<Option<(Built, T)>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
@@ -3026,8 +3038,8 @@ impl Writer {
                 Some(build) => OnPool::merge(build),
                 None => OnPool::global(),
             };
-            if build.is_none() {
-                builds.held_here(&stopping, HeldAt::Flush);
+            if let Some(at) = held_at {
+                builds.held_here(&stopping, at);
             }
             let cpu = vellev_index::pool::thread_cpu();
             let built = match rows(&stopping, build.as_deref(), on) {
@@ -3512,7 +3524,8 @@ impl Writer {
             names.vectors.clone(),
             catalog.clone(),
         );
-        let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
+        let build_of = Some(build.clone());
+        let built = self.built_stopping(gather, catalog.clone(), stopping, build_of, None);
         let built = match built.await {
             // Skipped, not failed: what it would have written would have
             // filled the disk, and what frees that disk comes next. Tried
@@ -4979,7 +4992,13 @@ impl RestoreFrom<'_> {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match writer
-                    .uploaded(&mut snapshot, restored, &mut staged, &Stopping::never())
+                    .uploaded(
+                        &mut snapshot,
+                        restored,
+                        &mut staged,
+                        &Stopping::never(),
+                        None,
+                    )
                     .await?
                 {
                     Some(prepared) => {
