@@ -771,8 +771,9 @@ dead connection passes to another node rather than waiting with it:
   that have vectors.
 - A merge gathers its vectors in the cache directory, not in memory, in a
   file of its own named `<id>.spill`, each 4 MiB write a step as above. As
-  that file goes up, a part of it is in memory at a time and 4 MiB more,
-  or all of it if that is less: `VELLEV_UPLOAD_PART_MIB` sets how large. It
+  that file goes up, a part of it is in memory at a time, rounded up to
+  whole 4 MiB pieces, and 4 MiB more, or all of it if that is less:
+  `VELLEV_UPLOAD_PART_MIB` sets how large a part is. It
   takes the disk the merged segment's copy would take anyway, sooner: once
   the store has the file it becomes that copy, by a rename, and is not
   written again. So a node with its cache on a disk it can fill needs room
@@ -785,10 +786,11 @@ dead connection passes to another node rather than waiting with it:
   goes on to clean up, which is what frees that disk, as it does when a
   merge fails. A disk that fills all the same, or stops answering, fails the
   merge where it gathers, counted in `vellev_merge_spill_failures_total`,
-  leaves the file gone and commits nothing, and `vellev_merge_spill_bytes`
-  says how much such files hold: a file whose removal could not run, as
-  every thread of a disk that stopped answering was held, stays on disk and
-  is counted until the node next starts on the directory. A merge stopped, dropped or failed takes
+  and commits nothing. `vellev_merge_spill_bytes` says how much such files
+  hold for as long as they lie on disk: one whose removal failed, or could
+  not run as every thread of a disk that stopped answering was held, stays
+  and is counted until the node next starts on the directory. A merge
+  stopped, dropped or failed takes
   its file with it, on a thread nothing waits for; one left by a node that
   was killed goes as a node next starts on the directory, however new,
   and a file another process is still writing is left alone. Nothing sweeps

@@ -571,7 +571,8 @@ pub struct SpillsTold {
     /// again at what it took.
     pub looks_held: AtomicBool,
     /// How many takings up of a spill have ended, whatever came of them,
-    /// counted on the disk's thread as the last thing each does.
+    /// counted on the disk's thread as each step's own locals drop, before
+    /// what it took with it.
     pub taken_up_ended: AtomicU64,
     /// How many bytes the disk says are free, if not [`Self::ASK_THE_DISK`].
     pub free: AtomicU64,

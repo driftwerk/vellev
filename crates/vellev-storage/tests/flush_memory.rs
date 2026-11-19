@@ -858,7 +858,7 @@ const RECKONED_WIDE: [Shape; 6] = [
 /// is over one, held at most a part and a piece at a time. At the default
 /// 16 MiB, going up sets the peak of a few shapes above, those of wide
 /// vectors and short text, but by too little for the bounds to tell: left
-/// out, `part` reads them 10 to 12% short.
+/// out, `part` reads them 10 to 12% short (run 41227992644).
 const RECKONED_GOING_UP: [Shape; 2] = [
     Shape::of(FEWER, WIDER, Text::Short).going_up_in(LARGER_PART),
     Shape::of(15_000, WIDER, Text::Short).going_up_in(LARGER_PART),

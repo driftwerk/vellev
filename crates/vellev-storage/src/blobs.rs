@@ -192,10 +192,12 @@ pub trait Blobs: fmt::Debug + Send + Sync {
         None
     }
     /// How many bytes each part is that [`Self::put_spilled`] sends a
-    /// spill up in, a piece at a time, which is all it holds of one in
-    /// memory beside the piece that came after: `None` from a store that
-    /// puts a file whole, as by default, and so may hold all of it. A store
-    /// over another that forwards [`Self::spills`] forwards this too.
+    /// spill up in, read a 4 MiB piece at a time: it holds a part of one in
+    /// memory, rounded up to whole pieces, and the piece that comes after.
+    /// `None` from a store that puts a file whole, as by default, and so
+    /// may hold all of it. A store that forwards [`Self::put_spilled`] to
+    /// another forwards this too, or its merges are reckoned to hold whole
+    /// frames as they go up.
     fn spilled_up_in_parts_of(&self) -> Option<usize> {
         None
     }

@@ -231,7 +231,8 @@ pub struct Config {
     /// part but the last. A file may have at most 10,000 parts, so 16 MiB
     /// parts carry files up to 156 GiB. A merge whose vectors are gathered
     /// in the cache directory holds a part of them in memory as they go up,
-    /// and 4 MiB more, or all of them if that is less: larger parts cost a
+    /// rounded up to whole 4 MiB pieces, and 4 MiB more, or all of them if
+    /// that is less: larger parts cost a
     /// merge that much more memory at its peak.
     #[arg(long, env = "VELLEV_UPLOAD_PART_MIB", default_value_t = 16, value_parser = clap::value_parser!(u64).range(5..=5120))]
     pub upload_part_mib: u64,
