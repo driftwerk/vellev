@@ -1748,6 +1748,19 @@ enum LetGoFlush {
     Closed,
 }
 
+impl LetGoFlush {
+    /// Why it counts as skipped, if it does: not made, or not known to have
+    /// landed, while its tenant's hold was intact.
+    fn skipped_because(&self) -> Option<&'static str> {
+        match self {
+            Self::Done | Self::Superseded => None,
+            Self::Skipped => Some("flush before letting go skipped; the next opener replays its rows"),
+            Self::Unknown => Some("flush before letting go cut in its commit; its rows replay unless its commit landed"),
+            Self::Closed => Some("flush before letting go not made: the writer had closed; its rows replay unless its last commit landed"),
+        }
+    }
+}
+
 /// What `work` comes to, if it ends before `deadline`. Unlike
 /// `tokio::time::timeout_at`, it never polls `work` once the deadline has
 /// passed, so that work that has yet to begin does not.
@@ -2193,6 +2206,14 @@ pub struct KeptBySweeps {
 }
 
 impl KeptBySweeps {
+    /// How many were kept for `why`.
+    pub fn of(&self, why: KeptFor) -> u64 {
+        match why {
+            KeptFor::Held => self.held,
+            KeptFor::Building => self.building,
+        }
+    }
+
     fn count(&mut self, why: KeptFor) {
         match why {
             KeptFor::Held => self.held += 1,
@@ -3097,20 +3118,14 @@ impl Inner {
         let work = &tenant.work;
         match work.flush_to_let_go(&mut building, flushes, deadline).await {
             Ok(LetGoFlush::Done) => {}
-            Ok(LetGoFlush::Skipped) => {
-                self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(tenant = %tenant.id(), "flush before letting go skipped; the next opener replays its rows");
-            }
             Ok(LetGoFlush::Superseded) => {
                 tracing::info!(tenant = %tenant.id(), "flush before letting go not made: the hold on the tenant was lost");
             }
-            Ok(LetGoFlush::Closed) => {
-                self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(tenant = %tenant.id(), "flush before letting go not made: the writer had closed; its rows replay unless its last commit landed");
-            }
-            Ok(LetGoFlush::Unknown) => {
-                self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(tenant = %tenant.id(), "flush before letting go cut in its commit; its rows replay unless its commit landed");
+            Ok(flush) => {
+                if let Some(why) = flush.skipped_because() {
+                    self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(tenant = %tenant.id(), "{why}");
+                }
             }
             Err(error) => {
                 tracing::warn!(tenant = %tenant.id(), %error, "flush before letting go failed");

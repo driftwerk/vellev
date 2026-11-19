@@ -736,8 +736,9 @@ impl Collector for Counted {
             None,
             counter.metric_type(),
         )?;
-        for (reason, count) in [("held", kept.held), ("building", kept.building)] {
-            ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
+        for why in KeptFor::ALL {
+            let reason = [("reason", why.name())];
+            ConstCounter::new(kept.of(why)).encode(family.encode_family(&reason)?)?;
         }
         let counter = ConstCounter::new(node.tenants_given_up());
         counter.encode(encoder.encode_descriptor(
