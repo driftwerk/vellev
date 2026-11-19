@@ -480,7 +480,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
         ),
         (
             "kept_for_building_seconds",
-            "Each spell sweeps over the memory budget kept a tenant for its busy building lock, nothing else holding it",
+            "Spells sweeps over the memory budget kept a tenant for its busy building lock alone",
             Timed::KeptForBuilding,
         ),
     ] {
@@ -490,7 +490,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "flush_to_let_go_seconds",
-        "The flush before a tenant is let go: its wait for a sweep's flush slot (wait), that wait split into one that got a slot (queued) and one the deadline cut first (not_reached), and the flush (held)",
+        "A let-go's flush: its wait for a slot (wait; split as queued and not_reached) and its hold (held)",
         "part",
         [
             ("wait", timings.seconds(Timed::LetGoFlushWait)),
@@ -730,7 +730,7 @@ impl Collector for Counted {
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants a sweep chose to let go but kept for a later one: something else held it (held), or its building lock was busy (building)",
+            "Tenants a sweep chose to let go but kept, by reason: held elsewhere (held) or building lock busy (building)",
             None,
             counter.metric_type(),
         )?;

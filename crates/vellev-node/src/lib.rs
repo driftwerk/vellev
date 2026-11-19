@@ -1210,9 +1210,7 @@ impl Tenant {
     /// Whether nothing holds the tenant's work but the tenant: no round of
     /// its maintenance is under way, no flush of its flush task, nor is a
     /// restore ending. Neither task holds a [`Tenant`], so only this says
-    /// so. Until a sweep can tell a tenant whose merge it would spare from
-    /// one it can let go (node memory note, M7b), a round or a flush keeps
-    /// its tenant, as when rounds held the tenant itself.
+    /// so. A round or a flush under way keeps its tenant from a sweep.
     fn between_rounds(&self) -> bool {
         Arc::strong_count(&self.work) == 1
     }
@@ -1449,13 +1447,10 @@ impl TenantWork {
         flushed.map_err(|error| self.failed(error))
     }
 
-    /// As [`Tenant::flush`], whatever the rows, made before the tenant is let
-    /// go under `building`, the lock taken as it was taken out, if there is
-    /// anything to flush: so that a let-go with nothing to flush takes none
-    /// of `flushes` and adds no sample to the mark the merge bench holds the
-    /// wait to (merge note, §3). Its wait for one of `flushes`, and its hold,
-    /// are timed under their own name. Cut by `deadline`, the sweep's for
-    /// all it lets go, it is no flush that failed: see [`Self::cut_short`].
+    /// As [`Tenant::flush`], whatever the rows, under `building`, as the
+    /// tenant is let go: once one of `flushes` is free, and until `deadline`.
+    /// With nothing to flush it takes no slot. See [`LetGoFlush`] for what
+    /// it comes to.
     async fn flush_to_let_go(
         &self,
         building: &mut BuildingHeld,
@@ -1728,8 +1723,9 @@ enum LetGoFlush {
     Superseded,
 }
 
-/// What `work` comes to, if it ends before `deadline`: never polled once the
-/// deadline has passed, so that work that has yet to begin does not.
+/// What `work` comes to, if it ends before `deadline`. Unlike
+/// `tokio::time::timeout_at`, it never polls `work` once the deadline has
+/// passed, so that work that has yet to begin does not.
 async fn before<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
     tokio::select! {
         biased;
@@ -1748,27 +1744,16 @@ const RESTORE_WAITS: usize = 3;
 /// memory budget.
 const RESIDENT_AT_LEAST: Duration = Duration::from_secs(1);
 
-/// By default, how long a sweep gives the flushes of all the tenants it lets go, from
-/// when it took them out: what is left unflushed by then is in the log, and
-/// the next opener replays it. Sweeps run one at a time, so that a flush
-/// that hangs would hold every let-go of the node.
+/// The default [`Settings::let_go_flush_within`].
 pub const LET_GO_FLUSH_WITHIN: Duration = Duration::from_secs(30);
 
-/// By default, how many tenants a sweep flushes at once as it lets them go: enough that
-/// none waits long on one slow flush, and few enough that a sweep of many
-/// does not build them all together, on top of the merges and flushes of the
-/// tenants that stay.
+/// The default [`Settings::let_go_flushes_at_once`].
 pub const LET_GO_FLUSHES_AT_ONCE: usize = 2;
 
-/// By default, how long giving a lease up early is waited for. A lease not given up runs
-/// out, and costs the next node to want it that wait, which is little beside
-/// a sweep held, so that this is shorter than a coordinator's own bound on
-/// a call by default.
+/// The default [`Settings::release_within`].
 pub const RELEASE_WITHIN: Duration = Duration::from_secs(5);
 
-/// By default, how many leases a sweep gives up at once: few beside the
-/// coordinator's pool of connections, which live tenants' renewals and
-/// commits share.
+/// The default [`Settings::releases_at_once`].
 pub const RELEASES_AT_ONCE: usize = 4;
 
 /// The least time from the start of one clean beside a tenant's merges to
@@ -1862,10 +1847,10 @@ impl Taken {
                     .is_some_and(|now| Arc::ptr_eq(now, opening));
                 let unheld = Arc::strong_count(opening) == 2 && Arc::strong_count(tenant) == 2;
                 let free_of_others = same && unheld && tenant.between_rounds();
-                // Tried last: held from here, so tried only of one that goes.
+                // The lock last: once taken, it is held.
                 let building = free_of_others
-                    .then(|| tenant.work.writer.building_if_free())
-                    .flatten();
+                    .then_some(tenant)
+                    .and_then(|tenant| tenant.work.writer.building_if_free());
                 if let Some(building) = building {
                     open.tenants.remove(&held.id);
                     let tenant = tenant.clone();
@@ -2863,13 +2848,10 @@ impl Inner {
     /// request holds or is opening.
     ///
     /// A sweep waits on no lock of a tenant's: one whose building lock is
-    /// busy is kept for a later sweep. Those it takes out are let go together,
-    /// [`Settings::let_go_flushes_at_once`] flushing at once, for
-    /// [`Settings::let_go_flush_within`] among them all. Every one of them goes by then,
-    /// with its flush skipped if need be, as what is left is in the log.
-    /// Their leases are then given up, [`Settings::releases_at_once`] at once,
-    /// within [`Settings::release_within`] among them all: one not begun by
-    /// then runs out.
+    /// busy is kept for a later sweep. Those it takes out are flushed within
+    /// [`Settings::let_go_flush_within`], and their leases then given up
+    /// within [`Settings::release_within`]: what is left unflushed is in the
+    /// log, and a lease not given up runs out.
     ///
     /// Over the budget, a tenant chosen that something else holds, as a
     /// request or its maintenance does while it merges, has its merge
@@ -2960,11 +2942,9 @@ impl Inner {
         join_all(gone.into_iter().map(releasing)).await;
     }
 
-    /// Flush `going` as far as `flushes` and `deadline` let it, then lose the
-    /// hold on it with its building lock still held, so that no commit is cut
-    /// and whatever queued for the lock is stopped before it has it. What is
-    /// left of it is its lease, to give up once the sweep's flushes end:
-    /// the tenant itself is let go of here.
+    /// Flush `going`, then lose the hold on it with its building lock still
+    /// held, so that whatever queued for the lock is stopped before it has
+    /// it. Its lease is returned, to give up once every flush has ended.
     async fn let_go_of(
         &self,
         going: Going,

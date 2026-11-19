@@ -1315,7 +1315,8 @@ impl RefusalGate {
 /// timed as it is let go.
 struct Building<'a> {
     /// The lock, unless whoever asked holds it, and goes on holding it past
-    /// this: see [`BuildingHeld::flush`].
+    /// this: see [`BuildingHeld::flush`]. One type with an optional guard,
+    /// not a borrowed variant, so that `Drop`'s timing is written once.
     _guard: Option<MutexGuard<'a, ()>>,
     holder: Holder,
     since: Instant,
@@ -1360,14 +1361,9 @@ pub struct BuildingHeld {
 
 impl BuildingHeld {
     /// As [`Writer::flush`], whatever the rows, under this lock, which is
-    /// held on past it: as a node flushes a tenant it lets go, whose lock it
-    /// took as it took the tenant out, and holds until the hold on the
-    /// tenant is lost. Says how long it held the lock for its flush, its
-    /// whole build and commit, or `None` if it found nothing to flush and so
-    /// built nothing. Having no wait for the lock, it times none. Its build
-    /// and its upload give up once `stop` is stopped, as a merge's do: work
-    /// off the async threads, which dropping the flush does not reach, then
-    /// lets go of what it holds.
+    /// held on past it. Says how long it held the lock, or `None` if it
+    /// found nothing to flush. Its build and upload, off the async threads,
+    /// give up once `stop` is stopped: dropping the flush does not reach them.
     pub async fn flush(&mut self, stop: &Stop) -> Result<(LogPosition, Option<Duration>)> {
         let (writer, adopted) = (&self.writer, &self.adopted);
         adopted.store(false, Ordering::SeqCst);
@@ -2229,9 +2225,8 @@ impl Writer {
         })
     }
 
-    /// The building lock, once it is free, held for as long as what is
-    /// returned is kept, by a test: it holds no tenant of a node's, and so
-    /// reaches what only a sweep that finds nothing else holding one sees.
+    /// Test hook: wait for the building lock, and hold it for as long as
+    /// what is returned is kept.
     #[doc(hidden)]
     pub async fn building_when_free(self: &Arc<Self>) -> BuildingHeld {
         let guard = self.building.clone().lock_owned().await;

@@ -1,8 +1,8 @@
 //! A node's sweeps (resident accounting PR 1, delta reviews of #165): one
 //! at a time, so that no sweep holds what another must find held by
 //! nothing else; and those asked for as tenants are used coalesced, so
-//! that a sweep held up, as by a flush that hangs, never has a sweep a
-//! request queued behind it.
+//! that a sweep held up, as by a slow flush, never has a sweep a request
+//! queued behind it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -223,8 +223,9 @@ fn written_for(node: &Node) -> Vec<String> {
 }
 
 /// Delta review of #165, M1: every use of a tenant over the budget asks for
-/// a sweep, and a sweep can hang in the flush of a tenant it lets go. Those
-/// asked for meanwhile are coalesced: while one sweep is held in a flush,
+/// a sweep, and a sweep can be held, for up to its deadline, in the flush
+/// of a tenant it lets go. Those asked for meanwhile are coalesced: while
+/// one sweep is held in a flush,
 /// a thousand uses of a tenant leave at most one more sweep to run once it
 /// ends, not a thousand queued behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -480,10 +481,9 @@ async fn the_flush_before_letting_a_tenant_go_is_timed_under_its_own_name() {
     assert_eq!(named(Timed::BuildingHeld(Holder::Flush)), 1, "{events:?}");
 }
 
-/// M7-R5: a sweep waits on no lock of a tenant's. A tenant chosen with its
-/// building lock held, by what holds nothing that would keep it otherwise,
-/// is kept, however long that lasts; the sweep ends in moments, and a second
-/// tenant goes in it. The first goes at the first sweep once the lock is free.
+/// M7-R5: a sweep waits on no lock of a tenant's. A tenant whose building
+/// lock is held is kept, while the sweep ends in moments with a second
+/// tenant gone; the first goes once the lock is free.
 #[tokio::test(start_paused = true)]
 async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
     let node = over_budget(memory());
@@ -743,15 +743,12 @@ async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
     assert_eq!(noted(&reopened), 2, "rows lost");
 }
 
-/// M7-R5b, nothing else in the gap: the tenant's own flush task comes to try
-/// again as the tenant waits among those a sweep flushes, its building lock
-/// taken as it was taken out. It queues behind that lock, and never has it:
-/// the flush that goes through is the let-go's, under the lock it was taken
-/// with, and losing the hold ends what queued. That the task queued is
-/// asserted (review A of #177, L5), so that a backoff that misses the gap
-/// fails the rule rather than passing it. The order of `lose` and the drop
-/// of the lock is not shown here: on this runtime nothing runs between them,
-/// so only a multi-thread runtime could see it, and only by a race.
+/// M7-R5b: the tenant's flush task, trying again while the tenant waits
+/// among a sweep's let-gos, queues behind the building lock taken with it
+/// and never has it: losing the hold ends what queued. That it queued is
+/// asserted (review A of #177, L5). The order of `lose` and the lock's drop
+/// is not shown: on this runtime nothing runs between them, so only a
+/// multi-thread runtime could see it, and only by a race.
 #[tokio::test(start_paused = true)]
 async fn a_flush_queued_behind_a_let_go_never_runs() {
     let store = HeldPuts::new();
