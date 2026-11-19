@@ -1864,10 +1864,13 @@ impl Taken {
                         true => self.kept_for_building += 1,
                         false => self.held_elsewhere += 1,
                     }
-                    if free_of_others && for_budget {
+                    if for_budget {
+                        let why = match free_of_others {
+                            true => KeptFor::Building,
+                            false => KeptFor::Held,
+                        };
                         let partition = tenant.work.writer.lease().key.to_string();
-                        let kept = (held.id.clone(), KeptFor::Building, partition);
-                        self.kept_for_budget.push(kept);
+                        self.kept_for_budget.push((held.id.clone(), why, partition));
                     }
                 }
                 false
