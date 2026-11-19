@@ -402,16 +402,27 @@ impl Settings {
     }
 
     /// Why a sweep could not let tenants go by these settings, if it could
-    /// not: with no flush at once, it would skip every one, and with no
-    /// release at once, it would give up no lease.
+    /// not: with no flush at once, or no time for them, it would skip every
+    /// one; with no release at once, or no time for them, it would give up
+    /// no lease; and more at once than a semaphore holds would panic.
     pub fn let_go_problem(&self) -> Option<String> {
-        if self.let_go_flushes_at_once == 0 {
+        let most = Semaphore::MAX_PERMITS;
+        if self.let_go_flushes_at_once == 0 || self.let_go_flush_within.is_zero() {
             return Some(
-                "a sweep that flushes no tenant at once would skip every let-go flush".into(),
+                "a sweep that flushes no tenant at once, or gives its flushes no time, \
+                 would skip every let-go flush"
+                    .into(),
             );
         }
-        (self.releases_at_once == 0)
-            .then(|| "a sweep that releases no lease at once would give up no lease".into())
+        if self.releases_at_once == 0 || self.release_within.is_zero() {
+            return Some(
+                "a sweep that releases no lease at once, or gives its releases no time, \
+                 would give up no lease"
+                    .into(),
+            );
+        }
+        (self.let_go_flushes_at_once > most || self.releases_at_once > most)
+            .then(|| format!("a sweep can flush or release at most {most} at once"))
     }
 
     /// The most rows a tenant holds unflushed, as these settings say.
