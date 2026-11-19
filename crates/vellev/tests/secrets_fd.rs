@@ -297,8 +297,6 @@ fn a_good_payload_is_taken_and_never_repeated() {
     let _ = node.0.kill();
     let status = node.0.wait().unwrap();
     let warned = matches!(stop, Stop::Warned);
-    // Everything it said to the end, the lines in flight at the kill
-    // included.
     let (said, why) = match stop {
         Stop::Warned => (rest(&out, said), "after the warning"),
         Stop::Ended => (Ok(said), "its stdout ended"),
