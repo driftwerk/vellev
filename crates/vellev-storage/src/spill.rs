@@ -100,7 +100,9 @@ impl Spills {
         }
     }
 
-    /// What has been spilled here, so far.
+    /// What has been spilled here, so far. Counted by the process: a
+    /// spill whose name could not be removed stays counted until it ends,
+    /// even once a cache opened again on the directory has swept it.
     pub fn figures(&self) -> SpillFigures {
         self.disk.spills_counted().figures()
     }
@@ -178,13 +180,15 @@ impl Drop for Name {
             if let Some(told) = told {
                 told.unlinks();
             }
+            // Counted for as long as it lies on disk: one that cannot be
+            // removed stays counted as long as the process runs, as the
+            // count is the process's; a node that starts again sweeps it.
             match std::fs::remove_file(&path) {
-                Ok(()) => {}
+                Ok(()) => counted.gone(frame),
                 // Already gone, as by a cache emptied under it.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => counted.gone(frame),
                 Err(error) => tracing::warn!(?path, %error, "a spill could not be removed"),
             }
-            counted.gone(frame);
             if let Some(told) = ran {
                 told.unlinked.fetch_add(1, Ordering::SeqCst);
             }
