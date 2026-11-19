@@ -25,23 +25,44 @@ static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// environment, and waits for it to stop, for a minute at most: a node
 /// that wrongly took the payload would wait for its database for ever, so
 /// it is then killed (and reaped) and the test fails, rather than hanging.
+/// Its output is drained while it runs, so a node saying a lot can't block
+/// on a full pipe and look like one that never stopped.
 fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
+    use std::io::Read;
     let mut child = start(payload, env);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let stopped = loop {
-        if child.try_wait().unwrap().is_some() {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    let drain = |mut from: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let _ = from.read_to_end(&mut all);
+            all
+        })
     };
-    if !stopped {
-        let _ = child.kill();
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(stopped, "the node didn't stop: {}", stderr(&output));
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => break None,
+        }
+    };
+    let stopped = status.is_some();
+    let status = match status {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            child.wait().unwrap()
+        }
+    };
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    };
+    assert!(stopped, "the node didn't stop: {}", self::stderr(&output));
     output
 }
 

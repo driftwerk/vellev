@@ -14,17 +14,17 @@
 //! close-on-exec), and anything else is refused untouched; once taken it is
 //! made close-on-exec, and a non-blocking one is waited for with its flag
 //! (the read end's, shared with every copy of that end) left as it is. A
-//! pipe named by mistake that passes these checks loses what is read from
-//! it before it is refused. The supervisor writes
-//! the payload once and closes its end before the node starts, and no other
-//! copy of the write end may survive anywhere, in other children of the
-//! supervisor included: the node reads the frame and then the pipe's end,
-//! so bytes written after the frame, or a name given twice in it, are
-//! refused, and a write end still open elsewhere, like a supervisor that
-//! never writes, is an error at the deadline (saying which) rather than a
-//! node waiting for ever. The node then exits refused, and its supervisor
-//! sees a start that failed. Errors name one of the two variables or a
-//! position, never a value, nor a name the node doesn't take.
+//! pipe named by mistake that passes these checks loses what is read from it
+//! before it is refused. The supervisor writes the payload once and closes
+//! its end before the node starts, and no other copy of the write end may
+//! survive anywhere, in other children of the supervisor included: the node
+//! reads the frame and then the pipe's end, so bytes written after the
+//! frame, or a name given twice in it, are refused, and a write end still
+//! open elsewhere, like a supervisor that never writes, is an error at the
+//! deadline (saying which) rather than a node waiting for ever. The node
+//! then exits refused, and its supervisor sees a start that failed. Errors
+//! name one of the two variables or a position, never a value, nor a name
+//! the node doesn't take.
 //!
 //! Only these two take the pipe: embedding keys and an object store's
 //! credentials still come from the environment. On Linux another process
@@ -79,9 +79,9 @@ impl std::fmt::Debug for Inherited {
 impl Inherited {
     /// Reads the descriptor `fd`, handed down by a supervisor for this
     /// alone, and closes it by the time it returns (but should a read block
-    /// past the deadline, which only something else draining the pipe can
-    /// cause: the reader is then left holding it, and the node, refused,
-    /// exits).
+    /// well past the deadline, through something else draining the pipe or
+    /// the reader starved, the reader may be left holding it while the node,
+    /// refused, exits).
     ///
     /// The number is looked at without being taken: one that isn't open,
     /// isn't a pipe, or is close-on-exec (so was opened in this process,
@@ -167,7 +167,8 @@ impl Inherited {
     /// Reads a framed payload from the pipe `fd` within `within`, and
     /// closes it by the time it returns, but should a read block well past
     /// the deadline (something else draining the pipe, or the reader
-    /// starved): the reader is then left holding it until the process exits.
+    /// starved), the reader may be left holding it until its read ends or
+    /// the process exits.
     pub(crate) fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
@@ -196,7 +197,7 @@ impl Inherited {
             .spawn(move || {
                 let read = Self::read_frame(&mut file, deadline);
                 // Closed before the answer is sent, so it is closed by the
-                // time this returns, not some time after.
+                // time this returns, unless this read outlives the backstop.
                 drop(file);
                 let _ = tx.send(read);
             })
@@ -985,7 +986,7 @@ mod tests {
             writer.write_all(b"++++").unwrap();
             drop(writer);
             inherited(&reader);
-            // A second open of the same pipe sees the flag it shares.
+            // A copy of the read end (a dup) sees the flag it shares.
             let other = reader.try_clone().unwrap();
             let fd = reader.into_raw_fd();
             assert!(take(fd).is_err());
@@ -1009,9 +1010,9 @@ mod tests {
             drop((pin, writer));
         }
 
-        /// A supervisor whose pipe is non-blocking (shared with the node,
-        /// as the flag belongs to the open pipe) is still waited for until
-        /// the deadline, not failed at once.
+        /// A supervisor whose pipe is non-blocking (the flag belongs to the
+        /// read end, so a copy the supervisor kept shares it) is waited for
+        /// until the deadline, not failed at once.
         #[test]
         fn a_non_blocking_pipe_is_waited_for() {
             let (reader, mut writer) = std::io::pipe().unwrap();
