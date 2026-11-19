@@ -772,6 +772,19 @@ async fn a_sweep_flushes_two_tenants_at_once_and_no_more() {
     assert_eq!(waited.len(), 3, "{events:?}");
     let least = |at_least: Duration| waited.iter().filter(|took| **took >= at_least).count();
     assert_eq!(least(flush), 1, "one waited behind the others: {waited:?}");
+    // The wait split in two (overseer's ruling on review B of #177, M2):
+    // each that had a slot is queued for as long as its wait, and none was
+    // not reached.
+    let of = |timed: Timed| -> Vec<Duration> {
+        let events = events.iter().filter(|event| event.timed == timed);
+        events.map(|event| event.took).collect()
+    };
+    assert_eq!(of(Timed::LetGoFlushQueued), waited, "{events:?}");
+    assert_eq!(
+        of(Timed::LetGoFlushNotReached),
+        Vec::<Duration>::new(),
+        "{events:?}"
+    );
 }
 
 /// Review B of #177, L7: how many a sweep flushes at once is a setting. A
@@ -849,6 +862,19 @@ async fn one_deadline_ends_a_sweep_s_flushes_and_those_not_reached_replay() {
     assert_eq!(waited.len(), 4, "{events:?}");
     let whole = waited.iter().filter(|took| **took >= LET_GO_FLUSH_WITHIN);
     assert_eq!(whole.count(), 2, "not reached, so not told: {waited:?}");
+    // The wait split in two (overseer's ruling on review B of #177, M2): the
+    // two that had a slot are queued, the two the deadline reached first are
+    // not reached, each for the whole of what the flushes are given.
+    let named = |timed: Timed| events.iter().filter(move |event| event.timed == timed);
+    assert_eq!(named(Timed::LetGoFlushQueued).count(), 2, "{events:?}");
+    let not_reached: Vec<Duration> = named(Timed::LetGoFlushNotReached)
+        .map(|event| event.took)
+        .collect();
+    assert_eq!(not_reached.len(), 2, "{events:?}");
+    assert!(
+        not_reached.iter().all(|took| *took >= LET_GO_FLUSH_WITHIN),
+        "{not_reached:?}"
+    );
     // Review A of #177, L1: the two begun, as `reached` says, were cut, and
     // a cut hold is no flush's hold, nor a let-go flush's.
     let held = |timed: Timed| events.iter().filter(|event| event.timed == timed).count();

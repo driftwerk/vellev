@@ -190,6 +190,12 @@ pub enum Timed {
     LetGoFlushWait,
     /// The same flush's hold of the lock: its whole build and commit.
     LetGoFlushHeld,
+    /// [`Timed::LetGoFlushWait`] of a let-go that had one of its sweep's
+    /// flushes: its wait in the queue for it.
+    LetGoFlushQueued,
+    /// [`Timed::LetGoFlushWait`] of a let-go that its sweep's deadline
+    /// reached before it had one of its flushes, so that it never began.
+    LetGoFlushNotReached,
 }
 
 impl Timed {
@@ -205,6 +211,8 @@ impl Timed {
             Timed::Backlog,
             Timed::LetGoFlushWait,
             Timed::LetGoFlushHeld,
+            Timed::LetGoFlushQueued,
+            Timed::LetGoFlushNotReached,
         ]);
         all
     }
@@ -223,11 +231,13 @@ impl Timed {
             Timed::Backlog => 2 * holders + 2 * phases + 1,
             Timed::LetGoFlushWait => 2 * holders + 2 * phases + 2,
             Timed::LetGoFlushHeld => 2 * holders + 2 * phases + 3,
+            Timed::LetGoFlushQueued => 2 * holders + 2 * phases + 4,
+            Timed::LetGoFlushNotReached => 2 * holders + 2 * phases + 5,
         }
     }
 }
 
-const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 4;
+const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 6;
 
 /// The bucket bounds, in seconds: a millisecond, and twice as long each
 /// time, to 2,097 seconds, about 35 minutes. Past the last is counted only
