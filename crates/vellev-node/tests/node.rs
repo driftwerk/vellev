@@ -2128,6 +2128,9 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
         settings.lease = lease;
         settings.release_within = Duration::from_millis(100);
     });
+    // The tenant's renewal wakes a third of its lease after its lease is
+    // asked for, so no sooner than this.
+    let renewal = tokio::time::Instant::now() + lease / 3;
     let name = tenant("merging");
     node.create_tenant(&name).await.unwrap();
     let held = node.tenant(&name).await.unwrap();
@@ -2157,12 +2160,21 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
     })
     .await
     .expect("the merge after shutdown never came to build");
-    // Past the tenant's next renewal, a third of its lease on.
-    tokio::time::sleep(lease / 2).await;
-    let merged = merging.is_finished();
+    assert!(
+        tokio::time::Instant::now() < renewal,
+        "the merge came to build only after the renewal was due"
+    );
+    // Past the renewal, which asks for its lease in no time.
+    tokio::time::sleep_until(renewal + lease / 6).await;
+    let still_held = builds.held();
     builds.hold(None);
     assert_eq!(stopped(), 0, "{:?}", node.merges().stopped);
-    assert!(!merged, "the merge after shutdown was stopped");
+    assert_eq!(still_held, 1, "the merge after shutdown was stopped");
+    let merged = tokio::time::timeout(Duration::from_secs(30), merging)
+        .await
+        .expect("the merge after shutdown never ended")
+        .unwrap();
+    assert!(matches!(merged, Ok(Some(_))), "{merged:?}");
 }
 
 /// Review of 038be00, M1: a hold is lost once, whoever finds it lost. Its
