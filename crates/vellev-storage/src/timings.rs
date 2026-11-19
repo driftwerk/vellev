@@ -223,8 +223,7 @@ pub enum Timed {
     Kept(KeptFor),
     /// The same spell's upper end: from the first sweep that kept the
     /// tenant so to the first that did not, or, for a spell still open, to
-    /// when it is read. The keep lay between the two. For a bench: no
-    /// metric serves it.
+    /// when it is read. For a bench: no metric serves it.
     KeptUpTo(KeptFor),
 }
 

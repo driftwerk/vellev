@@ -575,9 +575,8 @@ A node of an earlier release does not know the flag and exits with status
     no bound. Shutdown gives its tenants' leases up the same way, each as
     its opening resolves, four at a time and all within 5 s, where it gave
     them up one after another. Those not given up by then run out with
-    their lease. An opening still running then is not waited for: it gives
-    its lease up itself once it ends, and the node renews no lease once it
-    has shut down. A sweep or a shutdown logs one warning counting the
+    their lease. An opening still running then is not waited for, and
+    renews no hold: the node renews none once it has shut down. A sweep or a shutdown logs one warning counting the
     leases it did not give up, not one for each.
     The 30 s, the two flushes and the four releases at once, and the 5 s
     are fixed at these defaults for a node run as `vellev`, with no

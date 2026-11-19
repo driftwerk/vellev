@@ -1838,8 +1838,8 @@ impl Releases {
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
 
-/// Warn once if any of the leases of `by` releases, as `sent` says of
-/// each, was not sent, as those releases ran out of time.
+/// Warn once, with their count, of the leases `by` releases did not send
+/// in time.
 fn warn_unsent(sent: impl IntoIterator<Item = bool>, by: &str) {
     let unsent = sent.into_iter().filter(|sent| !sent).count();
     if unsent > 0 {
@@ -1848,8 +1848,10 @@ fn warn_unsent(sent: impl IntoIterator<Item = bool>, by: &str) {
 }
 
 /// Lose the hold on what `opening` opens, if it opens, on a task of its
-/// own: the guard for an opening shutdown did not wait for that passed its
-/// check of the node stopped just before shutdown stopped it.
+/// own: for an opening shutdown did not wait for that passed its check of
+/// the node stopped just before shutdown stopped it. It stops the tenant's
+/// tasks at once, not at its next renewal, so that no flush commits
+/// between.
 fn lost_once_opened(opening: Opening) {
     tokio::spawn(async move {
         let unopened = || async { Err(NodeError::Stopped) };
@@ -2112,7 +2114,9 @@ struct Inner {
     sweep_on_time: AtomicBool,
     /// Where a test holds each sweep as it is about to take tenants out.
     sweep_hold: Mutex<Option<Arc<SweepHold>>>,
-    /// Set as the node shuts down: from then on it renews no hold.
+    /// Set as the node shuts down: from then on it renews no hold. It
+    /// mirrors [`Open::stopped`], which is under the tenants lock, for the
+    /// renewing tasks, which hold no `Inner` to take it.
     renewals_stopped: Arc<AtomicBool>,
     /// When the node was made: how old its census is until its first sweep.
     started: Instant,
@@ -2977,8 +2981,7 @@ impl Node {
     /// lease is given up as its opening resolves, at most
     /// [`Settings::releases_at_once`] at once and all within
     /// [`Settings::release_within`]; one not given up by then runs out. An
-    /// opening still running then is not waited for: it gives its lease up
-    /// itself once it ends, and its lease is not renewed meanwhile.
+    /// opening still running then is not waited for, and renews no hold.
     pub async fn shutdown(&self) {
         // Warming stopped first, so that what was served until now, and
         // what it had yet to warm, is the last the list is written with.
