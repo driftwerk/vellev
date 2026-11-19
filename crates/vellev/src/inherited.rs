@@ -423,4 +423,130 @@ mod tests {
             .to_string();
         assert!(err.contains("pipe"), "{err}");
     }
+
+    /// The descriptor-number rules: what `from_descriptor` takes, refuses
+    /// and leaves alone. Whether a descriptor is still open is told by its
+    /// inode, never by its number alone, which a test running alongside
+    /// could reuse.
+    mod descriptor {
+        use super::*;
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        fn inode(fd: RawFd) -> Option<(u64, u64)> {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `fstat` only writes `st`, and fails harmlessly on a
+            // number that isn't open.
+            (unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0).then(|| {
+                // SAFETY: `fstat` succeeded, so `st` is written.
+                let st = unsafe { st.assume_init() };
+                (st.st_dev as u64, st.st_ino as u64)
+            })
+        }
+
+        fn fd_flags(fd: RawFd) -> libc::c_int {
+            // SAFETY: `F_GETFD` reads a flag; harmless on any number.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) }
+        }
+
+        /// As a supervisor's `dup2` leaves it in the child.
+        fn inherited(fd: &impl AsRawFd) {
+            // SAFETY: clears close-on-exec on a descriptor this test owns.
+            assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        }
+
+        fn take(fd: RawFd) -> Result<Inherited> {
+            // SAFETY: each test hands over only a descriptor it gives up,
+            // or one the checks refuse before taking it.
+            unsafe { Inherited::from_descriptor(fd) }
+        }
+
+        #[test]
+        fn a_standard_stream_is_refused() {
+            for fd in [0, 1, 2, -1] {
+                assert!(take(fd).is_err(), "{fd}");
+            }
+        }
+
+        #[test]
+        fn a_number_that_isnt_open_is_refused() {
+            let err = format!("{:#}", take(i32::MAX).unwrap_err());
+            assert!(err.contains("isn't open"), "{err}");
+        }
+
+        /// A descriptor with close-on-exec set was opened in this process
+        /// (Rust and tokio open every one so), not handed down by a
+        /// supervisor: it belongs to something else here, and is refused
+        /// and left open.
+        #[test]
+        fn a_pipe_this_process_opened_is_refused_and_left_open() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&framed(BOTH)).unwrap();
+            drop(writer);
+            let before = inode(reader.as_raw_fd());
+            let err = format!("{:#}", take(reader.as_raw_fd()).unwrap_err());
+            assert!(err.contains("inherited"), "{err}");
+            assert_eq!(inode(reader.as_raw_fd()), before);
+            drop(reader);
+        }
+
+        #[test]
+        fn an_inherited_descriptor_that_isnt_a_pipe_is_refused_and_left_open() {
+            let file = tempfile::tempfile().unwrap();
+            inherited(&file);
+            let before = inode(file.as_raw_fd());
+            let err = format!("{:#}", take(file.as_raw_fd()).unwrap_err());
+            assert!(err.contains("pipe"), "{err}");
+            assert_eq!(inode(file.as_raw_fd()), before);
+            drop(file);
+        }
+
+        /// Once taken, the descriptor is close-on-exec, so nothing the node
+        /// might start inherits it.
+        #[test]
+        fn a_taken_descriptor_is_not_passed_on() {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            inherited(&reader);
+            let fd = reader.into_raw_fd();
+            // SAFETY: the test gives `fd` up here.
+            let owned = unsafe { Inherited::adopt(fd) }.unwrap();
+            assert_ne!(fd_flags(owned.as_raw_fd()) & libc::FD_CLOEXEC, 0);
+        }
+
+        #[test]
+        fn an_inherited_pipe_is_read_and_closed() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&framed(BOTH)).unwrap();
+            drop(writer);
+            inherited(&reader);
+            let pipe = inode(reader.as_raw_fd());
+            let fd = reader.into_raw_fd();
+            let read = take(fd).unwrap();
+            assert_eq!(read.api_keys, ["k-fixture"]);
+            // Closed: the number is free, or reused by something else.
+            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+        }
+
+        /// A supervisor whose pipe is non-blocking (shared with the node,
+        /// as the flag belongs to the open pipe) is still waited for until
+        /// the deadline, not failed at once.
+        #[test]
+        fn a_non_blocking_pipe_is_waited_for() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            // SAFETY: sets a flag on a descriptor this test owns.
+            unsafe {
+                let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+                assert_eq!(
+                    libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    0
+                );
+            }
+            let late = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                writer.write_all(&framed(BOTH)).unwrap();
+            });
+            let read = Inherited::read(reader.into(), Duration::from_secs(5)).unwrap();
+            assert_eq!(read.api_keys, ["k-fixture"]);
+            late.join().unwrap();
+        }
+    }
 }
