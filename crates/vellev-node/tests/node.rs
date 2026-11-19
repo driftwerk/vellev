@@ -2085,6 +2085,36 @@ async fn a_slow_opening_holds_up_no_other_release_at_shutdown() {
         .unwrap();
 }
 
+/// Review of ab07a2e, L1: shutdown waits for a tenant's opening only as
+/// long as its releases go on. One whose lease's acquire is never answered
+/// holds shutdown up no longer than [`RELEASE_WITHIN`].
+#[tokio::test(start_paused = true)]
+async fn an_opening_that_never_ends_holds_shutdown_up_no_longer_than_its_releases() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let stuck = tenant("stuck");
+    node.create_tenant(&stuck).await.unwrap();
+    coordinator.acquires_wait.store(true, Ordering::SeqCst);
+    let _opening = tokio::spawn({
+        let node = node.clone();
+        async move { node.tenant(&stuck).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the opening never came to its acquire");
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("an opening that never ended held shutdown up");
+}
+
 /// `name` made on `node` with ten notes with vectors, flushed if
 /// `flushed`, and no longer used.
 async fn written_to_let_go(node: &Node, name: &str, flushed: bool) {
