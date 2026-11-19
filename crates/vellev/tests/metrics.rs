@@ -664,11 +664,14 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
         "a sweep found tenants held that nothing but the scrapes held"
     );
     let text = served.app.metrics().encoded();
-    assert_eq!(
-        sample(&text, "vellev_sweep_tenants_kept_total", &[]),
-        Some(0.0),
-        "{text}"
-    );
+    for reason in ["held", "building"] {
+        let kept = sample(
+            &text,
+            "vellev_sweep_tenants_kept_total",
+            &[("reason", reason)],
+        );
+        assert_eq!(kept, Some(0.0), "{reason}: {text}");
+    }
     assert_eq!(
         sample(&text, "vellev_merges_stopped_for_budget_total", &[]),
         Some(0.0),

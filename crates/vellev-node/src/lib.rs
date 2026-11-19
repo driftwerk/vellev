@@ -2071,6 +2071,17 @@ pub struct LetGo {
     pub flushes_skipped: u64,
 }
 
+/// The tenants sweeps chose to let go but kept, by why: each counted once,
+/// for the first reason found, in the order a sweep looks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeptBySweeps {
+    /// Held by something else, as a request, a round of its maintenance
+    /// or a restore is: looked at first.
+    pub held: u64,
+    /// With its building lock busy, nothing else holding it.
+    pub building: u64,
+}
+
 /// What this node holds open, and what it reckons that holds in memory:
 /// the figures its memory budget is held to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2352,6 +2363,14 @@ impl Node {
     /// merge does, or with their building lock busy: let go at a later round.
     pub fn tenants_kept_by_sweeps(&self) -> u64 {
         self.0.held_elsewhere.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::tenants_kept_by_sweeps`] by why each was kept.
+    pub fn kept_by_sweeps(&self) -> KeptBySweeps {
+        KeptBySweeps {
+            building: 0,
+            held: self.tenants_kept_by_sweeps(),
+        }
     }
 
     /// What the last sweep found this node holding, as it began: what it

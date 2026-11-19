@@ -14,7 +14,9 @@ use vellev_core::{
     ObjectId, Property, RequestId, TenantId,
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
-use vellev_node::{Node, Settings, Tenant, LET_GO_FLUSHES_AT_ONCE, LET_GO_FLUSH_WITHIN};
+use vellev_node::{
+    KeptBySweeps, Node, Settings, Tenant, LET_GO_FLUSHES_AT_ONCE, LET_GO_FLUSH_WITHIN,
+};
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
 use vellev_storage::timings::{Holder, Timed};
@@ -496,6 +498,15 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
     assert_eq!(node.let_go().for_budget, 1, "the second tenant stays");
     assert_eq!(written_for(&node), ["held"], "the wrong tenant went");
     assert_eq!(node.tenants_kept_by_sweeps(), kept + 1, "not kept");
+    let for_building = KeptBySweeps {
+        building: 1,
+        held: 0,
+    };
+    assert_eq!(
+        node.kept_by_sweeps(),
+        for_building,
+        "kept, but not for its lock"
+    );
     // Held for the 30 s of a slow clean or restore: no sweep waits for it.
     tokio::time::sleep(Duration::from_secs(30)).await;
     tokio::time::timeout(Duration::from_secs(1), node.sweep_now())
@@ -511,6 +522,27 @@ async fn a_tenant_whose_building_lock_is_held_is_kept_and_holds_up_no_sweep() {
     let opened = node.tenant(&tenant("held")).await.unwrap();
     assert_eq!(noted(&opened), 2);
     assert_eq!(opened.read(State::unflushed), 0, "not flushed as it went");
+}
+
+/// A tenant a request holds, chosen to be let go, is kept as held, not as
+/// one whose building lock is busy: what keeps it is looked at first.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_a_request_holds_is_kept_as_held() {
+    let node = over_budget(memory());
+    node.create_tenant(&tenant("asked")).await.unwrap();
+    let asked = node.tenant(&tenant("asked")).await.unwrap();
+    asked.write(vec![notes(), note(1)]).await.unwrap();
+    unused_long_enough().await;
+    tokio::time::timeout(Duration::from_secs(1), node.sweep_now())
+        .await
+        .expect("the sweep ended");
+    let held = KeptBySweeps {
+        building: 0,
+        held: 1,
+    };
+    assert_eq!(node.kept_by_sweeps(), held);
+    assert_eq!(node.tenants_kept_by_sweeps(), 1);
+    drop(asked);
 }
 
 /// M7-R5b: a store that never answers holds the let-go's flush for as long
