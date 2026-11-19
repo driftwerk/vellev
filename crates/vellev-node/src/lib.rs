@@ -747,8 +747,7 @@ impl Hold {
     /// counted for `why`; one stopped already is not, so what first stopped
     /// it is what it is counted as. A merge that no task of this hold runs,
     /// as a request's, past where a stop ends it, goes on: nothing here
-    /// stopped it. Only the first call does anything: [`Self::opened`] and
-    /// [`Self::stops`] stop what comes after it.
+    /// stopped it. Only the first call does anything.
     fn lose(&self, why: Lost) {
         let mut tasks = self.tasks.lock().expect("tasks lock");
         if self.lost.swap(true, Ordering::SeqCst) {

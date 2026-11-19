@@ -744,8 +744,7 @@ async fn a_tenant_idle_while_it_merges_is_kept_until_its_merge_ends() {
 
 /// M7-R4, at the node: a merge is counted as stopped once, by what first
 /// stopped it. A tenant dropped mid-merge, with the build held, and a
-/// request that goes on writing finds the hold lost, and loses it again,
-/// 20 times over.
+/// request that goes on writing finds the hold lost, 20 times over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_merge_stopped_again_and_again_is_counted_once_as_what_first_stopped_it() {
     let node = node(|settings| {
