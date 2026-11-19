@@ -4347,6 +4347,30 @@ mod tests {
         assert_eq!(going_up.peak(), 150);
     }
 
+    /// A clustered merge encodes its index file once its build is done,
+    /// holding its indexes, the segment's frame and the file as it grows:
+    /// reckoned as a frame is, at [`ENCODED_AT_PEAK`] of it, which a file
+    /// larger than a part holds more of than going up does.
+    #[test]
+    fn a_clustered_merge_reckons_its_index_file_as_it_is_encoded() {
+        let encoding = Reckoning {
+            indexed: 10.0,
+            encoded: 20.0,
+            index_file: 100.0,
+            part: 50.0,
+            ..Reckoning::default()
+        };
+        assert_eq!(encoding.peak(), (10.0 + 20.0 + 100.0 * ENCODED_AT_PEAK) as usize);
+        let built = of_vectors(5_000, 4);
+        let whole = Merge {
+            run: 0..1,
+            keys: Vec::new(),
+        };
+        let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
+        let encoded = clustered.indexed + clustered.encoded + clustered.index_file * ENCODED_AT_PEAK;
+        assert!(clustered.peak() as f64 >= encoded, "{clustered:?}");
+    }
+
     /// A run with no vectors gathers none on disk, and so is reckoned to
     /// hold none of a frame going up, nor a piece of it written, however
     /// a store spills.
