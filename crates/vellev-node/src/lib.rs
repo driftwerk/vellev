@@ -1501,11 +1501,8 @@ impl TenantWork {
         if let Some(ended) = unflushable() {
             return Ok(ended);
         }
-        // Stopped at the cut: the flush's build, off the async threads, is
-        // not dropped with it.
-        let stop = Stop::new();
-        let Some(flushed) = before(deadline, building.flush(&stop)).await else {
-            stop.stop();
+        let stop = StopOnDrop(Stop::new());
+        let Some(flushed) = before(deadline, building.flush(&stop.0)).await else {
             return Ok(self.cut_short(building));
         };
         self.flush_tried(flushed.is_ok());
@@ -1726,6 +1723,17 @@ impl TenantWork {
             }
             _ => error.into(),
         }
+    }
+}
+
+/// A let-go flush's [`Stop`], stopped as it is dropped: at the deadline's
+/// cut, or with the sweep, so that the flush's build, off the async
+/// threads and not dropped with it, gives up either way.
+struct StopOnDrop(Stop);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 
