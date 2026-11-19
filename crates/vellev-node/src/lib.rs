@@ -1822,7 +1822,8 @@ impl Releases {
         }
     }
 
-    /// Ends as the releases are over.
+    /// Ends [`Settings::release_within`] after the flushes end, or after
+    /// their deadline if that comes first.
     async fn over(&self) {
         let mut flushed = self.flushed.subscribe();
         let ended = tokio::select! {
@@ -1837,9 +1838,18 @@ impl Releases {
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
 
-/// Lose the hold on what `opening` opens, once it has, on a task of its
-/// own: for a tenant shutdown could not wait for, so that none it began
-/// opening is held on past it.
+/// Warn once if any of the leases of `by` releases, as `sent` says of
+/// each, was not sent, as those releases ran out of time.
+fn warn_unsent(sent: impl IntoIterator<Item = bool>, by: &str) {
+    let unsent = sent.into_iter().filter(|sent| !sent).count();
+    if unsent > 0 {
+        tracing::warn!(unsent, "leases not released: {by} releases ran out of time");
+    }
+}
+
+/// Lose the hold on what `opening` opens, if it opens, on a task of its
+/// own: the guard for an opening shutdown did not wait for that passed its
+/// check of the node stopped just before shutdown stopped it.
 fn lost_once_opened(opening: Opening) {
     tokio::spawn(async move {
         let unopened = || async { Err(NodeError::Stopped) };
@@ -2964,11 +2974,12 @@ impl Node {
     }
 
     /// Give up every tenant, so that another node can write for them at
-    /// once rather than when the leases run out, and open no more. Their
-    /// leases are given up as a sweep's are, each as its opening resolves,
-    /// at most [`Settings::releases_at_once`] at once and all within
-    /// [`Settings::release_within`]: one not given up by then runs out, and
-    /// a tenant still opening then has its hold lost once it opens.
+    /// once rather than when the leases run out, and open no more. Each
+    /// lease is given up as its opening resolves, at most
+    /// [`Settings::releases_at_once`] at once and all within
+    /// [`Settings::release_within`]; one not given up by then runs out. An
+    /// opening still running then is not waited for: it gives its lease up
+    /// itself once it ends, and its lease is not renewed meanwhile.
     pub async fn shutdown(&self) {
         // Warming stopped first, so that what was served until now, and
         // what it had yet to warm, is the last the list is written with.
@@ -2990,25 +3001,19 @@ impl Node {
                     Some(Ok(tenant)) => {
                         tenant.work.hold.lose(Lost::Shutdown);
                         let lease = tenant.work.writer.lease();
-                        self.0.released(lease, releases).await
+                        Some(self.0.released(lease, releases).await)
                     }
-                    // Not opened: what opened it gave its lease up.
-                    Some(Err(_)) => true,
+                    // Not opened: no lease is held, or its opening gave it up.
+                    Some(Err(_)) => None,
                     None => {
                         lost_once_opened(opening);
-                        false
+                        None
                     }
                 }
             }
         });
-        let unsent = join_all(releasing).await.into_iter().filter(|sent| !sent);
-        let unsent = unsent.count();
-        if unsent > 0 {
-            tracing::warn!(
-                unsent,
-                "leases not released: shutdown's releases ran out of time"
-            );
-        }
+        let sent = join_all(releasing).await.into_iter().flatten();
+        warn_unsent(sent, "shutdown's");
         if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
             tracing::warn!(%error, "the node could not take itself off the register");
         }
@@ -3150,14 +3155,8 @@ impl Inner {
         let flushes = Semaphore::new(self.settings.let_go_flushes_at_once);
         let releases = Releases::new(&self.settings, deadline, taken.going.len());
         let letting_go = |going| self.let_go_of(going, &flushes, deadline, &releases);
-        let let_go = join_all(taken.going.into_iter().map(letting_go)).await;
-        let unsent = let_go.into_iter().filter(|sent| !sent).count();
-        if unsent > 0 {
-            tracing::warn!(
-                unsent,
-                "leases not released: the sweep's releases ran out of time"
-            );
-        }
+        let sent = join_all(taken.going.into_iter().map(letting_go)).await;
+        warn_unsent(sent, "the sweep's");
     }
 
     /// Flush `going`, then lose the hold on it with its building lock still
