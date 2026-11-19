@@ -41,11 +41,12 @@ fn the_node_binary_gives_jemalloc_its_options() {
         .expect("nm, from binutils");
     let listing = std::io::BufReader::new(nm.stdout.take().expect("nm's output"));
     let export = listing
-        .lines()
-        .map_while(Result::ok)
-        .find(|line| line.ends_with(" _rjem_malloc_conf"));
+        .split(b'\n')
+        .map(|line| line.expect("nm's output"))
+        .find(|line| line.ends_with(b" _rjem_malloc_conf"))
+        .map(|line| String::from_utf8_lossy(&line).into_owned());
     // Found, nm is stopped and its status says nothing; not found, nm
-    // must have read the whole binary, or the export may be there unseen.
+    // must have listed the whole binary, or the export may be there unseen.
     if export.is_some() {
         let _ = nm.kill();
     }
