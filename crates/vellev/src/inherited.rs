@@ -6,25 +6,53 @@
 //! Helper) writes the database URL, which holds Postgres's password, and the
 //! admin keys to a pipe instead. The payload is its length (4 bytes,
 //! big-endian), then one JSON object holding `VELLEV_DATABASE_URL` and
-//! `VELLEV_API_KEYS` (comma-separated), as the environment would. They take
-//! the place of whatever the command line or the environment gave.
+//! `VELLEV_API_KEYS` (comma-separated), as the environment would. Both are
+//! required, and with a pipe it is their only source: either one also set
+//! on the command line or in the environment is refused.
 //!
-//! The descriptor must be a pipe. The read stops once the framed length is
-//! in, so a copy of the write end held open elsewhere can't make it wait,
-//! and a supervisor that never writes is an error at the deadline. Errors
-//! name a variable or a position, never a value.
+//! The descriptor must be the read end of a pipe the node inherited (not
+//! close-on-exec), and anything else is refused untouched; once taken it is
+//! made close-on-exec, and a non-blocking one is waited for with its flag
+//! (the read end's, shared with every copy of that end) left as it is. A
+//! pipe named by mistake that passes these checks loses what is read from it
+//! before it is refused. The supervisor writes the payload once and closes
+//! its end before the node starts, and no other copy of the write end may
+//! survive anywhere, in other children of the supervisor included: the node
+//! reads the frame and then the pipe's end, so bytes written after the
+//! frame, or a name given twice in it, are refused, and a write end still
+//! open elsewhere, like a supervisor that never writes, is an error at the
+//! deadline (saying which) rather than a node waiting for ever. The node
+//! then exits refused, and its supervisor sees a start that failed. Errors
+//! name one of the two variables or a position, never a value, nor a name
+//! the node doesn't take.
+//!
+//! Only these two take the pipe: embedding keys and an object store's
+//! credentials still come from the environment. On Linux another process
+//! of the same user can open the pipe through `/proc/<pid>/fd/<n>`, the
+//! supervisor's or the node's, from when the pipe is made until the node
+//! has read it, so the pipe shortens the exposure the environment had but
+//! does not close it. Such a process can copy the payload without taking
+//! it (`tee(2)`), or replace it whole, and neither is seen; taking it
+//! without writing a whole frame back, adding bytes, or holding a write
+//! end open fails the start. macOS has no such path.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 use eyre::{bail, eyre, Result};
 
 use crate::config::Config;
 
-/// The most a payload may hold.
-pub const MAX_BYTES: usize = 64 * 1024;
+/// The most a payload may hold: a conservative cap, so that with its 4-byte
+/// length it fits a default fresh pipe (16 KiB on macOS, 64 KiB on Linux),
+/// as the supervisor writes it all before the node starts to read. A
+/// Linux user over `pipe-user-pages-soft` gets pipes of as little as one
+/// page, so supervisors should keep the payload and its length within
+/// 4 KiB (Desk Helper's is a few hundred bytes).
+pub const MAX_BYTES: usize = 16 * 1024 - 4;
+const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
 pub const READ_WITHIN: Duration = Duration::from_secs(10);
 
@@ -49,30 +77,102 @@ impl std::fmt::Debug for Inherited {
 }
 
 impl Inherited {
-    /// Reads the descriptor `fd`, handed to this process for this alone,
-    /// and closes it.
-    pub fn from_descriptor(fd: RawFd) -> Result<Self> {
-        if fd < 3 {
-            bail!("--secrets-fd {fd} is one of the standard streams");
-        }
-        use std::os::unix::fs::FileTypeExt;
-        // Looked at without being owned, so a number that names something
-        // else (nothing was handed over on it) is left open.
-        // SAFETY: the `File` is never dropped, so the descriptor isn't
-        // closed; `fstat` on a number that isn't open fails harmlessly.
-        let peek = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        if !peek.metadata().is_ok_and(|m| m.file_type().is_fifo()) {
-            bail!("--secrets-fd {fd} doesn't name a pipe");
-        }
-        // SAFETY: a pipe handed to this process to be read here, once;
-        // nothing else owns it.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    /// Reads the descriptor `fd`, handed down by a supervisor for this
+    /// alone, and closes it by the time it returns (but should the read not
+    /// finish well past the deadline, blocked by something else draining
+    /// the pipe or with the reader starved, the reader may be left holding
+    /// it while the node, refused, exits).
+    ///
+    /// The number is looked at without being taken: one below 3, or one
+    /// that isn't open, can't be looked at, isn't a pipe, isn't open for
+    /// reading only (a write end, or on Linux an `O_PATH` one), or is
+    /// close-on-exec (so was opened in this process, as Rust and tokio open
+    /// every descriptor, rather than inherited) is refused and left as it
+    /// was. One taken that then can't be made close-on-exec is refused and
+    /// closed.
+    ///
+    /// # Safety
+    ///
+    /// If `fd` names an open pipe without close-on-exec, nothing else in
+    /// this process may own it, and no other thread may close or reopen
+    /// that number while this runs: it is checked, then taken, and closed
+    /// once read.
+    pub unsafe fn from_descriptor(fd: RawFd) -> Result<Self> {
+        // SAFETY: passed on from this function's own contract.
+        let owned = unsafe { Self::adopt(fd) }?;
         Self::read(owned, READ_WITHIN)
     }
 
+    /// Checks `fd` by number, then takes it and makes it close-on-exec, so
+    /// nothing the node starts inherits it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Inherited::from_descriptor`].
+    unsafe fn adopt(fd: RawFd) -> Result<OwnedFd> {
+        if fd < 0 {
+            bail!("--secrets-fd {fd} isn't a descriptor");
+        }
+        if fd < 3 {
+            bail!("--secrets-fd {fd} is one of the standard streams");
+        }
+        // SAFETY: `fcntl(F_GETFD)` and `fstat` read about a number, take
+        // nothing, and fail harmlessly on one that isn't open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            bail!("--secrets-fd {fd} isn't open");
+        }
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: as above; `fstat` only writes `st`.
+        if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+            bail!(
+                "--secrets-fd {fd} can't be looked at: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: `fstat` succeeded, so `st` is written.
+        let mode = unsafe { st.assume_init() }.st_mode;
+        if mode & libc::S_IFMT != libc::S_IFIFO {
+            bail!("--secrets-fd {fd} doesn't name a pipe");
+        }
+        // SAFETY: `F_GETFL` reads the open pipe's status flags; takes
+        // nothing.
+        let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // On Linux an `O_PATH` descriptor reads as `O_RDONLY` but can't be
+        // read.
+        #[cfg(target_os = "linux")]
+        let path_only = status != -1 && status & libc::O_PATH != 0;
+        #[cfg(not(target_os = "linux"))]
+        let path_only = false;
+        if status == -1 || status & libc::O_ACCMODE != libc::O_RDONLY || path_only {
+            bail!("--secrets-fd {fd} isn't open for reading only (a pipe's read end)");
+        }
+        if flags & libc::FD_CLOEXEC != 0 {
+            bail!(
+                "--secrets-fd {fd} is close-on-exec, so it was opened in this process \
+                 rather than inherited from a supervisor"
+            );
+        }
+        // SAFETY: an open pipe without close-on-exec, which the caller
+        // promises nothing else in this process owns.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: sets a flag on the descriptor just taken.
+        if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            bail!(
+                "--secrets-fd {fd} can't be made close-on-exec: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(owned)
+    }
+
     /// Reads a framed payload from the pipe `fd` within `within`, and
-    /// closes it.
-    pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
+    /// closes it by the time it returns (but should the read not finish
+    /// well past the deadline, blocked by something else draining the pipe
+    /// or with the reader starved, the reader may be left holding it until
+    /// its read ends or the process exits).
+    pub(crate) fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
         let is_pipe = file
@@ -83,41 +183,87 @@ impl Inherited {
         if !is_pipe {
             bail!("the secrets' descriptor isn't a pipe");
         }
-        // Read on a thread of its own, so a supervisor that never writes is
-        // an error at the deadline rather than a node that never starts.
+        // Read on a thread of its own that waits for each read with `poll`
+        // against the deadline, so a supervisor that never writes is an
+        // error at the deadline rather than a node that never starts, a
+        // non-blocking pipe is waited for too (its flag, shared with every
+        // copy of the read end, is left as it is), and the descriptor is
+        // closed by the time this returns. The wait here is a backstop, past
+        // the deadline by half as long again (a second at least), for a
+        // read that blocks after all (something else holding the pipe
+        // draining it between the poll and the read), or a reader starved of
+        // the processor.
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let read = (|| -> std::io::Result<Vec<u8>> {
-                let mut header = [0u8; 4];
-                file.read_exact(&mut header)?;
-                let len = u32::from_be_bytes(header) as usize;
-                if len > MAX_BYTES {
-                    return Err(std::io::Error::other("too long"));
-                }
-                let mut body = vec![0u8; len];
-                file.read_exact(&mut body)?;
-                Ok(body)
-            })();
-            let _ = tx.send(read);
-        });
-        let body = match rx.recv_timeout(within) {
+        let deadline = std::time::Instant::now() + within;
+        std::thread::Builder::new()
+            .name("vellev-secrets".into())
+            .spawn(move || {
+                let read = Self::read_frame(&mut file, deadline);
+                // Closed before the answer is sent, so it is closed by the
+                // time this returns, unless this read outlives the backstop.
+                drop(file);
+                let _ = tx.send(read);
+            })
+            .map_err(|e| eyre!("the secrets' reader can't be started: {e}"))?;
+        let body = match rx.recv_timeout(within + BACKSTOP.max(within / 2)) {
             Ok(Ok(body)) => body,
-            Ok(Err(e)) if e.to_string() == "too long" => {
-                bail!("the secrets are over {MAX_BYTES} bytes")
+            Ok(Err(Unread::TooLong)) => bail!(
+                "the secrets' length is over the most the secrets may hold ({MAX_BYTES} bytes)"
+            ),
+            Ok(Err(Unread::Short)) => bail!("the secrets ended before their length"),
+            Ok(Err(Unread::After)) => {
+                bail!(
+                    "more was written after the secrets' framed length: the supervisor writes \
+                     them once, after their exact length"
+                )
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                bail!("the secrets ended before their length")
+            Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
+            Ok(Err(Unread::Late { framed: true })) => bail!(
+                "the secrets arrived, but the pipe's write end is still open elsewhere after \
+                 {within:?}: the supervisor, and every child of it, must close it once they \
+                 are written"
+            ),
+            Ok(Err(Unread::Late { framed: false })) => bail!(
+                "the secrets didn't arrive within {within:?}, nor did the pipe's write end \
+                 close"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "reading the secrets didn't finish well past {within:?}: a read blocked \
+                 (something else reading the pipe), or the reader was starved"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("reading the secrets stopped without an answer")
             }
-            Ok(Err(e)) => bail!("reading the secrets: {e}"),
-            Err(_) => bail!("the secrets didn't arrive within {within:?}"),
         };
         Self::parse(&body)
+    }
+
+    /// The framed payload, and then the end of the pipe, by `deadline`: the
+    /// supervisor writes it once and closes its end, so anything after it
+    /// was written by something else.
+    fn read_frame(
+        file: &mut std::fs::File,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Vec<u8>, Unread> {
+        let mut header = [0u8; 4];
+        fill(file, &mut header, deadline, false)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_BYTES {
+            return Err(Unread::TooLong);
+        }
+        let mut body = vec![0u8; len];
+        fill(file, &mut body, deadline, false)?;
+        let mut after = [0u8; 1];
+        match read_by(file, &mut after, deadline, true)? {
+            0 => Ok(body),
+            _ => Err(Unread::After),
+        }
     }
 
     fn parse(body: &[u8]) -> Result<Self> {
         // serde_json's messages can quote what they read: only the position
         // is kept.
-        let raw: BTreeMap<String, String> = serde_json::from_slice(body).map_err(|e| {
+        let Pairs(raw) = serde_json::from_slice(body).map_err(|e| {
             eyre!(
                 "the secrets aren't a JSON object of strings (line {}, column {})",
                 e.line(),
@@ -125,35 +271,174 @@ impl Inherited {
             )
         })?;
         let mut inherited = Self::default();
+        let mut seen = BTreeSet::new();
         for (name, value) in raw {
-            if value.is_empty() {
-                bail!("{name} was handed over empty");
+            let known = name == DATABASE_URL || name == API_KEYS;
+            if known && !seen.insert(name.clone()) {
+                bail!("{name} was handed over twice");
             }
+            // A name is repeated only once it is known to be one of the
+            // two: a supervisor that writes the wrong shape may put a
+            // secret where a name belongs.
             match name.as_str() {
-                DATABASE_URL => inherited.database_url = Some(value),
+                DATABASE_URL => {
+                    if value.trim().is_empty() {
+                        bail!("{DATABASE_URL} was handed over empty");
+                    }
+                    inherited.database_url = Some(value);
+                }
                 API_KEYS => {
                     inherited.api_keys = value
                         .split(',')
                         .map(|k| k.trim().to_string())
                         .filter(|k| !k.is_empty())
                         .collect();
+                    if inherited.api_keys.is_empty() {
+                        bail!("{API_KEYS} was handed over with no key in it");
+                    }
                 }
-                _ => bail!("{name:?} isn't a secret the node takes on a pipe"),
+                _ => bail!(
+                    "the secrets hold a name that isn't a secret the node takes on a pipe \
+                     (only {DATABASE_URL} and {API_KEYS}; the name isn't repeated)"
+                ),
             }
+        }
+        if inherited.database_url.is_none() {
+            bail!("the secrets don't hold {DATABASE_URL}");
+        }
+        if inherited.api_keys.is_empty() {
+            bail!("the secrets don't hold {API_KEYS}");
         }
         Ok(inherited)
     }
 
-    /// Puts what was handed over in place of what the command line or the
-    /// environment gave.
-    pub fn apply(self, config: &mut Config) {
-        if let Some(url) = self.database_url {
-            config.database_url = url;
+    /// Makes what was handed over the node's database URL and keys. With a
+    /// pipe it is their only source: either one also given on the command
+    /// line or in the environment, both readable by other processes, is
+    /// refused rather than overridden, so a supervisor that still leaks
+    /// them is found out.
+    pub fn apply(self, config: &mut Config) -> Result<()> {
+        if !config.database_url.trim().is_empty() {
+            bail!(
+                "{DATABASE_URL} is also set on the command line or in the environment; \
+                 with --secrets-fd it comes only on the pipe"
+            );
         }
-        if !self.api_keys.is_empty() {
-            config.api_keys = self.api_keys;
+        if config.api_keys.iter().any(|k| !k.trim().is_empty()) {
+            bail!(
+                "{API_KEYS} is also set on the command line or in the environment; \
+                 with --secrets-fd they come only on the pipe"
+            );
+        }
+        config.database_url = self.database_url.unwrap_or_default();
+        config.api_keys = self.api_keys;
+        Ok(())
+    }
+}
+
+/// A JSON object of strings, its names and values in the order given,
+/// repeats kept, so a name given twice is seen rather than the last one
+/// silently winning.
+struct Pairs(Vec<(String, String)>);
+
+impl<'de> serde::Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Pairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object of strings")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Pairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry::<String, String>()? {
+                    pairs.push(pair);
+                }
+                Ok(Pairs(pairs))
+            }
+        }
+        d.deserialize_map(Visit)
+    }
+}
+
+/// Fills `buf` from `file` by `deadline`; `framed` says whether the frame
+/// is already in, for the error should the deadline pass.
+fn fill(
+    file: &mut std::fs::File,
+    mut buf: &mut [u8],
+    deadline: std::time::Instant,
+    framed: bool,
+) -> std::result::Result<(), Unread> {
+    while !buf.is_empty() {
+        match read_by(file, buf, deadline, framed)? {
+            0 => return Err(Unread::Short),
+            n => buf = &mut buf[n..],
         }
     }
+    Ok(())
+}
+
+/// One read from `file` once `poll` says it won't wait, by `deadline`.
+fn read_by(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+    framed: bool,
+) -> std::result::Result<usize, Unread> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(Unread::Late { framed });
+        }
+        // Rounded up from nanoseconds, so no wait left is polled as none.
+        let ms =
+            libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX);
+        let mut ready = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is one valid `pollfd` for the call's length.
+        match unsafe { libc::poll(&mut ready, 1, ms) } {
+            0 => continue,
+            -1 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(Unread::Io(e));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        match file.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => return Err(Unread::Io(e)),
+        }
+    }
+}
+
+/// The least a read that blocked after all is waited for past its
+/// deadline.
+const BACKSTOP: Duration = Duration::from_secs(1);
+
+/// Why a frame couldn't be read.
+enum Unread {
+    TooLong,
+    Short,
+    After,
+    /// The deadline passed, before or after the frame was in.
+    Late {
+        framed: bool,
+    },
+    Io(std::io::Error),
 }
 
 #[cfg(test)]
@@ -178,7 +463,7 @@ mod tests {
     #[test]
     fn the_database_url_and_keys_are_read_from_the_pipe() {
         let read = through_pipe(&framed(
-            br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":"k1-fixture,k2-fixture"}"#,
+            br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":" k1-fixture, ,k2-fixture"}"#,
         ))
         .unwrap();
         assert_eq!(
@@ -193,60 +478,320 @@ mod tests {
         );
     }
 
-    #[test]
-    fn they_replace_what_the_command_line_and_environment_gave() {
+    const BOTH: &[u8] =
+        br#"{"VELLEV_DATABASE_URL":"postgres://from-pipe","VELLEV_API_KEYS":"k-fixture"}"#;
+
+    /// A config as clap leaves it with neither secret on the command line
+    /// or in the environment.
+    fn bare_config() -> Config {
         let mut config = crate::config::tests::config(&[]);
-        let read = through_pipe(&framed(
-            br#"{"VELLEV_DATABASE_URL":"postgres://from-pipe","VELLEV_API_KEYS":"k-fixture"}"#,
-        ))
-        .unwrap();
-        read.apply(&mut config);
+        config.database_url.clear();
+        config.api_keys.clear();
+        config
+    }
+
+    #[test]
+    fn they_become_the_nodes_database_and_keys() {
+        let mut config = bare_config();
+        through_pipe(&framed(BOTH))
+            .unwrap()
+            .apply(&mut config)
+            .unwrap();
         assert_eq!(config.database_url, "postgres://from-pipe");
         assert_eq!(config.api_keys, ["k-fixture"]);
     }
 
+    /// With a pipe, the pipe is the only source: a database URL or keys
+    /// also given on the command line or in the environment (both readable
+    /// by other processes) are refused, naming the variable, not the value.
     #[test]
-    fn anything_but_the_two_names_is_refused() {
-        let err = through_pipe(&framed(br#"{"AWS_SECRET_ACCESS_KEY":"s-fixture"}"#))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("AWS_SECRET_ACCESS_KEY"), "{err}");
-        assert!(!err.contains("s-fixture"), "{err}");
+    fn with_a_pipe_neither_may_also_come_from_the_command_line_or_environment() {
+        let mut url = bare_config();
+        url.database_url = "postgres://u:pw-fixture@h/db".into();
+        let mut keys = bare_config();
+        keys.api_keys = vec!["env-key-fixture".into()];
+        for (mut config, named) in [(url, "VELLEV_DATABASE_URL"), (keys, "VELLEV_API_KEYS")] {
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(BOTH))
+                    .unwrap()
+                    .apply(&mut config)
+                    .unwrap_err()
+            );
+            assert!(err.contains(named), "{err}");
+            assert!(
+                !err.contains("pw-fixture") && !err.contains("env-key-fixture"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A pipe that leaves either secret out is refused, rather than the
+    /// node starting on whatever else it was given.
+    #[test]
+    fn the_pipe_must_hand_over_both() {
+        for (payload, missing) in [
+            (
+                &br#"{"VELLEV_API_KEYS":"k-fixture"}"#[..],
+                "VELLEV_DATABASE_URL",
+            ),
+            (
+                br#"{"VELLEV_DATABASE_URL":"postgres://db"}"#,
+                "VELLEV_API_KEYS",
+            ),
+            (br#"{}"#, "VELLEV_DATABASE_URL"),
+        ] {
+            let err = format!("{:#}", through_pipe(&framed(payload)).unwrap_err());
+            assert!(err.contains(missing), "{err}");
+        }
+    }
+
+    /// Anything after the frame is refused: the supervisor writes one
+    /// payload and closes its end, so more bytes mean something else wrote
+    /// to the pipe.
+    #[test]
+    fn bytes_after_the_frame_are_refused() {
+        let mut twice = framed(BOTH);
+        twice.extend(framed(br#"{"VELLEV_API_KEYS":"forged-fixture"}"#));
+        let err = format!("{:#}", through_pipe(&twice).unwrap_err());
+        assert!(err.contains("more was written"), "{err}");
+        assert!(!err.contains("forged-fixture"), "{err}");
+        for stray in 1..=3 {
+            let mut trailer = framed(BOTH);
+            trailer.extend(std::iter::repeat_n(b'x', stray));
+            let err = format!("{:#}", through_pipe(&trailer).unwrap_err());
+            assert!(err.contains("more was written"), "{stray}: {err}");
+        }
+    }
+
+    /// A name the node doesn't take is refused, and is not repeated: a
+    /// supervisor that writes the wrong shape may put a secret where a
+    /// name belongs.
+    #[test]
+    fn anything_but_the_two_names_is_refused_without_repeating_it() {
+        for payload in [
+            &br#"{"AWS_SECRET_ACCESS_KEY":"s-fixture"}"#[..],
+            br#"{"postgres://u:pw-fixture@127.0.0.1:1/db":"x"}"#,
+            br#"{"postgres://u:pw-fixture@127.0.0.1:1/db":""}"#,
+        ] {
+            let err = format!("{:#}", through_pipe(&framed(payload)).unwrap_err());
+            assert!(err.contains("isn't a secret the node takes"), "{err}");
+            for secret in ["AWS_SECRET_ACCESS_KEY", "s-fixture", "pw-fixture"] {
+                assert!(!err.contains(secret), "{err}");
+            }
+        }
+    }
+
+    /// Keys handed over on the pipe that come to none once trimmed are
+    /// refused as such, beside a good database URL.
+    #[test]
+    fn a_key_list_that_is_empty_once_trimmed_is_refused() {
+        for keys in [" ", ",", " , ,"] {
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"{keys}"}}"#);
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(payload.as_bytes())).unwrap_err()
+            );
+            assert!(
+                err.contains("VELLEV_API_KEYS was handed over with no key in it"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A database URL handed over blank is refused as such, not left for
+    /// `checked()` to call missing.
+    #[test]
+    fn a_blank_database_url_is_refused() {
+        for url in ["", " ", "\\t "] {
+            let payload =
+                format!(r#"{{"VELLEV_DATABASE_URL":"{url}","VELLEV_API_KEYS":"k-fixture"}}"#);
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(payload.as_bytes())).unwrap_err()
+            );
+            assert!(
+                err.contains("VELLEV_DATABASE_URL was handed over empty"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A name given twice is refused, as anything after the frame is: the
+    /// supervisor writes each once. Only a known name is repeated.
+    #[test]
+    fn a_name_given_twice_is_refused() {
+        let url_twice = br#"{"VELLEV_DATABASE_URL":"postgres://u:a-fixture@h/db","VELLEV_API_KEYS":"k","VELLEV_DATABASE_URL":"postgres://u:b-fixture@h/db"}"#;
+        let err = format!("{:#}", through_pipe(&framed(url_twice)).unwrap_err());
+        assert!(
+            err.contains("VELLEV_DATABASE_URL was handed over twice"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("a-fixture") && !err.contains("b-fixture"),
+            "{err}"
+        );
+        let twice = br#"{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"a-fixture","VELLEV_API_KEYS":"b-fixture"}"#;
+        let err = format!("{:#}", through_pipe(&framed(twice)).unwrap_err());
+        assert!(
+            err.contains("VELLEV_API_KEYS was handed over twice"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("a-fixture") && !err.contains("b-fixture"),
+            "{err}"
+        );
+        let unknown = br#"{"postgres://u:pw-fixture@h/db":"x","postgres://u:pw-fixture@h/db":"y"}"#;
+        let err = format!("{:#}", through_pipe(&framed(unknown)).unwrap_err());
+        assert!(!err.contains("pw-fixture"), "{err}");
+    }
+
+    /// Blank values clap leaves from an empty or comma-only variable count
+    /// as unset, as they do for `keys()` and `checked()`.
+    #[test]
+    fn blank_values_from_the_environment_are_not_a_second_source() {
+        for (url, keys) in [("", vec![""]), ("  ", vec![" ", ""]), ("", vec![])] {
+            let mut config = bare_config();
+            config.database_url = url.into();
+            config.api_keys = keys.into_iter().map(String::from).collect();
+            through_pipe(&framed(BOTH))
+                .unwrap()
+                .apply(&mut config)
+                .unwrap();
+            assert_eq!(config.database_url, "postgres://from-pipe");
+            assert_eq!(config.api_keys, ["k-fixture"]);
+        }
+    }
+
+    /// A payload of exactly the most is taken, written whole before
+    /// anything reads (so on the platform it runs on, the largest frame
+    /// fits a default fresh pipe), and a length one byte more is refused
+    /// from its header alone.
+    #[test]
+    fn the_most_a_payload_may_hold_is_taken_and_a_byte_more_refused() {
+        let mut most = BOTH.to_vec();
+        most.resize(MAX_BYTES, b' ');
+        let read = through_pipe(&framed(&most)).unwrap();
+        assert_eq!(read.api_keys, ["k-fixture"]);
+        let mut over = ((MAX_BYTES + 1) as u32).to_be_bytes().to_vec();
+        over.extend_from_slice(b"{\"");
+        let err = format!("{:#}", through_pipe(&over).unwrap_err());
+        assert!(err.contains("over the most the secrets may hold"), "{err}");
+    }
+
+    /// A length shorter than the payload is reported as the frame's length
+    /// being wrong, not only as more being written.
+    #[test]
+    fn a_length_shorter_than_the_payload_is_named() {
+        let mut short = (BOTH.len() as u32 - 1).to_be_bytes().to_vec();
+        short.extend_from_slice(BOTH);
+        let err = format!("{:#}", through_pipe(&short).unwrap_err());
+        assert!(err.contains("framed length"), "{err}");
     }
 
     #[test]
     fn malformed_or_short_payloads_are_refused_without_repeating_them() {
         let mut short = framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#);
         short.truncate(short.len() - 2);
-        for bad in [
-            short,
-            framed(br#"{"VELLEV_API_KEYS": 12345678}"#),
-            framed(b"VELLEV_API_KEYS=k-fixture"),
-            ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
+        for (bad, reason) in [
+            (short, "ended before their length"),
+            (vec![0, 0], "ended before their length"),
+            (
+                framed(br#"{"VELLEV_API_KEYS": 12345678}"#),
+                "line 1, column",
+            ),
+            (framed(b"VELLEV_API_KEYS=k-fixture"), "line 1, column"),
+            // serde_json's own message would quote the whole string.
+            (
+                framed(br#""postgres://u:pw-fixture@h/db""#),
+                "line 1, column",
+            ),
+            (
+                ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
+                "over the most the secrets may hold",
+            ),
         ] {
-            let err = through_pipe(&bad).unwrap_err().to_string();
+            let err = format!("{:#}", through_pipe(&bad).unwrap_err());
+            assert!(err.contains(reason), "{reason}: {err}");
             assert!(
-                !err.contains("k-fixture") && !err.contains("12345678"),
+                !err.contains("k-fixture")
+                    && !err.contains("12345678")
+                    && !err.contains("pw-fixture"),
                 "{err}"
             );
         }
     }
 
+    /// A supervisor that never writes, or whose write end stays open after
+    /// the payload (so the end of it can't be confirmed), is an error at
+    /// the deadline, never a node waiting for ever.
     #[test]
-    fn a_silent_pipe_times_out_and_a_held_write_end_does_not_hang() {
+    fn a_silent_pipe_or_a_held_write_end_is_refused_at_the_deadline() {
         let (reader, writer) = std::io::pipe().unwrap();
-        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+        let silent = Inherited::read(reader.into(), Duration::from_secs(1))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("within"), "{err}");
+        assert!(silent.contains("didn't arrive within"), "{silent}");
         drop(writer);
+        // The payload is in, but the pipe never ends: the error says so,
+        // as this is a supervisor (or a child of it) still holding a copy
+        // of the write end, not one that never wrote.
         let (reader, mut writer) = std::io::pipe().unwrap();
-        writer
-            .write_all(&framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#))
-            .unwrap();
-        let read = Inherited::read(reader.into(), Duration::from_secs(5)).unwrap();
-        assert_eq!(read.api_keys, ["k-fixture"]);
+        writer.write_all(&framed(BOTH)).unwrap();
+        let held = Inherited::read(reader.into(), Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(held.contains("write end is still open"), "{held}");
+        assert!(!held.contains("didn't arrive"), "{held}");
         drop(writer);
+        // Only part of the payload, and the pipe held: the secrets did not
+        // arrive.
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let whole = framed(BOTH);
+        writer.write_all(&whole[..whole.len() - 3]).unwrap();
+        let part = Inherited::read(reader.into(), Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(part.contains("didn't arrive within"), "{part}");
+        drop(writer);
+    }
+
+    /// Closed by the time the read returns. Told by the pipe's inode, as
+    /// the number may be reused. A guard, not a proof of the order: with
+    /// the close after the answer is sent, the reader's thread almost
+    /// always closes before this looks, so it may well pass (it did, before
+    /// the close was moved ahead of the send, which orders it by itself).
+    #[test]
+    fn the_pipe_is_closed_by_the_time_the_read_returns() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::fs::MetadataExt;
+        // Where this process's descriptors show as files.
+        let fds = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let inode = |fd: RawFd| {
+            std::fs::metadata(format!("{fds}/{fd}"))
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        };
+        for _ in 0..500 {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&framed(BOTH)).unwrap();
+            drop(writer);
+            // A second read end, held until the check, keeps the pipe in
+            // being, so no pipe made alongside can come to share its inode.
+            let pin = reader.try_clone().unwrap();
+            let reader = OwnedFd::from(reader);
+            let fd = reader.as_raw_fd();
+            let pipe = inode(fd);
+            assert!(pipe.is_some());
+            Inherited::read(reader, Duration::from_secs(5)).unwrap();
+            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            drop(pin);
+        }
     }
 
     #[test]
@@ -260,5 +805,235 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("pipe"), "{err}");
+    }
+
+    /// The descriptor-number rules: what `from_descriptor` takes, refuses
+    /// and leaves alone. Whether a descriptor is still open is told by its
+    /// inode, never by its number alone, which a test running alongside
+    /// could reuse.
+    ///
+    /// These clear close-on-exec on descriptors of the test process, which
+    /// is sound only while no unit test in this crate starts a child (the
+    /// ones that do are integration tests, processes of their own).
+    mod descriptor {
+        use super::*;
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        fn inode(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `fstat` only writes `st`, and fails harmlessly on a
+            // number that isn't open.
+            (unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0).then(|| {
+                // SAFETY: `fstat` succeeded, so `st` is written.
+                let st = unsafe { st.assume_init() };
+                (st.st_dev, st.st_ino)
+            })
+        }
+
+        fn fd_flags(fd: RawFd) -> libc::c_int {
+            // SAFETY: `F_GETFD` reads a flag; harmless on any number.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) }
+        }
+
+        /// As a supervisor's `dup2` leaves it in the child.
+        fn inherited(fd: &impl AsRawFd) {
+            // SAFETY: clears close-on-exec on a descriptor this test owns.
+            assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        }
+
+        fn take(fd: RawFd) -> Result<Inherited> {
+            // SAFETY: each test hands over only a descriptor it gives up,
+            // or one the checks refuse before taking it.
+            unsafe { Inherited::from_descriptor(fd) }
+        }
+
+        #[test]
+        fn a_standard_stream_or_a_negative_number_is_refused() {
+            for fd in [0, 1, 2] {
+                let err = format!("{:#}", take(fd).unwrap_err());
+                assert!(err.contains("one of the standard streams"), "{fd}: {err}");
+            }
+            for fd in [-1, i32::MIN] {
+                let err = format!("{:#}", take(fd).unwrap_err());
+                assert!(err.contains("isn't a descriptor"), "{fd}: {err}");
+            }
+        }
+
+        #[test]
+        fn a_number_that_isnt_open_is_refused() {
+            let err = format!("{:#}", take(i32::MAX).unwrap_err());
+            assert!(err.contains("isn't open"), "{err}");
+        }
+
+        /// A descriptor with close-on-exec set was opened in this process
+        /// (Rust and tokio open every one so), not handed down by a
+        /// supervisor: it belongs to something else here, and is refused
+        /// and left open.
+        #[test]
+        fn a_pipe_this_process_opened_is_refused_and_left_open() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&framed(BOTH)).unwrap();
+            drop(writer);
+            // Not dropped until it is shown left open: were it wrongly
+            // taken and closed, dropping it would close a number another
+            // test may hold by then.
+            let reader = std::mem::ManuallyDrop::new(reader);
+            let before = inode(reader.as_raw_fd());
+            let err = format!("{:#}", take(reader.as_raw_fd()).unwrap_err());
+            assert!(err.contains("inherited"), "{err}");
+            assert_eq!(inode(reader.as_raw_fd()), before);
+            drop(std::mem::ManuallyDrop::into_inner(reader));
+        }
+
+        #[test]
+        fn an_inherited_descriptor_that_isnt_a_pipe_is_refused_and_left_open() {
+            let file = tempfile::tempfile().unwrap();
+            inherited(&file);
+            let file = std::mem::ManuallyDrop::new(file);
+            let before = inode(file.as_raw_fd());
+            let err = format!("{:#}", take(file.as_raw_fd()).unwrap_err());
+            assert!(err.contains("pipe"), "{err}");
+            assert_eq!(inode(file.as_raw_fd()), before);
+            drop(std::mem::ManuallyDrop::into_inner(file));
+        }
+
+        /// Once taken, the descriptor is close-on-exec, so nothing the node
+        /// might start inherits it.
+        #[test]
+        fn a_taken_descriptor_is_not_passed_on() {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            inherited(&reader);
+            let fd = reader.into_raw_fd();
+            // SAFETY: the test gives `fd` up here.
+            let owned = unsafe { Inherited::adopt(fd) }.unwrap();
+            assert_ne!(fd_flags(owned.as_raw_fd()) & libc::FD_CLOEXEC, 0);
+        }
+
+        /// Closed by the time the read returns, not some time after on
+        /// the reader's thread: many times over, so a close that races the
+        /// return is seen.
+        #[test]
+        fn an_inherited_pipe_is_read_and_closed() {
+            for _ in 0..500 {
+                let (reader, mut writer) = std::io::pipe().unwrap();
+                writer.write_all(&framed(BOTH)).unwrap();
+                drop(writer);
+                inherited(&reader);
+                // A second read end, held until the check, keeps the pipe in
+                // being, so no pipe made alongside can come to share its
+                // inode.
+                let pin = reader.try_clone().unwrap();
+                let pipe = inode(reader.as_raw_fd());
+                let fd = reader.into_raw_fd();
+                let read = take(fd).unwrap();
+                assert_eq!(read.api_keys, ["k-fixture"]);
+                // Closed: the number is free, or reused by something else.
+                assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+                drop(pin);
+            }
+        }
+
+        /// A write end, or anything else not opened for reading only, is
+        /// refused and left open: reading it would fail, or (a FIFO opened
+        /// read-write) hold its own write end and never see the end.
+        #[test]
+        fn a_descriptor_not_open_for_reading_only_is_refused_and_left_open() {
+            let (reader, writer) = std::io::pipe().unwrap();
+            inherited(&writer);
+            let writer = std::mem::ManuallyDrop::new(writer);
+            let before = inode(writer.as_raw_fd());
+            let err = format!("{:#}", take(writer.as_raw_fd()).unwrap_err());
+            assert!(err.contains("isn't open for reading only"), "{err}");
+            assert_eq!(inode(writer.as_raw_fd()), before);
+            drop(std::mem::ManuallyDrop::into_inner(writer));
+            drop(reader);
+        }
+
+        /// On Linux an `O_PATH` descriptor of a named pipe reads as open
+        /// for reading only, but can't be read: it is refused untouched.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_path_only_descriptor_is_refused_and_left_open() {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = tempfile::tempdir().unwrap();
+            let fifo =
+                std::ffi::CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path; `mkfifo` and `open` take
+            // nothing of this process's.
+            let fd = unsafe {
+                assert_eq!(libc::mkfifo(fifo.as_ptr(), 0o600), 0);
+                libc::open(fifo.as_ptr(), libc::O_PATH)
+            };
+            assert!(fd >= 3, "{}", std::io::Error::last_os_error());
+            // SAFETY: the descriptor just opened, owned here alone.
+            let path_only = std::mem::ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(fd) });
+            let before = inode(fd);
+            let err = format!("{:#}", take(fd).unwrap_err());
+            assert!(err.contains("isn't open for reading only"), "{err}");
+            assert_eq!(inode(fd), before);
+            drop(std::mem::ManuallyDrop::into_inner(path_only));
+        }
+
+        /// A pipe that turns out not to hold the secrets (another
+        /// program's, named by mistake) is refused without its shared state
+        /// being changed: its non-blocking flag is as it was.
+        #[test]
+        fn a_wrong_pipe_is_refused_without_being_changed() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            // SAFETY: sets a flag on a descriptor this test owns.
+            let flags = unsafe {
+                let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+                libc::fcntl(reader.as_raw_fd(), libc::F_GETFL)
+            };
+            writer.write_all(b"++++").unwrap();
+            drop(writer);
+            inherited(&reader);
+            // A copy of the read end (a dup) sees the flag it shares.
+            let other = reader.try_clone().unwrap();
+            let fd = reader.into_raw_fd();
+            assert!(take(fd).is_err());
+            // SAFETY: reads a flag of a descriptor this test owns.
+            let now = unsafe { libc::fcntl(other.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(now, flags);
+        }
+
+        /// At the deadline too, the descriptor is closed by the time the
+        /// read returns: no reader is left holding it.
+        #[test]
+        fn a_silent_pipe_is_closed_at_the_deadline() {
+            let (reader, writer) = std::io::pipe().unwrap();
+            let pin = reader.try_clone().unwrap();
+            let reader = OwnedFd::from(reader);
+            let fd = reader.as_raw_fd();
+            let pipe = inode(fd);
+            let err = Inherited::read(reader, Duration::from_millis(300)).unwrap_err();
+            assert!(format!("{err:#}").contains("didn't arrive"), "{err:#}");
+            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            drop((pin, writer));
+        }
+
+        /// A supervisor whose pipe is non-blocking (the flag belongs to the
+        /// read end, so a copy the supervisor kept shares it) is waited for
+        /// until the deadline, not failed at once.
+        #[test]
+        fn a_non_blocking_pipe_is_waited_for() {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            // SAFETY: sets a flag on a descriptor this test owns.
+            unsafe {
+                let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+                assert_eq!(
+                    libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    0
+                );
+            }
+            let late = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                writer.write_all(&framed(BOTH)).unwrap();
+            });
+            let read = Inherited::read(reader.into(), Duration::from_secs(5)).unwrap();
+            assert_eq!(read.api_keys, ["k-fixture"]);
+            late.join().unwrap();
+        }
     }
 }
