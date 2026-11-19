@@ -85,9 +85,10 @@ jobs:
     name: Report
     needs: [simulation, recall, advisories]
     # Runs after a failed job, but not when the run itself was cancelled,
-    # and only for the default branch: a manual run on another branch, or
-    # with a few cases, must not close or add to the nightly's issue.
-    if: ${{ !cancelled() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    # and only for the scheduled run, which GitHub starts on the default
+    # branch alone: a manual run, on any branch or with a few cases, must
+    # not close or add to the nightly's issue.
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Two reports at once could both find no open issue and open two.
@@ -103,6 +104,9 @@ jobs:
       SIMULATION: ${{ needs.simulation.result }}
       RECALL: ${{ needs.recall.result }}
       ADVISORIES: ${{ needs.advisories.result }}
+      # The repository belongs to an organisation, so an issue alone notifies
+      # only those watching it; the one assigned is always told.
+      ASSIGNEE: kingsleyh
     steps:
       - name: Open, update or close the red-nightly issue
         run: |
@@ -120,6 +124,10 @@ jobs:
           else
             gh label create nightly-red --color B60205 \
               --description "The nightly workflow is failing" 2>/dev/null || true
-            gh issue create --label nightly-red \
-              --title "Nightly is red" --body "$body"
+            url=$(gh issue create --label nightly-red \
+              --title "Nightly is red" --body "$body")
+            # The issue stands even if the assignment fails, so a failure
+            # here is a warning, not a reason to fail the report.
+            gh issue edit "$url" --add-assignee "$ASSIGNEE" \
+              || echo "::warning::could not assign $url to $ASSIGNEE"
           fi
