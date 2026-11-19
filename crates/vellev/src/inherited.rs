@@ -509,12 +509,11 @@ mod tests {
         }
     }
 
-    /// The supervisor writes the frame before the node starts, so the
-    /// largest one allowed must fit a fresh pipe's buffer (16 KiB on macOS,
-    /// 64 KiB on Linux) or the supervisor would wait for ever. A payload of
-    /// exactly the most is taken, one byte more is refused.
+    /// A payload of exactly the most is taken, one byte more is refused.
+    /// (That the most fits a default fresh pipe is held by the constant's
+    /// own compile-time check, not shown here.)
     #[test]
-    fn the_largest_frame_fits_a_fresh_pipe() {
+    fn the_most_a_payload_may_hold_is_taken_and_a_byte_more_refused() {
         let mut most = BOTH.to_vec();
         most.resize(MAX_BYTES, b' ');
         let read = through_pipe(&framed(&most)).unwrap();
@@ -547,6 +546,11 @@ mod tests {
                 "line 1, column",
             ),
             (framed(b"VELLEV_API_KEYS=k-fixture"), "line 1, column"),
+            // serde_json's own message would quote the whole string.
+            (
+                framed(br#""postgres://u:pw-fixture@h/db""#),
+                "line 1, column",
+            ),
             (
                 ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
                 "over the most the secrets may hold",
@@ -555,7 +559,9 @@ mod tests {
             let err = format!("{:#}", through_pipe(&bad).unwrap_err());
             assert!(err.contains(reason), "{reason}: {err}");
             assert!(
-                !err.contains("k-fixture") && !err.contains("12345678"),
+                !err.contains("k-fixture")
+                    && !err.contains("12345678")
+                    && !err.contains("pw-fixture"),
                 "{err}"
             );
         }
@@ -593,6 +599,31 @@ mod tests {
             .to_string();
         assert!(part.contains("didn't arrive within"), "{part}");
         drop(writer);
+    }
+
+    /// Closed by the time the read returns, not some time after on the
+    /// reader's thread: many times over, so a close that races the return
+    /// is seen. Told by the pipe's inode, as the number may be reused.
+    #[test]
+    fn the_pipe_is_closed_by_the_time_the_read_returns() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::fs::MetadataExt;
+        let inode = |fd: RawFd| {
+            std::fs::metadata(format!("/dev/fd/{fd}"))
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        };
+        for _ in 0..500 {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&framed(BOTH)).unwrap();
+            drop(writer);
+            let reader = OwnedFd::from(reader);
+            let fd = reader.as_raw_fd();
+            let pipe = inode(fd);
+            assert!(pipe.is_some());
+            Inherited::read(reader, Duration::from_secs(5)).unwrap();
+            assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+        }
     }
 
     #[test]
