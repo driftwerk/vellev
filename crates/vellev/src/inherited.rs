@@ -6,13 +6,17 @@
 //! Helper) writes the database URL, which holds Postgres's password, and the
 //! admin keys to a pipe instead. The payload is its length (4 bytes,
 //! big-endian), then one JSON object holding `VELLEV_DATABASE_URL` and
-//! `VELLEV_API_KEYS` (comma-separated), as the environment would. They take
-//! the place of whatever the command line or the environment gave.
+//! `VELLEV_API_KEYS` (comma-separated), as the environment would. Both are
+//! required, and with a pipe it is their only source: either one also set
+//! on the command line or in the environment is refused.
 //!
-//! The descriptor must be a pipe. The read stops once the framed length is
-//! in, so a copy of the write end held open elsewhere can't make it wait,
-//! and a supervisor that never writes is an error at the deadline. Errors
-//! name a variable or a position, never a value.
+//! The descriptor must be a pipe. The supervisor writes the payload once
+//! and closes its end before the node starts: the node reads the frame and
+//! then the pipe's end, so bytes written after the frame are refused, and
+//! a write end still open elsewhere, like a supervisor that never writes,
+//! is an error at the deadline rather than a node waiting for ever. Errors
+//! name one of the two variables or a position, never a value, nor a name
+//! the node doesn't take.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -87,31 +91,49 @@ impl Inherited {
         // an error at the deadline rather than a node that never starts.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let read = (|| -> std::io::Result<Vec<u8>> {
-                let mut header = [0u8; 4];
-                file.read_exact(&mut header)?;
-                let len = u32::from_be_bytes(header) as usize;
-                if len > MAX_BYTES {
-                    return Err(std::io::Error::other("too long"));
-                }
-                let mut body = vec![0u8; len];
-                file.read_exact(&mut body)?;
-                Ok(body)
-            })();
-            let _ = tx.send(read);
+            let _ = tx.send(Self::read_frame(&mut file));
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
-            Ok(Err(e)) if e.to_string() == "too long" => {
-                bail!("the secrets are over {MAX_BYTES} bytes")
+            Ok(Err(Unread::TooLong)) => bail!("the secrets are over {MAX_BYTES} bytes"),
+            Ok(Err(Unread::Short)) => bail!("the secrets ended before their length"),
+            Ok(Err(Unread::After)) => {
+                bail!("more was written after the secrets; the supervisor writes them once")
             }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                bail!("the secrets ended before their length")
-            }
-            Ok(Err(e)) => bail!("reading the secrets: {e}"),
-            Err(_) => bail!("the secrets didn't arrive within {within:?}"),
+            Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
+            Err(_) => bail!(
+                "the secrets didn't arrive within {within:?}, with their writer's end \
+                 closed after them"
+            ),
         };
         Self::parse(&body)
+    }
+
+    /// The framed payload, and then the end of the pipe: the supervisor
+    /// writes it once and closes its end, so anything after it was written
+    /// by something else.
+    fn read_frame(file: &mut std::fs::File) -> std::result::Result<Vec<u8>, Unread> {
+        let short = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Unread::Short,
+            _ => Unread::Io(e),
+        };
+        let mut header = [0u8; 4];
+        file.read_exact(&mut header).map_err(short)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_BYTES {
+            return Err(Unread::TooLong);
+        }
+        let mut body = vec![0u8; len];
+        file.read_exact(&mut body).map_err(short)?;
+        let mut after = [0u8; 1];
+        loop {
+            match file.read(&mut after) {
+                Ok(0) => return Ok(body),
+                Ok(_) => return Err(Unread::After),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Unread::Io(e)),
+            }
+        }
     }
 
     fn parse(body: &[u8]) -> Result<Self> {
@@ -126,34 +148,71 @@ impl Inherited {
         })?;
         let mut inherited = Self::default();
         for (name, value) in raw {
-            if value.is_empty() {
-                bail!("{name} was handed over empty");
-            }
+            // A name is repeated only once it is known to be one of the
+            // two: a supervisor that writes the wrong shape may put a
+            // secret where a name belongs.
             match name.as_str() {
-                DATABASE_URL => inherited.database_url = Some(value),
+                DATABASE_URL => {
+                    if value.trim().is_empty() {
+                        bail!("{DATABASE_URL} was handed over empty");
+                    }
+                    inherited.database_url = Some(value);
+                }
                 API_KEYS => {
                     inherited.api_keys = value
                         .split(',')
                         .map(|k| k.trim().to_string())
                         .filter(|k| !k.is_empty())
                         .collect();
+                    if inherited.api_keys.is_empty() {
+                        bail!("{API_KEYS} was handed over with no key in it");
+                    }
                 }
-                _ => bail!("{name:?} isn't a secret the node takes on a pipe"),
+                _ => bail!(
+                    "the secrets hold a name that isn't a secret the node takes on a pipe \
+                     (only {DATABASE_URL} and {API_KEYS}; the name isn't repeated)"
+                ),
             }
+        }
+        if inherited.database_url.is_none() {
+            bail!("the secrets don't hold {DATABASE_URL}");
+        }
+        if inherited.api_keys.is_empty() {
+            bail!("the secrets don't hold {API_KEYS}");
         }
         Ok(inherited)
     }
 
-    /// Puts what was handed over in place of what the command line or the
-    /// environment gave.
-    pub fn apply(self, config: &mut Config) {
-        if let Some(url) = self.database_url {
-            config.database_url = url;
+    /// Makes what was handed over the node's database URL and keys. With a
+    /// pipe it is their only source: either one also given on the command
+    /// line or in the environment, both readable by other processes, is
+    /// refused rather than overridden, so a supervisor that still leaks
+    /// them is found out.
+    pub fn apply(self, config: &mut Config) -> Result<()> {
+        if !config.database_url.trim().is_empty() {
+            bail!(
+                "{DATABASE_URL} is also set on the command line or in the environment; \
+                 with --secrets-fd it comes only on the pipe"
+            );
         }
-        if !self.api_keys.is_empty() {
-            config.api_keys = self.api_keys;
+        if config.api_keys.iter().any(|k| !k.trim().is_empty()) {
+            bail!(
+                "{API_KEYS} is also set on the command line or in the environment; \
+                 with --secrets-fd they come only on the pipe"
+            );
         }
+        config.database_url = self.database_url.unwrap_or_default();
+        config.api_keys = self.api_keys;
+        Ok(())
     }
+}
+
+/// Why a frame couldn't be read.
+enum Unread {
+    TooLong,
+    Short,
+    After,
+    Io(std::io::Error),
 }
 
 #[cfg(test)]
@@ -246,8 +305,14 @@ mod tests {
     #[test]
     fn the_pipe_must_hand_over_both() {
         for (payload, missing) in [
-            (&br#"{"VELLEV_API_KEYS":"k-fixture"}"#[..], "VELLEV_DATABASE_URL"),
-            (br#"{"VELLEV_DATABASE_URL":"postgres://db"}"#, "VELLEV_API_KEYS"),
+            (
+                &br#"{"VELLEV_API_KEYS":"k-fixture"}"#[..],
+                "VELLEV_DATABASE_URL",
+            ),
+            (
+                br#"{"VELLEV_DATABASE_URL":"postgres://db"}"#,
+                "VELLEV_API_KEYS",
+            ),
             (br#"{}"#, "VELLEV_DATABASE_URL"),
         ] {
             let err = format!("{:#}", through_pipe(&framed(payload)).unwrap_err());
@@ -292,7 +357,10 @@ mod tests {
     fn a_key_list_that_is_empty_once_trimmed_is_refused() {
         for keys in [" ", ",", " , ,"] {
             let payload = format!(r#"{{"VELLEV_API_KEYS":"{keys}"}}"#);
-            let err = format!("{:#}", through_pipe(&framed(payload.as_bytes())).unwrap_err());
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(payload.as_bytes())).unwrap_err()
+            );
             assert!(err.contains("VELLEV_API_KEYS"), "{err}");
         }
     }
@@ -304,7 +372,10 @@ mod tests {
         for (bad, reason) in [
             (short, "ended before their length"),
             (vec![0, 0], "ended before their length"),
-            (framed(br#"{"VELLEV_API_KEYS": 12345678}"#), "line 1, column"),
+            (
+                framed(br#"{"VELLEV_API_KEYS": 12345678}"#),
+                "line 1, column",
+            ),
             (framed(b"VELLEV_API_KEYS=k-fixture"), "line 1, column"),
             (
                 ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
@@ -320,7 +391,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A supervisor that never writes, or whose write end stays open after
     /// the payload (so the end of it can't be confirmed), is an error at
     /// the deadline, never a node waiting for ever.
