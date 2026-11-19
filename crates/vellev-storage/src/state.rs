@@ -4261,17 +4261,21 @@ mod tests {
         assert_eq!(gathered.indexing, 1_500.0);
     }
 
-    /// A run of `rows` rows of `width` values each, of one collection, in
-    /// one segment.
+    /// A run of `rows` rows of `width` values each, of one collection of
+    /// that width, in one segment: the vector of each row its own.
     fn of_vectors(rows: usize, width: usize) -> Built {
         let mut built = Built::new(&[]);
-        built.commit(vec![long_text_collection()]);
+        let Op::CreateCollection { id, mut schema } = long_text_collection() else {
+            unreachable!()
+        };
+        schema.embedding.dimensions = width.max(1) as _;
+        built.commit(vec![Op::CreateCollection { id, schema }]);
         let upserts = (0..rows).map(|n| Op::Upsert {
             collection: CollectionId(0),
             object: Object {
                 id: oid(n as u128),
                 properties: BTreeMap::new(),
-                vector: (width > 0).then(|| vec![0.5; width]),
+                vector: (width > 0).then(|| row_vector(n, width)),
             },
         });
         built.commit(upserts.collect());
@@ -4279,26 +4283,52 @@ mod tests {
         built
     }
 
+    /// Row `n`'s vector of `width` values: spread, as an index is built of.
+    fn row_vector(n: usize, width: usize) -> Vec<f32> {
+        (0..width)
+            .map(|at| ((n * 31 + at * 17) % 97) as f32 / 97.0 - 0.5)
+            .collect()
+    }
+
     /// A clustered merge's index file is encoded before its vectors go up,
     /// and held as they do: reckoned going up, beside its indexes, the
-    /// segment's frame and a part, as no other stage holds it. A merge
-    /// whose vectors are coded, not clustered, writes no index file.
+    /// segment's frame and a part, at within a few percent of the file the
+    /// merge writes, as `prepared` encodes it. A merge whose vectors are
+    /// coded, not clustered, writes no index file.
     #[test]
     fn a_clustered_merge_reckons_its_index_file_going_up() {
-        let built = of_vectors(5_000, 4);
-        let whole = Merge {
-            run: 0..1,
-            keys: Vec::new(),
-        };
-        let coded = built
-            .state
-            .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
-        let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
-        assert_eq!(coded.index_file, 0.0);
-        // Its codes and factors, as coded, and its centroids.
-        let (width, clusters) = (64.0, (5_000f64).sqrt().floor());
-        let index_file = 5_000.0 * (width / 8.0 + 12.0) + clusters * width * 4.0;
-        assert_eq!(clustered.index_file, index_file);
+        for (rows, width) in [(5_000, 4), (4_000, 384)] {
+            let built = of_vectors(rows, width);
+            let whole = Merge {
+                run: 0..1,
+                keys: Vec::new(),
+            };
+            let coded = built
+                .state
+                .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+            assert_eq!(coded.index_file, 0.0);
+            let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
+            let vectors: Vec<Vec<f32>> = (0..rows).map(|n| row_vector(n, width)).collect();
+            let rows_of: Vec<(u32, &[f32])> = vectors
+                .iter()
+                .enumerate()
+                .map(|(n, vector)| (n as u32, vector.as_slice()))
+                .collect();
+            let index = ClusteredIndex::build(Distance::Cosine, &rows_of).unwrap();
+            let file = SegmentIndex {
+                segment: "k".into(),
+                vectors: vec![(CollectionId(0), Arc::new(index))],
+            };
+            use crate::format::{encode_as, Kind, FORMAT_VERSION};
+            let written = encode_as(Kind::Index, FORMAT_VERSION, &file).unwrap().len() as f64;
+            let off = (clustered.index_file - written) / written;
+            assert!(
+                off.abs() < 0.03,
+                "{rows} x {width}: reckoned {} for a file of {written}, {:.1}% off",
+                clustered.index_file,
+                off * 100.0
+            );
+        }
         let going_up = Reckoning {
             part: 100.0,
             index_file: 50.0,
