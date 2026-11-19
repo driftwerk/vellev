@@ -2320,8 +2320,8 @@ async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
     )
     .await
     .expect("a compact on a lost hold was not refused at once");
-    refused("a compact", compacted.map(drop));
     assert_eq!(builds.turns_taken(), turns, "the compact took a merge turn");
+    refused("a compact", compacted.map(drop));
     refused("a flush", held.flush().await.map(drop));
 }
 
