@@ -2102,6 +2102,8 @@ struct Inner {
     sweep_on_time: AtomicBool,
     /// Where a test holds each sweep as it is about to take tenants out.
     sweep_hold: Mutex<Option<Arc<SweepHold>>>,
+    /// Set as the node shuts down: from then on it renews no hold.
+    renewals_stopped: Arc<AtomicBool>,
     /// When the node was made: how old its census is until its first sweep.
     started: Instant,
     /// How many tenants sweeps chose to let go but kept, by why.
@@ -2401,6 +2403,7 @@ impl Node {
             sweep_queued: AtomicBool::new(false),
             sweep_on_time: AtomicBool::new(false),
             sweep_hold: Mutex::default(),
+            renewals_stopped: Arc::default(),
             started: Instant::now(),
             kept_by_sweeps: Mutex::default(),
             kept_since: Mutex::default(),
@@ -2973,6 +2976,7 @@ impl Node {
         let openings: Vec<Opening> = {
             let mut open = self.0.opened();
             open.stopped = true;
+            self.0.renewals_stopped.store(true, Ordering::SeqCst);
             open.followers.clear();
             open.tenants.drain().map(|(_, opening)| opening).collect()
         };
@@ -3683,16 +3687,17 @@ impl Inner {
     /// renewal is timed from when the one before was asked for, so a slow
     /// answer does not let the hold run out.
     ///
-    /// The hold is given up once its writer, when it is open, is closed, as
-    /// by an attempt that failed or a caller that stopped waiting part way,
-    /// or has been publishing a commit for longer than its bounds allow:
-    /// a writer that can write no more would otherwise keep the tenant
-    /// from every other node.
+    /// The hold is given up once the node has shut down, and once its
+    /// writer, when it is open, is closed, as by an attempt that failed or
+    /// a caller that stopped waiting part way, or has been publishing a
+    /// commit for longer than its bounds allow: a writer that can write no
+    /// more would otherwise keep the tenant from every other node.
     fn renewing(&self, lease: Lease, hold: Arc<Hold>, deadline: &Arc<Mutex<Instant>>) {
         let coordinator = self.coordinator.clone();
         let ttl = self.settings.lease;
         let every = ttl / 3;
         let deadline = Arc::downgrade(deadline);
+        let stopped = self.renewals_stopped.clone();
         tokio::spawn(async move {
             let mut next = lease.requested_at + every;
             loop {
@@ -3700,6 +3705,10 @@ impl Inner {
                 let Some(deadline) = deadline.upgrade() else {
                     return;
                 };
+                if stopped.load(Ordering::SeqCst) {
+                    hold.lose(Lost::Shutdown);
+                    return;
+                }
                 if hold.is_lost() {
                     return;
                 }
