@@ -1891,14 +1891,11 @@ struct Going {
 struct Taken {
     /// The tenants written for, taken out and still to be let go.
     going: Vec<Going>,
-    /// The tenants written for that something else held, left as they are,
-    /// with what each holds, in the order they were chosen.
-    kept: Vec<(Arc<Tenant>, usize)>,
+    /// The tenants written for that it kept, left as they are, in the
+    /// order they were chosen.
+    kept: Vec<Kept>,
     /// How many chosen, written for or copied, it kept, by why.
     kept_by: KeptBySweeps,
-    /// The tenants written for that it kept, chosen for the budget: see
-    /// [`Inner::kept_spells`].
-    kept_for_budget: Vec<KeptForBudget>,
     /// About how many bytes what was taken out held.
     freed: usize,
     /// How many were taken out for being idle, and for the budget.
@@ -1943,16 +1940,17 @@ impl Taken {
                     self.freed += held.size;
                     return true;
                 } else if same {
-                    self.kept.push((tenant.clone(), held.size));
                     let why = match free_of_others {
                         true => KeptFor::Building,
                         false => KeptFor::Held,
                     };
                     self.kept_by.count(why);
-                    if for_budget {
-                        let tenant = tenant.clone();
-                        self.kept_for_budget.push(KeptForBudget { tenant, why });
-                    }
+                    self.kept.push(Kept {
+                        tenant: tenant.clone(),
+                        size: held.size,
+                        why,
+                        for_budget,
+                    });
                 }
                 false
             }
@@ -1991,10 +1989,13 @@ impl KeptSpell {
     }
 }
 
-/// A tenant written for that a sweep over the budget kept, and why.
-struct KeptForBudget {
+/// A tenant written for that a sweep kept: what it holds, why, and
+/// whether it was chosen for the budget.
+struct Kept {
     tenant: Arc<Tenant>,
+    size: usize,
     why: KeptFor,
+    for_budget: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3039,7 +3040,7 @@ impl Inner {
             .lock()
             .expect("kept by sweeps lock")
             .add(taken.kept_by);
-        self.kept_spells(&taken.kept_for_budget);
+        self.kept_spells(&taken.kept);
         self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
         self.let_go_for_budget
             .fetch_add(taken.for_budget, Ordering::Relaxed);
@@ -3054,7 +3055,7 @@ impl Inner {
                 // so that each can be let go at a later round. None is
                 // stopped while letting others go is enough.
                 let mut over = left - budget;
-                for (tenant, size) in &taken.kept {
+                for Kept { tenant, size, .. } in &taken.kept {
                     if over == 0 {
                         break;
                     }
@@ -3257,19 +3258,22 @@ impl Inner {
             .collect()
     }
 
-    /// Go on with the spell of each tenant in `kept`, kept by this sweep
-    /// over the budget, for the same reason as the last, to now, or begin
+    /// Go on with the spell of each tenant of `kept` this sweep kept for the
+    /// budget, for the same reason as the last, to now, or begin
     /// one; and end, timed to the last sweep that kept it, that of each not
     /// kept so now: taken out, kept for the other reason, or not over the
     /// budget any more. So a spell is timed to a sweep's resolution: one
     /// sweep's keep reads nothing, however long to the next.
-    fn kept_spells(&self, kept: &[KeptForBudget]) {
+    fn kept_spells(&self, kept: &[Kept]) {
         let now = Instant::now();
+        let kept: HashMap<&TenantId, &Kept> = kept
+            .iter()
+            .filter(|kept| kept.for_budget)
+            .map(|kept| (kept.tenant.id(), kept))
+            .collect();
         let mut since = self.kept_since.lock().expect("kept since lock");
         since.retain(|tenant, spell| {
-            let goes_on = kept
-                .iter()
-                .any(|kept| kept.tenant.id() == tenant && kept.why == spell.why);
+            let goes_on = kept.get(tenant).is_some_and(|kept| kept.why == spell.why);
             match goes_on {
                 true => spell.last = now,
                 false => {
@@ -3280,7 +3284,7 @@ impl Inner {
             }
             goes_on
         });
-        for KeptForBudget { tenant, why } in kept {
+        for Kept { tenant, why, .. } in kept.into_values() {
             since
                 .entry(tenant.id().clone())
                 .or_insert_with(|| KeptSpell {
