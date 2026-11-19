@@ -1244,6 +1244,14 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         );
         assert_eq!(count, Some(0.0), "{part}: {text}");
     }
+    for reason in ["held", "building"] {
+        let count = sample(
+            &text,
+            "vellev_sweep_kept_seconds_count",
+            &[("reason", reason)],
+        );
+        assert_eq!(count, Some(0.0), "{reason}: {text}");
+    }
     assert_eq!(
         sample(&text, "vellev_let_go_flushes_skipped_total", &[]),
         Some(0.0),
