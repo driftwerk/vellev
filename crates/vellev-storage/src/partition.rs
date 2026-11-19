@@ -1,3 +1,8 @@
+//! A partition and the writer that commits to it. The writer's test seams,
+//! its gates and counts, are compiled in, as `merge_gate` first was, on
+//! purpose: each costs an atomic or an uncontended lock, and the node's
+//! tests, in another crate, need them.
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -1691,8 +1696,6 @@ impl Writer {
     async fn building(&self, holder: Holder) -> Building<'_> {
         let asked = Instant::now();
         if holder == Holder::Flush {
-            // Counted as it asks, with no await between: once a test sees
-            // the count, the flush waits for the lock, or has it.
             self.flushes_asked.fetch_add(1, Ordering::SeqCst);
         }
         let guard = self.building.lock().await;
