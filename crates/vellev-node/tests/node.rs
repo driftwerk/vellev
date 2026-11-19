@@ -2109,6 +2109,58 @@ async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
     assert!(given_up(&cluster, "stuck").await, "its lease never ran out");
 }
 
+/// Review of b4ddefb, L1: a hold shutdown has lost is lost once. A merge
+/// begun on a tenant's writer after shutdown, by a caller still holding the
+/// tenant, its lease not yet given up, is not stopped, nor counted as
+/// stopped by shutdown, when the tenant's renewal next wakes. Real time, on
+/// a short lease, as a merge's build is held off the async threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
+    let lease = Duration::from_secs(3);
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = lease;
+        settings.release_within = Duration::from_millis(100);
+    });
+    let name = tenant("merging");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    // Its release unanswered: the lease is still the tenant's.
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    node.shutdown().await;
+    let stopped = || node.merges().stopped.shutdown;
+    assert_eq!(stopped(), 0, "{:?}", node.merges().stopped);
+    let writer = held.writer().clone();
+    for from in [10, 20, 30, 40] {
+        writer.commit(ten_notes(from)).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    // Held at the start of its build, where a stop finds it.
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilStopped));
+    let merging = tokio::spawn(async move { writer.merge().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while builds.held() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the merge after shutdown never came to build");
+    // Past the tenant's next renewal, a third of its lease on.
+    tokio::time::sleep(lease / 2).await;
+    let merged = merging.is_finished();
+    builds.hold(None);
+    assert_eq!(stopped(), 0, "{:?}", node.merges().stopped);
+    assert!(!merged, "the merge after shutdown was stopped");
+}
+
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
 /// opening resolves. One tenant still opening, its lease's acquire
 /// unanswered, holds up no other tenant's release.
