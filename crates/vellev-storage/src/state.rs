@@ -895,7 +895,7 @@ impl Reckoning {
     /// About how many bytes the merge holds at its peak.
     pub(crate) fn peak(&self) -> usize {
         let built = self.indexed + self.training.max(self.encoded * ENCODED_AT_PEAK);
-        let going_up = self.indexed + self.encoded + self.part;
+        let going_up = self.indexed + self.encoded + self.index_file + self.part;
         let staged = self.piece.max(self.indexing).max(built).max(going_up);
         (self.rows + self.vectors + self.tombstones + staged) as usize
     }
@@ -919,6 +919,7 @@ impl Reckoning {
             },
             encoded: self.encoded * by,
             indexed: self.indexed * by,
+            index_file: self.index_file * by,
             indexing: self.indexing * by,
             ..self
         }
@@ -1283,9 +1284,21 @@ fn coding_bytes(rows: f64, dimensions: usize) -> f64 {
 /// and every row's code and factors as they are made.
 fn training_bytes(rows: f64, dimensions: usize) -> f64 {
     let width = rotated_width(dimensions);
-    let clusters = rows.sqrt().clamp(1.0, 4096.0).floor();
+    let clusters = clusters_of(rows);
     let sample = (clusters * 64.0).min(rows);
     sample * (width * 4.0 + 24.0) + clusters * width * 4.0 + rows * (width / 8.0 + 64.0)
+}
+
+/// How many clusters a clustered index of `rows` vectors trains.
+fn clusters_of(rows: f64) -> f64 {
+    rows.sqrt().clamp(1.0, 4096.0).floor()
+}
+
+/// About how many bytes the file of a clustered index of `rows` vectors of
+/// `dimensions` comes to, encoded before its merge's vectors go up and held
+/// as they do: its codes and factors, as [`coded_bytes`], and its centroids.
+fn index_file_bytes(rows: f64, dimensions: usize) -> f64 {
+    coded_bytes(rows, dimensions) + clusters_of(rows) * rotated_width(dimensions) * 4.0
 }
 
 /// About how many bytes a segment's vector indexes take in memory: its
@@ -2927,6 +2940,9 @@ impl State {
                 continue;
             }
             besides += coded_bytes(rows, dimensions);
+            if rows > clustered_above as f64 {
+                reckoning.index_file += index_file_bytes(rows, dimensions);
+            }
             // Clustered as `clustered` says a merged segment's vectors are,
             // and one collection's at a time, as `indexed_stopping` builds.
             reckoning.training = reckoning.training.max(match rows > clustered_above as f64 {
@@ -2934,9 +2950,10 @@ impl State {
                 false => coding_bytes(rows, dimensions),
             });
         }
-        if let Some(going_up) = spilled {
+        // As `Run::merged` spills only a run with vectors.
+        if let Some(going_up) = spilled.filter(|_| values > 0.0) {
             reckoning.vectors -= values;
-            reckoning.piece = values.min(SPILLED_AT_ONCE as f64);
+            reckoning.piece = frames.min(SPILLED_AT_ONCE as f64);
             reckoning.part = frames.min(going_up as f64);
             reckoning.part_at_most = going_up as f64;
         }
@@ -4201,7 +4218,11 @@ mod tests {
         assert!((held.vectors - values - offsets).abs() < 8.0, "{held:?}");
         assert!((spilled.vectors - offsets).abs() < 8.0, "{spilled:?}");
         assert_eq!(held.piece, 0.0);
-        assert_eq!(spilled.piece, values);
+        // As a gathering's piece holds: its frame's, up to 4 MiB.
+        assert!(
+            (spilled.piece - values - offsets).abs() < 8.0,
+            "{spilled:?}"
+        );
         assert_eq!(spilled.part, 1_000.0, "a part of the frame, no more");
         assert_eq!(spilled.indexed, held.indexed);
         assert_eq!(spilled.encoded, held.encoded);
@@ -4269,7 +4290,9 @@ mod tests {
             run: 0..1,
             keys: Vec::new(),
         };
-        let coded = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+        let coded = built
+            .state
+            .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
         let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
         assert_eq!(coded.index_file, 0.0);
         // Its codes and factors, as coded, and its centroids.
