@@ -3255,6 +3255,28 @@ mod tests {
         assert!(plain.0.lock().unwrap().is_empty());
     }
 
+    /// What a spilled frame holds as it goes up is reckoned from the parts
+    /// the store under the cache sends it in, whatever the cache's disk was
+    /// told: a node sets both from one setting, but nothing else makes them
+    /// agree. A store that puts a file whole is reckoned to hold all of it.
+    #[cfg(unix)]
+    #[test]
+    fn what_goes_up_of_a_spill_is_reckoned_at_the_parts_its_store_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let transfers = Transfers {
+            part_bytes: 64 << 20,
+            ..Transfers::default()
+        };
+        let store = ObjectBlobs::new(Arc::new(InMemory::new())).transferring(transfers);
+        let cached = CachedBlobs::new(Arc::new(store), dir.path());
+        let spills = cached.spills().expect("a cache spills");
+        let piece = crate::spill::SPILLED_AT_ONCE;
+        assert_eq!(spills.held_going_up(), (64 << 20) + piece);
+        let plain = CachedBlobs::new(Arc::new(Plain::default()), dir.path());
+        let spills = plain.spills().expect("a cache spills");
+        assert_eq!(spills.held_going_up(), usize::MAX, "a whole frame");
+    }
+
     /// A store that puts every file it is asked to create, there or not.
     #[derive(Debug)]
     struct Careless(ObjectBlobs);
