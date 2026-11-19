@@ -249,7 +249,9 @@ pub enum Holding {
     /// to with some copied, until let go, stopped or not: a long gather.
     GatheringUntilLetGo,
     /// A flush's build, at its start, until its flush is stopped: a build
-    /// that would otherwise run on. No merge's or restore's.
+    /// that would otherwise run on. Only a flush's own, of the rows in
+    /// memory: not a merge's, nor the rows a merge's or the curve commit
+    /// flushes, nor a restore's.
     FlushUntilStopped,
 }
 

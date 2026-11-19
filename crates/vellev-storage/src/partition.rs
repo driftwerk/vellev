@@ -2257,7 +2257,8 @@ impl Writer {
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged, stopping).await?;
+        let at = Some(HeldAt::Flush);
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged, stopping, at).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -2358,11 +2359,14 @@ impl Writer {
     /// held up while all of them are, and build, upload and load back the
     /// segment of them, if there are any, which is then seen to be fit to
     /// adopt. Its build, upload and load give up once `stopping` is stopped.
+    /// Its build is held where a test holds builds at `held_at`, if given:
+    /// a flush's, not a merge's or the curve commit's.
     async fn flushing(
         &self,
         mut snapshot: Snapshot,
         staged: &mut Staged,
         stopping: &Stopping,
+        held_at: Option<HeldAt>,
     ) -> Result<(Snapshot, Option<Fit>)> {
         while self
             .partition
@@ -2371,8 +2375,7 @@ impl Writer {
             tokio::task::yield_now().await;
         }
         let named_at = snapshot.position;
-        let at = Some(HeldAt::Flush);
-        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping, at);
+        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping, held_at);
         let segment = match uploaded.await? {
             Some(prepared) => {
                 let prepared = FreedOff::new(prepared);
@@ -3286,7 +3289,7 @@ impl Writer {
         let mut staged = self.staging();
         let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self
-            .flushing(snapshot, &mut staged, &Stopping::never())
+            .flushing(snapshot, &mut staged, &Stopping::never(), None)
             .await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -3646,7 +3649,7 @@ impl Writer {
         }
         let (snapshot, taking) = self.taken_noted();
         let (snapshot, segment) = self
-            .flushing(snapshot, &mut staged, &Stopping::never())
+            .flushing(snapshot, &mut staged, &Stopping::never(), None)
             .await?;
         let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
