@@ -4657,8 +4657,10 @@ impl Drop for Refusing<'_> {
 /// deletes the copies.
 pub struct RestoreFrom<'a> {
     writer: &'a Writer,
-    _building: Building<'a>,
+    // Before the lock, as fields drop in order: a merge or write waiting
+    // for the lock then never finds the restore still refusing it.
     _refusing: Refusing<'a>,
+    _building: Building<'a>,
     staged: Staged,
     /// The state put back, loaded from the copies.
     target: Partition,
