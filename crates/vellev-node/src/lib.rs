@@ -1839,6 +1839,18 @@ impl Releases {
 
 type Opening = Arc<OnceCell<Arc<Tenant>>>;
 
+/// Lose the hold on what `opening` opens, once it has, on a task of its
+/// own: for a tenant shutdown could not wait for, so that none it began
+/// opening is held on past it.
+fn lost_once_opened(opening: Opening) {
+    tokio::spawn(async move {
+        let unopened = || async { Err(NodeError::Stopped) };
+        if let Ok(tenant) = opening.get_or_try_init(unopened).await {
+            tenant.work.hold.lose(Lost::Shutdown);
+        }
+    });
+}
+
 /// How many tries of a restore by others one caller waits for before it is
 /// told a restore is running, rather than making a try of its own.
 const RESTORE_WAITS: usize = 3;
@@ -2952,8 +2964,10 @@ impl Node {
 
     /// Give up every tenant, so that another node can write for them at
     /// once rather than when the leases run out, and open no more. Their
-    /// leases are given up as a sweep's are, all within
-    /// [`Settings::release_within`]: one not given up by then runs out.
+    /// leases are given up as a sweep's are, each as its opening resolves,
+    /// at most [`Settings::releases_at_once`] at once and all within
+    /// [`Settings::release_within`]: one not given up by then runs out, and
+    /// a tenant still opening then has its hold lost once it opens.
     pub async fn shutdown(&self) {
         // Warming stopped first, so that what was served until now, and
         // what it had yet to warm, is the last the list is written with.
@@ -2964,19 +2978,24 @@ impl Node {
             open.followers.clear();
             open.tenants.drain().map(|(_, opening)| opening).collect()
         };
-        let mut leases = Vec::new();
-        for opening in openings {
-            let unopened = || async { Err(NodeError::Stopped) };
-            if let Ok(tenant) = opening.get_or_try_init(unopened).await {
-                tenant.work.hold.lose(Lost::Shutdown);
-                leases.push((tenant.id().clone(), tenant.work.writer.lease().clone()));
-            }
-        }
-        // Given up as a sweep's are: a few at once, all within one bound.
         let releases = Releases::flushes_over(&self.0.settings);
-        let releasing = leases
-            .iter()
-            .map(|(tenant, lease)| self.0.released(tenant, lease, &releases));
+        let releasing = openings.into_iter().map(|opening| {
+            let releases = &releases;
+            async move {
+                let unopened = || async { Err(NodeError::Stopped) };
+                let opened = opening.get_or_try_init(unopened);
+                match unless(releases.over(), opened).await {
+                    Some(Ok(tenant)) => {
+                        tenant.work.hold.lose(Lost::Shutdown);
+                        let lease = tenant.work.writer.lease();
+                        self.0.released(tenant.id(), lease, releases).await;
+                    }
+                    // Not opened: what opened it gave its lease up.
+                    Some(Err(_)) => {}
+                    None => lost_once_opened(opening),
+                }
+            }
+        });
         join_all(releasing).await;
         if let Err(error) = self.0.coordinator.depart(&self.0.settings.node).await {
             tracing::warn!(%error, "the node could not take itself off the register");
