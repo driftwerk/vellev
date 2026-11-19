@@ -2090,6 +2090,10 @@ async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
     .await
     .expect("the opening never had its lease");
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !given_up(&cluster, "stuck").await,
+        "the opening holds no lease"
+    );
     let bound = RELEASE_WITHIN + Duration::from_secs(1);
     tokio::time::timeout(bound, node.shutdown())
         .await
