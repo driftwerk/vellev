@@ -4230,6 +4230,82 @@ mod tests {
         assert_eq!(gathered.indexing, 1_500.0);
     }
 
+    /// A gathering that stayed in memory, as one of rows with no vectors
+    /// does whatever was planned, holds nothing of a frame going up from
+    /// local disk: its frame goes up with the segment's, as in memory.
+    #[test]
+    fn a_gathering_kept_in_memory_reckons_nothing_going_up() {
+        let planned = Reckoning {
+            rows: 1_000.0,
+            piece: 100.0,
+            part: 100.0,
+            ..Reckoning::default()
+        };
+        let gathered = planned.gathered(1_000, &Gathering::with_capacity(0, 0));
+        assert_eq!(gathered.piece, 0.0);
+        assert_eq!(gathered.part, 0.0);
+    }
+
+    /// `rows` rows of `width` values each, gathered into a spill in `dir`
+    /// as a merge gathers them, unfinished.
+    async fn spilled_gathering(dir: &std::path::Path, rows: usize, width: usize) -> Gathering {
+        use crate::blobs::Disk;
+        use crate::spill::Spills;
+        use crate::stopping::Stopping;
+        let spills = Spills::in_dir(dir.to_path_buf(), Disk::shared().clone(), None);
+        let runtime = tokio::runtime::Handle::current();
+        let asked = spills.asked(runtime, Stopping::never(), "k".into());
+        tokio::task::spawn_blocking(move || {
+            let frame = crate::column::frame_bytes(rows * width, rows) as u64;
+            let spilling = asked.begin(frame).unwrap().unwrap();
+            let mut gathering = Gathering::spilled(rows * width, rows, spilling);
+            let vector = vec![0.5; width];
+            for _ in 0..rows {
+                assert!(gathering.with_room_for(width).unwrap());
+                gathering.push(Some(&vector));
+            }
+            gathering
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A gathered frame larger than the one planned, as when the rows that
+    /// died were mostly those with no vector, is reckoned going up at as
+    /// much of it as a store's part holds, not at what was planned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gathering_larger_than_planned_goes_up_at_as_much_as_a_part_holds() {
+        let mut built = Built::new(&[]);
+        built.commit(vec![long_text_collection()]);
+        let rows = (0..2_048).map(|n| Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: oid(n),
+                properties: BTreeMap::new(),
+                vector: Some(vec![0.5; 4]),
+            },
+        });
+        built.commit(rows.collect());
+        built.flush();
+        built.commit((0..1_024).map(|n| delete(0, n)).collect());
+        let whole = Merge {
+            run: 0..1,
+            keys: Vec::new(),
+        };
+        let planned = built
+            .state
+            .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1 << 20));
+        let dir = tempfile::tempdir().unwrap();
+        let gathering = spilled_gathering(dir.path(), 2_048, 4).await;
+        let frame = gathering.frame_bytes() as f64;
+        assert!(frame > planned.part, "{frame} against {planned:?}");
+        let gathered = planned.gathered(2_048, &gathering);
+        assert_eq!(gathered.part, frame);
+        // And never at more than a part holds.
+        let capped = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+        assert_eq!(capped.gathered(2_048, &gathering).part, 1_000.0);
+    }
+
     /// An open works out what its segment comes to on that segment's own
     /// thread, not all of them on the one that puts them together.
     #[test]
