@@ -485,7 +485,7 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     histograms(
         encoder,
         "sweep_kept_seconds",
-        "Spells sweeps over the memory budget kept a tenant written for, by reason: held elsewhere (held) or building lock busy (building); copies and idle keeps are not timed",
+        "Spells sweeps over budget kept a tenant written for, by reason: held or building",
         "reason",
         KeptFor::ALL.map(|why| (why.name(), timings.seconds(Timed::Kept(why)))),
     )?;
@@ -732,7 +732,7 @@ impl Collector for Counted {
         let counter = ConstCounter::new(0u64);
         let mut family = encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants and copies a sweep chose to let go but kept, by reason: held elsewhere (held) or building lock busy (building)",
+            "Tenants and copies sweeps kept, by reason: held or building",
             None,
             counter.metric_type(),
         )?;
