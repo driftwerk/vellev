@@ -16,7 +16,7 @@ use vellev_core::{
 };
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{MergesStopped, Node, NodeError, Settings};
-use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs, SpillsTold};
+use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs, SpillFigures, SpillsTold};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
 use vellev_storage::timings::{Holder, MergeEnd, Timed};
 use vellev_storage::{Disk, Holding, MergeGate, Mutation, State, MERGE_BUILDS};
@@ -857,10 +857,15 @@ fn spills(dir: &std::path::Path) -> usize {
 async fn a_node_s_merge_gathers_in_its_store_s_cache_and_a_shutdown_leaves_nothing_of_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = ObjectBlobs::new(Arc::new(object_store::memory::InMemory::new()));
-    let cached: Arc<dyn Blobs> = Arc::new(CachedBlobs::new(Arc::new(store), dir.path()));
+    // A disk of its own, so that its figures are this merge's alone: the
+    // shared one counts whatever else in the process spills to it.
+    let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 64);
+    let cached = CachedBlobs::new(Arc::new(store), dir.path()).on(disk);
+    let cached: Arc<dyn Blobs> = Arc::new(cached);
     let node = node_on(cached, |settings| {
         settings.flush_rows = NOTES as usize;
     });
+    assert_eq!(node.spills(), SpillFigures::default(), "a new disk counts");
     let builds = node.merge_builds().clone();
     builds.hold(Some(Holding::GatheringUntilLetGo));
     four_flushes(&node, "merging").await;
