@@ -62,4 +62,5 @@ pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
 pub use vellev_index::pool::merge_slots;
+pub use vellev_index::stop::Stop;
 pub use work::Work;

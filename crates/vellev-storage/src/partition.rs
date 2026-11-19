@@ -1359,9 +1359,13 @@ impl BuildingHeld {
     /// took as it took the tenant out, and holds until the hold on the
     /// tenant is lost. Says how long it held the lock for its flush, its
     /// whole build and commit, or `None` if it found nothing to flush and so
-    /// built nothing. Having no wait for the lock, it times none.
-    pub async fn flush(&mut self) -> Result<(LogPosition, Option<Duration>)> {
+    /// built nothing. Having no wait for the lock, it times none. Its build
+    /// and its upload give up once `stop` is stopped, as a merge's do: work
+    /// off the async threads, which dropping the flush does not reach, then
+    /// lets go of what it holds.
+    pub async fn flush(&mut self, stop: &Stop) -> Result<(LogPosition, Option<Duration>)> {
         let writer = &self.writer;
+        let stopping = Stopping::flush(stop.clone());
         let mut building = Building {
             _guard: None,
             holder: Holder::Flush,
@@ -1369,7 +1373,7 @@ impl BuildingHeld {
             writer,
             timed: true,
         };
-        let position = writer.flushing_held(&mut building).await?;
+        let position = writer.flushing_held(&mut building, &stopping).await?;
         Ok((position, building.timed.then(|| building.held())))
     }
 }
@@ -2146,7 +2150,7 @@ impl Writer {
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
         let mut building = self.building(Holder::Flush).await;
-        self.flushing_held(&mut building).await
+        self.flushing_held(&mut building, &Stopping::never()).await
     }
 
     /// As [`Self::flush`], if it still holds `rows` rows unflushed once it
@@ -2160,7 +2164,8 @@ impl Writer {
             building.built_nothing();
             return Ok(None);
         }
-        self.flushing_held(&mut building).await.map(Some)
+        let stopping = Stopping::never();
+        self.flushing_held(&mut building, &stopping).await.map(Some)
     }
 
     /// The building lock, if nothing holds it or queues for it this moment,
@@ -2190,8 +2195,13 @@ impl Writer {
     }
 
     /// What [`Self::flush`] does once it holds the building lock, as
-    /// `building`: which, if there is nothing to flush, built nothing.
-    async fn flushing_held(&self, building: &mut Building<'_>) -> Result<LogPosition> {
+    /// `building`: which, if there is nothing to flush, built nothing. It
+    /// gives up before its commit once `stopping` is stopped.
+    async fn flushing_held(
+        &self,
+        building: &mut Building<'_>,
+        stopping: &Stopping,
+    ) -> Result<LogPosition> {
         // Noted under the lock it is taken under, so that no rows are
         // applied between: the rows it takes are exactly those it notes.
         let taken = self.partition.read(|state| {
@@ -2204,7 +2214,7 @@ impl Writer {
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged, stopping).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -2298,11 +2308,12 @@ impl Writer {
     /// `snapshot` out of memory, a part at a time so that commits are not
     /// held up while all of them are, and build, upload and load back the
     /// segment of them, if there are any, which is then seen to be fit to
-    /// adopt.
+    /// adopt. Its build, upload and load give up once `stopping` is stopped.
     async fn flushing(
         &self,
         mut snapshot: Snapshot,
         staged: &mut Staged,
+        stopping: &Stopping,
     ) -> Result<(Snapshot, Option<Fit>)> {
         while self
             .partition
@@ -2311,10 +2322,14 @@ impl Writer {
             tokio::task::yield_now().await;
         }
         let named_at = snapshot.position;
-        let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
+        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping);
+        let segment = match uploaded.await? {
             Some(prepared) => {
                 let prepared = FreedOff::new(prepared);
-                Some(self.fit(prepared, &snapshot.catalog, None).await?)
+                Some(
+                    self.fit(prepared, &snapshot.catalog, Some(stopping))
+                        .await?,
+                )
             }
             None => None,
         };
@@ -2398,7 +2413,10 @@ impl Writer {
         let segment = match target.read(State::snapshot) {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
-                match self.uploaded(&mut snapshot, restored, &mut staged).await? {
+                match self
+                    .uploaded(&mut snapshot, restored, &mut staged, &Stopping::never())
+                    .await?
+                {
                     Some(prepared) => {
                         let (meta, loaded) = self.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
@@ -2829,12 +2847,14 @@ impl Writer {
 
     /// Build and upload a segment of the rows taken out of `snapshot` and
     /// its tombstones, its files named at `named_at`; none if it has
-    /// neither.
+    /// neither. Given up, a failure, once `stopping` is stopped: asked as
+    /// the rows are indexed, and before and while each file goes up.
     async fn uploaded(
         &self,
         snapshot: &mut Snapshot,
         named_at: LogPosition,
         staged: &mut Staged,
+        stopping: &Stopping,
     ) -> Result<Option<Prepared>> {
         if snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
             return Ok(None);
@@ -2850,11 +2870,22 @@ impl Writer {
             rows,
             tombstones: snapshot.tombstones.clone(),
         };
-        let built = self
-            .built(file, Some(vectors), snapshot.catalog.clone())
-            .await?;
+        let stopped = || StorageError::Background(format!("the build at {named_at:?} was stopped"));
+        let rows = move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| {
+            Ok(Some((file, Some(vectors), ())))
+        };
+        let catalog = snapshot.catalog.clone();
+        let built = self.built_stopping(rows, catalog, stopping, None).await?;
+        let Some((built, ())) = built else {
+            return Err(stopped());
+        };
         let prepared = Self::prepared(names.meta(shape), built, self.writes())?;
-        self.upload(&prepared, staged).await?;
+        if !self
+            .upload_stopping(&prepared, staged, stopping, None)
+            .await?
+        {
+            return Err(stopped());
+        }
         Ok(Some(prepared))
     }
 
@@ -2889,31 +2920,12 @@ impl Writer {
         }
     }
 
-    /// Index the segment of `file`, its vectors gathered in `vectors` or,
-    /// without, still in its rows, to be taken from them into their column;
-    /// then encode both, sealing the gathered frame, off the async threads
-    /// and out of the state's lock, before anything is written, so that
-    /// neither readers nor commits wait while a large segment is indexed.
-    async fn built(
-        &self,
-        file: SegmentFile,
-        vectors: Option<Gathering>,
-        catalog: Catalog,
-    ) -> Result<Built> {
-        let rows = move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| {
-            Ok(Some((file, vectors, ())))
-        };
-        match self
-            .built_stopping(rows, catalog, &Stopping::never(), None)
-            .await?
-        {
-            Some((built, ())) => Ok(built),
-            None => unreachable!("a build nothing stops is never stopped"),
-        }
-    }
-
-    /// As [`Self::built`], of the rows `rows` comes to, with what else it
-    /// says, giving up, `None`, if it comes to none, or once `stopping` is
+    /// Index the segment of the rows `rows` comes to, their vectors gathered
+    /// or, without, still in the rows, to be taken from them into their
+    /// column; then encode both, sealing the gathered frame, off the async
+    /// threads and out of the state's lock, before anything is written, so
+    /// that neither readers nor commits wait while a large segment is
+    /// indexed. With what else `rows` says, giving up, `None`, if it comes to none, or once `stopping` is
     /// stopped: asked as the rows are indexed, and before and after they
     /// are encoded. `rows` is the work's first step, in the same turn off
     /// the async threads, with no lock held: a merge gathers there, where
@@ -3031,18 +3043,7 @@ impl Writer {
 
     /// Upload a segment's files, the segment's own last so that it never
     /// sits in the store without its companions, noting each in `staged`
-    /// before it goes up.
-    async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
-        match self
-            .upload_stopping(prepared, staged, &Stopping::never(), None)
-            .await?
-        {
-            true => Ok(()),
-            false => unreachable!("an upload nothing stops is never stopped"),
-        }
-    }
-
-    /// As [`Self::upload`], giving up, `false`, once `stopping` is
+    /// before it goes up; giving up, `false`, once `stopping` is
     /// stopped: asked before each file, and while each goes up. A file
     /// given up part way is aborted as its upload is dropped, its parts
     /// discarded ([`crate::Transfers`]); those that went up are deleted
@@ -3223,7 +3224,9 @@ impl Writer {
         }
         let mut staged = self.staging();
         let (snapshot, taking) = self.taken_noted();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let (snapshot, segment) = self
+            .flushing(snapshot, &mut staged, &Stopping::never())
+            .await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -3580,7 +3583,9 @@ impl Writer {
             return Ok(dropped(MergeEnd::Uncovered));
         }
         let (snapshot, taking) = self.taken_noted();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let (snapshot, segment) = self
+            .flushing(snapshot, &mut staged, &Stopping::never())
+            .await?;
         let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -3638,7 +3643,7 @@ impl Writer {
             writer: self,
             timed: true,
         };
-        let flushed = self.flushing_held(&mut building).await;
+        let flushed = self.flushing_held(&mut building, &Stopping::never()).await;
         (flush_first.tried)(flushed.is_ok());
         match flushed {
             Ok(position) => Ok(Some(position)),
@@ -4893,7 +4898,7 @@ impl RestoreFrom<'_> {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match writer
-                    .uploaded(&mut snapshot, restored, &mut staged)
+                    .uploaded(&mut snapshot, restored, &mut staged, &Stopping::never())
                     .await?
                 {
                     Some(prepared) => {

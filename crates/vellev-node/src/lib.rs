@@ -27,7 +27,7 @@ use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
 use vellev_storage::timings::{Timed, Timings};
 use vellev_storage::{
     Batch, BuildingHeld, Embedded, FlushFirst, GroupCommitter, MergeBuilds, Mutation, Receipt,
-    State, StorageError, Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
+    State, Stop, StorageError, Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
 };
 
 mod backing;
@@ -1466,7 +1466,11 @@ impl TenantWork {
         let Some(Ok(_flush)) = flush else {
             return Ok(false);
         };
-        let Some(flushed) = before(deadline, building.flush()).await else {
+        // Stopped at the cut: the flush's build, off the async threads, is
+        // not dropped with it.
+        let stop = Stop::new();
+        let Some(flushed) = before(deadline, building.flush(&stop)).await else {
+            stop.stop();
             return Ok(false);
         };
         self.flush_tried(flushed.is_ok());
