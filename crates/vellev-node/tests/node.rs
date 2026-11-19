@@ -10136,6 +10136,30 @@ fn settings_that_give_releases_no_time_are_refused() {
     );
 }
 
+/// Review of 79b8103, L4: a time for let-go flushes or releases so long that
+/// a sweep's deadline overflows the clock would panic in the sweep. Such
+/// settings are refused, a day allowed.
+#[test]
+fn settings_that_give_let_go_flushes_or_releases_endless_time_are_refused() {
+    let day = Duration::from_secs(24 * 60 * 60);
+    let given = |let_go_flush_within, release_within| Settings {
+        let_go_flush_within,
+        release_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(given(day, day).check().is_ok());
+    for (flushes, releases) in [
+        (Duration::MAX, RELEASE_WITHIN),
+        (LET_GO_FLUSH_WITHIN, Duration::MAX),
+    ] {
+        let refused = given(flushes, releases).check();
+        assert!(
+            matches!(refused, Err(NodeError::Settings(_))),
+            "{flushes:?}, {releases:?}: {refused:?}"
+        );
+    }
+}
+
 /// More flushes or releases at once than a semaphore can hold would panic
 /// in the sweep that makes one. Such settings are refused, the most it can
 /// hold allowed.
