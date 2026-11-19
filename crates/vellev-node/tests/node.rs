@@ -2035,6 +2035,56 @@ async fn shutdown_s_releases_are_bounded_in_number_and_in_time() {
     assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
 }
 
+/// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
+/// opening resolves. One tenant still opening, its lease's acquire
+/// unanswered, holds up no other tenant's release.
+#[tokio::test(start_paused = true)]
+async fn a_slow_opening_holds_up_no_other_release_at_shutdown() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let open = tenant("open");
+    node.create_tenant(&open).await.unwrap();
+    let held = node.tenant(&open).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    drop(held);
+    let slow = tenant("slow");
+    node.create_tenant(&slow).await.unwrap();
+    coordinator.acquires_wait.store(true, Ordering::SeqCst);
+    let opening = tokio::spawn({
+        let node = node.clone();
+        async move { node.tenant(&slow).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the slow opening never came to its acquire");
+    let shutting = tokio::spawn({
+        let node = node.clone();
+        async move { node.shutdown().await }
+    });
+    let released = tokio::time::timeout(RELEASE_WITHIN, async {
+        while !given_up(&cluster, "open").await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(!opening.is_finished(), "the slow opening ended");
+    coordinator.acquire_gate.add_permits(1);
+    released.expect("a slow opening held up another tenant's release");
+    tokio::time::timeout(RELEASE_WITHIN, shutting)
+        .await
+        .expect("shutdown outlasted its releases")
+        .unwrap();
+}
+
 /// `name` made on `node` with ten notes with vectors, flushed if
 /// `flushed`, and no longer used.
 async fn written_to_let_go(node: &Node, name: &str, flushed: bool) {
@@ -2485,6 +2535,11 @@ struct Unrenewing {
     backup_claimed: Hook,
     /// How many claims on backups were asked for.
     claims: AtomicUsize,
+    /// Whether a lease's acquire waits for a permit from
+    /// [`Self::acquire_gate`], and how many wait so now.
+    acquires_wait: AtomicBool,
+    acquires_waiting: AtomicUsize,
+    acquire_gate: tokio::sync::Semaphore,
 }
 
 /// A call counted in flight until it ends, however it ends.
@@ -2554,6 +2609,9 @@ impl Unrenewing {
             commits_failing: AtomicBool::new(false),
             backup_claimed: Hook::default(),
             claims: AtomicUsize::new(0),
+            acquires_wait: AtomicBool::new(false),
+            acquires_waiting: AtomicUsize::new(0),
+            acquire_gate: tokio::sync::Semaphore::new(0),
             unanswered_commits: AtomicBool::new(false),
             hang_after_commit: AtomicBool::new(false),
             landed: tokio::sync::Notify::new(),
@@ -2620,6 +2678,12 @@ impl Coordinator for Unrenewing {
         holder: &NodeId,
         ttl: Duration,
     ) -> Result<Acquired, CoordinatorError> {
+        if self.acquires_wait.load(Ordering::SeqCst) {
+            self.acquires_waiting.fetch_add(1, Ordering::SeqCst);
+            let permit = self.acquire_gate.acquire().await.expect("acquire gate");
+            permit.forget();
+            self.acquires_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
         self.inner.acquire(key, holder, ttl).await
     }
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
