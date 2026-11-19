@@ -18,8 +18,16 @@
 //! so bytes written after the frame, or a name given twice in it, are
 //! refused, and a write end still open elsewhere, like a supervisor that
 //! never writes, is an error at the deadline (saying which) rather than a
-//! node waiting for ever. Errors name one of the two variables or a
+//! node waiting for ever. The node then exits refused, and its supervisor
+//! sees a start that failed. Errors name one of the two variables or a
 //! position, never a value, nor a name the node doesn't take.
+//!
+//! Only these two take the pipe: embedding keys and an object store's
+//! credentials still come from the environment. On Linux another process
+//! of the same user can open `/proc/<pid>/fd/<n>` in the moment before the
+//! node reads, so the pipe shortens the exposure the environment had but
+//! does not close it; taking or adding to the payload there fails the
+//! start.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -30,8 +38,11 @@ use eyre::{bail, eyre, Result};
 
 use crate::config::Config;
 
-/// The most a payload may hold.
-pub const MAX_BYTES: usize = 64 * 1024;
+/// The most a payload may hold: with its 4-byte length, the most a fresh
+/// pipe buffers on macOS (16 KiB; Linux's hold 64), as the supervisor
+/// writes it all before the node starts to read.
+pub const MAX_BYTES: usize = 16 * 1024 - 4;
+const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
 pub const READ_WITHIN: Duration = Duration::from_secs(10);
 
@@ -172,10 +183,15 @@ impl Inherited {
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
-            Ok(Err(Unread::TooLong)) => bail!("the secrets are over {MAX_BYTES} bytes"),
+            Ok(Err(Unread::TooLong)) => bail!(
+                "the secrets' length is over the most the secrets may hold ({MAX_BYTES} bytes)"
+            ),
             Ok(Err(Unread::Short)) => bail!("the secrets ended before their length"),
             Ok(Err(Unread::After)) => {
-                bail!("more was written after the secrets; the supervisor writes them once")
+                bail!(
+                    "more was written after the secrets' framed length: the supervisor writes \
+                     them once, after their exact length"
+                )
             }
             Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -522,6 +538,16 @@ mod tests {
     /// supervisor writes each once. Only a known name is repeated.
     #[test]
     fn a_name_given_twice_is_refused() {
+        let url_twice = br#"{"VELLEV_DATABASE_URL":"postgres://u:a-fixture@h/db","VELLEV_API_KEYS":"k","VELLEV_DATABASE_URL":"postgres://u:b-fixture@h/db"}"#;
+        let err = format!("{:#}", through_pipe(&framed(url_twice)).unwrap_err());
+        assert!(
+            err.contains("VELLEV_DATABASE_URL was handed over twice"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("a-fixture") && !err.contains("b-fixture"),
+            "{err}"
+        );
         let twice = br#"{"VELLEV_DATABASE_URL":"postgres://db","VELLEV_API_KEYS":"a-fixture","VELLEV_API_KEYS":"b-fixture"}"#;
         let err = format!("{:#}", through_pipe(&framed(twice)).unwrap_err());
         assert!(
@@ -549,8 +575,35 @@ mod tests {
                 .unwrap()
                 .apply(&mut config)
                 .unwrap();
+            assert_eq!(config.database_url, "postgres://from-pipe");
             assert_eq!(config.api_keys, ["k-fixture"]);
         }
+    }
+
+    /// The supervisor writes the frame before the node starts, so the
+    /// largest one allowed must fit a fresh pipe's buffer (16 KiB on macOS,
+    /// 64 KiB on Linux) or the supervisor would wait for ever. A payload of
+    /// exactly the most is taken, one byte more is refused.
+    #[test]
+    fn the_largest_frame_fits_a_fresh_pipe() {
+        let mut most = BOTH.to_vec();
+        most.resize(MAX_BYTES, b' ');
+        let read = through_pipe(&framed(&most)).unwrap();
+        assert_eq!(read.api_keys, ["k-fixture"]);
+        let mut over = most;
+        over.push(b' ');
+        let err = format!("{:#}", through_pipe(&framed(&over)).unwrap_err());
+        assert!(err.contains("over the most the secrets may hold"), "{err}");
+    }
+
+    /// A length shorter than the payload is reported as the frame's length
+    /// being wrong, not only as more being written.
+    #[test]
+    fn a_length_shorter_than_the_payload_is_named() {
+        let mut short = (BOTH.len() as u32 - 1).to_be_bytes().to_vec();
+        short.extend_from_slice(BOTH);
+        let err = format!("{:#}", through_pipe(&short).unwrap_err());
+        assert!(err.contains("framed length"), "{err}");
     }
 
     #[test]
@@ -567,10 +620,10 @@ mod tests {
             (framed(b"VELLEV_API_KEYS=k-fixture"), "line 1, column"),
             (
                 ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
-                "over 65536 bytes",
+                "over the most the secrets may hold",
             ),
         ] {
-            let err = through_pipe(&bad).unwrap_err().to_string();
+            let err = format!("{:#}", through_pipe(&bad).unwrap_err());
             assert!(err.contains(reason), "{reason}: {err}");
             assert!(
                 !err.contains("k-fixture") && !err.contains("12345678"),
@@ -585,7 +638,7 @@ mod tests {
     #[test]
     fn a_silent_pipe_or_a_held_write_end_is_refused_at_the_deadline() {
         let (reader, writer) = std::io::pipe().unwrap();
-        let silent = Inherited::read(reader.into(), Duration::from_millis(200))
+        let silent = Inherited::read(reader.into(), Duration::from_secs(1))
             .unwrap_err()
             .to_string();
         assert!(silent.contains("didn't arrive within"), "{silent}");
@@ -595,11 +648,21 @@ mod tests {
         // of the write end, not one that never wrote.
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(&framed(BOTH)).unwrap();
-        let held = Inherited::read(reader.into(), Duration::from_millis(200))
+        let held = Inherited::read(reader.into(), Duration::from_secs(1))
             .unwrap_err()
             .to_string();
         assert!(held.contains("write end is still open"), "{held}");
         assert!(!held.contains("didn't arrive"), "{held}");
+        drop(writer);
+        // Only part of the payload, and the pipe held: the secrets did not
+        // arrive.
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let whole = framed(BOTH);
+        writer.write_all(&whole[..whole.len() - 3]).unwrap();
+        let part = Inherited::read(reader.into(), Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(part.contains("didn't arrive within"), "{part}");
         drop(writer);
     }
 
