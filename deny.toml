@@ -37,8 +37,22 @@ ignore = true
 # own, trusted with its data already, and `object_store` 0.12.5 pins
 # `quick-xml` 0.38, so nothing short of the next `object_store` fixes it;
 # `cargo update` cannot. Revisit by 2026-11-09: DW-670.
+#
+# RUSTSEC-2026-0543 and RUSTSEC-2026-0542 say `chrono`, and `humantime`
+# that wraps it, are unmaintained: no fault is known in either, and there
+# is no release to move to. `object_store` needs both in every release up
+# to 0.14.2, so neither can leave the build while it is the node's store,
+# however vellev's own code keeps time. Ignored with the owner's OK of
+# 2026-11-19. Revisit by 2027-02-19, or as soon as `object_store` drops
+# `chrono`: DW-670.
 [advisories]
-ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
+]
 
 [bans]
 multiple-versions = "allow"

@@ -19,10 +19,25 @@ jobs:
     uses: ./.github/workflows/ci.yml
     secrets: inherit
 
+  # The per-commit gates leave advisories out, so that one reported
+  # overnight does not turn unrelated pull requests red; a release is
+  # different, as it is what goes out to installs. Nothing is published
+  # with a dependency that has an advisory the ignores in deny.toml do not
+  # name, each with its reason and the owner's OK.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, advisories]
     env:
       # In dependency order. The server's crates are not published.
       CRATES: vellev-core vellev-index vellev-api vellev-client

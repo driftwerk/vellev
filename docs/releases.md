@@ -6,6 +6,17 @@ node of that release answers differently. The breaking changes are those
 `cargo semver-checks` finds against the release before, and whatever it
 cannot see.
 
+## What stops a release
+
+A release is checked by every gate a commit to main is, and by one more:
+no dependency may have an advisory in the RustSec database that
+`deny.toml` does not ignore. A pull request is not held to that, so that
+an advisory reported overnight does not turn unrelated work red; the
+nightly checks it instead, and opens an issue while it fails. An
+advisory reported the morning of a release therefore stops it, until the
+dependency is moved off or the advisory is ignored in `deny.toml` with
+its reason, a date to look at it again, and the owner's OK.
+
 ## 0.2.0
 
 Bring clients up to this release before the nodes: see
