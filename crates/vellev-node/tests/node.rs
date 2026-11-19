@@ -2035,6 +2035,76 @@ async fn shutdown_s_releases_are_bounded_in_number_and_in_time() {
     assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
 }
 
+/// `tenant` opening on `node`, on a task of its own, held at its lease's
+/// acquire by `coordinator`'s gate, which holds every acquire from now on.
+async fn acquire_gated(
+    coordinator: &Unrenewing,
+    node: &Node,
+    tenant: TenantId,
+) -> tokio::task::JoinHandle<Result<(), NodeError>> {
+    coordinator.acquires_wait.store(true, Ordering::SeqCst);
+    let opening = tokio::spawn({
+        let node = node.clone();
+        async move { node.tenant(&tenant).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the opening never came to its acquire");
+    opening
+}
+
+/// Review of 31452e7, M1: a node that has shut down renews no lease. An
+/// opening held in `Writer::open`, its lease acquired, is not waited for by
+/// shutdown, and once shutdown returns its lease is renewed no more: it runs
+/// out at its TTL.
+#[tokio::test(start_paused = true)]
+async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
+    let cluster = Cluster::new();
+    let stuck = tenant("stuck");
+    let first = cluster.node();
+    first.create_tenant(&stuck).await.unwrap();
+    let held = first.tenant(&stuck).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_notes(0)).await.unwrap();
+    drop(held);
+    first.shutdown().await;
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let opening = acquire_gated(&coordinator, &node, stuck).await;
+    // Its reads take a day: it holds its lease in Writer::open.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_secs(24 * 60 * 60));
+    coordinator.acquire_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.acquires_waiting.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the opening never had its lease");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("shutdown waited for the stuck opening");
+    let renewed = coordinator.lease_renewals.load(Ordering::SeqCst);
+    tokio::time::sleep(LEASE * 2).await;
+    assert!(!opening.is_finished(), "the opening ended");
+    assert_eq!(
+        coordinator.lease_renewals.load(Ordering::SeqCst),
+        renewed,
+        "renewed after shutdown"
+    );
+    assert!(given_up(&cluster, "stuck").await, "its lease never ran out");
+}
+
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
 /// opening resolves. One tenant still opening, its lease's acquire
 /// unanswered, holds up no other tenant's release.
@@ -2054,18 +2124,7 @@ async fn a_slow_opening_holds_up_no_other_release_at_shutdown() {
     drop(held);
     let slow = tenant("slow");
     node.create_tenant(&slow).await.unwrap();
-    coordinator.acquires_wait.store(true, Ordering::SeqCst);
-    let opening = tokio::spawn({
-        let node = node.clone();
-        async move { node.tenant(&slow).await.map(|_| ()) }
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("the slow opening never came to its acquire");
+    let opening = acquire_gated(&coordinator, &node, slow).await;
     let shutting = tokio::spawn({
         let node = node.clone();
         async move { node.shutdown().await }
@@ -2097,18 +2156,7 @@ async fn an_opening_that_never_ends_holds_shutdown_up_no_longer_than_its_release
     });
     let stuck = tenant("stuck");
     node.create_tenant(&stuck).await.unwrap();
-    coordinator.acquires_wait.store(true, Ordering::SeqCst);
-    let _opening = tokio::spawn({
-        let node = node.clone();
-        async move { node.tenant(&stuck).await.map(|_| ()) }
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while coordinator.acquires_waiting.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("the opening never came to its acquire");
+    let _opening = acquire_gated(&coordinator, &node, stuck).await;
     let bound = RELEASE_WITHIN + Duration::from_secs(1);
     tokio::time::timeout(bound, node.shutdown())
         .await
@@ -2566,9 +2614,11 @@ struct Unrenewing {
     /// How many claims on backups were asked for.
     claims: AtomicUsize,
     /// Whether a lease's acquire waits for a permit from
-    /// [`Self::acquire_gate`], and how many wait so now.
+    /// [`Self::acquire_gate`].
     acquires_wait: AtomicBool,
+    /// How many acquires wait for a permit now.
     acquires_waiting: AtomicUsize,
+    /// Permits for acquires to go on, none to begin with.
     acquire_gate: tokio::sync::Semaphore,
 }
 
