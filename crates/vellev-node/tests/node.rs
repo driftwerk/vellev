@@ -2264,6 +2264,67 @@ async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() 
     );
 }
 
+/// Review of d8fb3ca, M1: once its hold is lost, a tenant does no more
+/// work for a request that holds it still. A compact or a flush is refused
+/// at once, as a write is, and the compact takes no turn among the node's
+/// merge builds: nothing goes on building the tenant's data in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = Duration::from_secs(3);
+    });
+    let name = tenant("lost");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    for from in [10, 20, 30, 40] {
+        held.write(ten_notes(from)).await.unwrap();
+        held.flush().await.unwrap();
+    }
+    // A merge held at its build, stopped as the refused renewal loses the
+    // hold: how the rule knows the hold is lost.
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilStopped));
+    let first = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    until("the first merge at its build", || builds.held() > 0).await;
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    until("the merge stopped by the refused renewal", || {
+        node.merges().stopped.lease == 1
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the stopped merge's request never ended")
+        .unwrap()
+        .unwrap();
+    builds.hold(None);
+    let turns = builds.turns_taken();
+    let refused = |what: &str, outcome: Result<(), NodeError>| {
+        assert!(
+            matches!(outcome, Err(NodeError::Storage(StorageError::Closed))),
+            "{what} on a lost hold: {outcome:?}"
+        );
+    };
+    refused("a write", held.write(ten_notes(50)).await.map(drop));
+    let compacted = tokio::time::timeout(
+        Duration::from_secs(5),
+        held.compact(Duration::from_secs(60 * 60)),
+    )
+    .await
+    .expect("a compact on a lost hold was not refused at once");
+    refused("a compact", compacted.map(drop));
+    assert_eq!(builds.turns_taken(), turns, "the compact took a merge turn");
+    refused("a flush", held.flush().await.map(drop));
+}
+
 /// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
 /// opening resolves. One tenant still opening, its lease's acquire
 /// unanswered, holds up no other tenant's release.
