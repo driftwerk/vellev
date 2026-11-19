@@ -901,6 +901,8 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
 
     // Told otherwise, as one that fills after it is asked, the write says.
     told.free.store(u64::MAX - 1, Ordering::SeqCst);
+    let room = || disk_room(cache.path()).expect("the room on it").0;
+    let free = room();
 
     let full = within(LONG, "the merge on a full disk", writer.merge()).await;
     let error = full.expect_err("nothing to gather its vectors on");
@@ -909,6 +911,8 @@ async fn a_disk_that_really_fills_fails_the_merge_and_leaves_nothing() {
         "{error}"
     );
     settled("what it wrote stays", || files(cache.path()) == before).await;
+    // Its name gone, and nothing holding its file open: the room is back.
+    settled("the room it took never came back", || room() >= free).await;
     assert_eq!(cluster.committed().await.manifest, manifest);
 
     // With the room back the merge commits, told so: a small disk never has
