@@ -1462,7 +1462,7 @@ impl TenantWork {
         flushes: &Semaphore,
         deadline: Instant,
     ) -> Result<LetGoFlush> {
-        if self.read(State::unflushed) == 0 {
+        if !self.read(State::holds_unflushed) {
             return Ok(LetGoFlush::Done);
         }
         // A hold lost, or a writer closed, as by a reopen here that fenced

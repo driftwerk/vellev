@@ -2237,6 +2237,13 @@ impl State {
         self.memtable.rows.len()
     }
 
+    /// Whether a flush has anything to take out of memory: rows written
+    /// since the last checkpoint, or tombstones, which [`Self::unflushed`]
+    /// does not count.
+    pub fn holds_unflushed(&self) -> bool {
+        !self.memtable.rows.is_empty() || !self.memtable.tombstones.is_empty()
+    }
+
     /// About how many bytes what is held in memory until the next flush
     /// takes: the rows written since the last checkpoint, with whatever
     /// codes they are searched by. Counted in [`Self::resident`] too.
