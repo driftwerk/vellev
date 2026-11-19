@@ -24,7 +24,7 @@ use vellev_storage::coordinator::{
     Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
-use vellev_storage::timings::{KeptFor, Timed, Timings};
+use vellev_storage::timings::{Event, KeptFor, Timed, Timings};
 use vellev_storage::{
     Batch, BuildingHeld, Embedded, FlushFirst, GroupCommitter, MergeBuilds, Mutation, Receipt,
     State, Stop, StorageError, Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
@@ -2384,6 +2384,12 @@ impl Node {
     pub fn tenants_kept_by_sweeps(&self) -> u64 {
         let KeptBySweeps { held, building } = self.kept_by_sweeps();
         held + building
+    }
+
+    /// The keep spells not yet ended, each as an event of how long it has
+    /// run so far. Not reported yet.
+    pub fn kept_spells_open(&self) -> Vec<Event> {
+        Vec::new()
     }
 
     /// [`Self::tenants_kept_by_sweeps`] by why each was kept.

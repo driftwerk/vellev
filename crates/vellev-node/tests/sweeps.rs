@@ -696,6 +696,37 @@ async fn a_tenant_its_merge_commit_holds_under_the_lock_is_timed_as_one_held_spe
     );
 }
 
+/// Review of f800a51, M1: a tenant still kept when the events are read has
+/// its spell so far reported, as no event of an ended spell tells it: so
+/// that a tenant kept to the end of a run is held to the mark.
+#[tokio::test(start_paused = true)]
+async fn a_spell_still_open_when_read_is_reported_as_it_stands() {
+    let node = over_budget(memory());
+    node.timings().keep_events(true);
+    let writer = written(&node, "busy", 2).await;
+    unused_long_enough().await;
+    let _building = writer.building_when_free().await;
+    node.timings().drain_events();
+    node.sweep_now().await;
+    let kept_for = Duration::from_secs(90);
+    tokio::time::sleep(kept_for).await;
+    node.sweep_now().await;
+    let ended = node.timings().drain_events();
+    assert_eq!(
+        took(&ended, Timed::Kept(KeptFor::Building)),
+        Vec::<Duration>::new(),
+        "{ended:?}"
+    );
+    let open = node.kept_spells_open();
+    let spells = took(&open, Timed::Kept(KeptFor::Building));
+    assert_eq!(spells.len(), 1, "{open:?}");
+    assert!(
+        spells[0] >= kept_for && spells[0] < kept_for + Duration::from_secs(1),
+        "{spells:?}"
+    );
+    assert_eq!(open[0].partition, "busy/0");
+}
+
 /// A tenant a request holds, chosen to be let go, is kept as held, not as
 /// one whose building lock is busy: what keeps it is looked at first.
 #[tokio::test(start_paused = true)]
