@@ -856,6 +856,9 @@ pub(crate) struct Reckoning {
     /// The most a store holds of a frame going up, which `part` never
     /// passes, whatever frame was gathered: none, gathered in memory.
     pub part_at_most: f64,
+    /// A clustered index's file, encoded once it is built and held as the
+    /// vectors go up.
+    pub index_file: f64,
     /// What the run's tombstones take, if they are carried on.
     pub tombstones: f64,
     /// Their segment's frame, as [`encoded_bytes`] counts it.
@@ -4235,6 +4238,68 @@ mod tests {
         assert_eq!(gathered.encoded, 250.0);
         assert_eq!(gathered.indexed, 1_000.0);
         assert_eq!(gathered.indexing, 1_500.0);
+    }
+
+    /// A run of `rows` rows of `width` values each, of one collection, in
+    /// one segment.
+    fn of_vectors(rows: usize, width: usize) -> Built {
+        let mut built = Built::new(&[]);
+        built.commit(vec![long_text_collection()]);
+        let upserts = (0..rows).map(|n| Op::Upsert {
+            collection: CollectionId(0),
+            object: Object {
+                id: oid(n as u128),
+                properties: BTreeMap::new(),
+                vector: (width > 0).then(|| vec![0.5; width]),
+            },
+        });
+        built.commit(upserts.collect());
+        built.flush();
+        built
+    }
+
+    /// A clustered merge's index file is encoded before its vectors go up,
+    /// and held as they do: reckoned going up, beside its indexes, the
+    /// segment's frame and a part, as no other stage holds it. A merge
+    /// whose vectors are coded, not clustered, writes no index file.
+    #[test]
+    fn a_clustered_merge_reckons_its_index_file_going_up() {
+        let built = of_vectors(5_000, 4);
+        let whole = Merge {
+            run: 0..1,
+            keys: Vec::new(),
+        };
+        let coded = built.state.merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+        let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
+        assert_eq!(coded.index_file, 0.0);
+        // Its codes and factors, as coded, and its centroids.
+        let (width, clusters) = (64.0, (5_000f64).sqrt().floor());
+        let index_file = 5_000.0 * (width / 8.0 + 12.0) + clusters * width * 4.0;
+        assert_eq!(clustered.index_file, index_file);
+        let going_up = Reckoning {
+            part: 100.0,
+            index_file: 50.0,
+            ..Reckoning::default()
+        };
+        assert_eq!(going_up.peak(), 150);
+    }
+
+    /// A run with no vectors gathers none on disk, and so is reckoned to
+    /// hold none of a frame going up, nor a piece of it written, however
+    /// a store spills.
+    #[test]
+    fn a_plan_of_rows_without_vectors_reckons_nothing_of_a_spill() {
+        let built = of_vectors(2_048, 0);
+        let whole = Merge {
+            run: 0..1,
+            keys: Vec::new(),
+        };
+        let spilled = built
+            .state
+            .merge_reckoning(&whole, CLUSTERED_ABOVE, Some(1_000));
+        assert_eq!(spilled.piece, 0.0);
+        assert_eq!(spilled.part, 0.0);
+        assert_eq!(spilled.part_at_most, 0.0);
     }
 
     /// A gathering that stayed in memory, as one of rows with no vectors
