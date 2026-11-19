@@ -1455,6 +1455,12 @@ impl TenantWork {
         if self.read(State::unflushed) == 0 {
             return Ok(LetGoFlush::Done);
         }
+        // A hold lost, or a writer closed, as by a reopen here that fenced
+        // the lease, has nothing to flush for: its commit would be refused.
+        let superseded = || self.hold.is_lost() || self.writer.is_closed();
+        if superseded() {
+            return Ok(LetGoFlush::Superseded);
+        }
         let timings = self.writer.timings();
         let partition = &self.writer.lease().key;
         let asked = Instant::now();
@@ -1463,6 +1469,9 @@ impl TenantWork {
         let Some(Ok(_flush)) = flush else {
             return Ok(LetGoFlush::Skipped);
         };
+        if superseded() {
+            return Ok(LetGoFlush::Superseded);
+        }
         // Stopped at the cut: the flush's build, off the async threads, is
         // not dropped with it.
         let stop = Stop::new();
@@ -1701,6 +1710,9 @@ enum LetGoFlush {
     /// Cut in its commit, which closed the writer: its rows replay unless
     /// its commit landed.
     Unknown,
+    /// Not made, as the hold on the tenant was lost or its writer closed
+    /// before it began: superseded, as by the tenant opened here again.
+    Superseded,
 }
 
 /// What `work` comes to, if it ends before `deadline`: never polled once the
@@ -2894,6 +2906,9 @@ impl Inner {
             Ok(LetGoFlush::Skipped) => {
                 self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(tenant = %tenant.id(), "flush before letting go skipped; the next opener replays its rows");
+            }
+            Ok(LetGoFlush::Superseded) => {
+                tracing::info!(tenant = %tenant.id(), "flush before letting go not made: the hold on the tenant was lost");
             }
             Ok(LetGoFlush::Unknown) => {
                 self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
