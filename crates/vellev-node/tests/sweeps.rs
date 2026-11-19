@@ -693,7 +693,11 @@ async fn a_let_go_superseded_while_it_waits_for_a_flush_does_not_flush() {
 /// again as the tenant waits among those a sweep flushes, its building lock
 /// taken as it was taken out. It queues behind that lock, and never has it:
 /// the flush that goes through is the let-go's, under the lock it was taken
-/// with, and losing the hold ends what queued.
+/// with, and losing the hold ends what queued. That the task queued is
+/// asserted (review A of #177, L5), so that a backoff that misses the gap
+/// fails the rule rather than passing it. The order of `lose` and the drop
+/// of the lock is not shown here: on this runtime nothing runs between them,
+/// so only a multi-thread runtime could see it, and only by a race.
 #[tokio::test(start_paused = true)]
 async fn a_flush_queued_behind_a_let_go_never_runs() {
     let store = TenantPuts::new();
@@ -708,7 +712,7 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
     written(&node, "first", 1).await;
     written(&node, "second", 1).await;
     store.fail_vectors("third", true);
-    written(&node, "third", 3).await;
+    let third = written(&node, "third", 3).await;
     until(5, "its flush task's flush failed", || {
         node.flushing().failed == 1
     })
@@ -716,6 +720,7 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
     store.fail_vectors("third", false);
     node.timings().drain_events();
     unused_long_enough().await;
+    let asked = third.flushes_asked_for_building();
     // The two before it hold the sweep's flushes past the try of its flush
     // task, with `backoff` left of 2 s from the failure.
     store.hold("first", Duration::from_secs(3));
@@ -734,6 +739,11 @@ async fn a_flush_queued_behind_a_let_go_never_runs() {
         named(Timed::BuildingWait(Holder::Flush)),
         0,
         "a flush had the lock between a tenant's taking and its hold lost: {events:?}"
+    );
+    assert_eq!(
+        third.flushes_asked_for_building(),
+        asked + 1,
+        "its flush task never queued for the lock as it waited to be flushed"
     );
     assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
     let opened = node.tenant(&tenant("third")).await.unwrap();
