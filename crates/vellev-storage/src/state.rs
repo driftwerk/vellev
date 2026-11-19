@@ -856,8 +856,9 @@ pub(crate) struct Reckoning {
     /// The most a store holds of a frame going up, which `part` never
     /// passes, whatever frame was gathered: none, gathered in memory.
     pub part_at_most: f64,
-    /// A clustered index's file, encoded once it is built and held as the
-    /// vectors go up.
+    /// A clustered index's file: as it is encoded once the index is built,
+    /// held as a frame is, at [`ENCODED_AT_PEAK`] of it, and then whole as
+    /// the vectors go up.
     pub index_file: f64,
     /// What the run's tombstones take, if they are carried on.
     pub tombstones: f64,
@@ -895,8 +896,12 @@ impl Reckoning {
     /// About how many bytes the merge holds at its peak.
     pub(crate) fn peak(&self) -> usize {
         let built = self.indexed + self.training.max(self.encoded * ENCODED_AT_PEAK);
+        // Its index file encoded as its frame is, beside it.
+        let encoding = self.indexed + self.encoded + self.index_file * ENCODED_AT_PEAK;
         let going_up = self.indexed + self.encoded + self.index_file + self.part;
-        let staged = self.piece.max(self.indexing).max(built).max(going_up);
+        let staged = (self.piece.max(self.indexing).max(built))
+            .max(encoding)
+            .max(going_up);
         (self.rows + self.vectors + self.tombstones + staged) as usize
     }
 
@@ -4360,14 +4365,18 @@ mod tests {
             part: 50.0,
             ..Reckoning::default()
         };
-        assert_eq!(encoding.peak(), (10.0 + 20.0 + 100.0 * ENCODED_AT_PEAK) as usize);
+        assert_eq!(
+            encoding.peak(),
+            (10.0 + 20.0 + 100.0 * ENCODED_AT_PEAK) as usize
+        );
         let built = of_vectors(5_000, 4);
         let whole = Merge {
             run: 0..1,
             keys: Vec::new(),
         };
         let clustered = built.state.merge_reckoning(&whole, 1_000, Some(1_000));
-        let encoded = clustered.indexed + clustered.encoded + clustered.index_file * ENCODED_AT_PEAK;
+        let encoded =
+            clustered.indexed + clustered.encoded + clustered.index_file * ENCODED_AT_PEAK;
         assert!(clustered.peak() as f64 >= encoded, "{clustered:?}");
     }
 
