@@ -976,7 +976,84 @@ async fn silent() -> String {
 #[test]
 #[allow(deprecated)]
 fn bedrock_keeps_the_retry_behaviour_its_timings_were_tuned_for() {
-    assert!(Bedrock::behavior() == BehaviorVersion::v2026_01_12());
+    assert_eq!(Bedrock::behavior(), BehaviorVersion::v2026_01_12());
+}
+
+/// A Bedrock that answered with a server error may be in a bad way on
+/// that connection: the retry is sent on a new one. Retry Behavior 2.1
+/// reuses it, so this also fails if the behaviour held is not the one the
+/// node's retries were tuned for, through an SDK change or a change here.
+#[tokio::test]
+async fn a_call_retried_after_a_server_error_is_sent_on_a_new_connection() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let peers: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
+    let invoke = |State(peers): State<Arc<Mutex<Vec<SocketAddr>>>>,
+                  ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+        let first = {
+            let mut peers = peers.lock().unwrap();
+            peers.push(peer);
+            peers.len() == 1
+        };
+        if first {
+            let refusal = Json(json!({ "message": "not now" }));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("x-amzn-errortype", "InternalServerException")],
+                refusal,
+            ));
+        }
+        Ok(Json(
+            json!({ "embedding": [1, 0], "inputTextTokenCount": 1 }),
+        ))
+    };
+    let router = Router::new()
+        .route("/model/{model}/invoke", post(invoke))
+        .with_state(peers.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+
+    let config = aws_sdk_bedrockruntime::Config::builder()
+        .behavior_version(Bedrock::behavior())
+        .region(Region::new("eu-west-2"))
+        .credentials_provider(Credentials::new(
+            "AKIDEXAMPLE",
+            "secret",
+            None,
+            None,
+            "test",
+        ))
+        .endpoint_url(url)
+        .retry_config(Bedrock::retries().with_initial_backoff(Duration::from_millis(5)))
+        .timeout_config(Bedrock::timeouts())
+        .build();
+    let provider = Bedrock::with_client(
+        aws_sdk_bedrockruntime::Client::from_conf(config),
+        TITAN,
+        256,
+    )
+    .unwrap();
+
+    let vectors = provider
+        .embed(vec!["fox".into()], Purpose::Document)
+        .await
+        .unwrap();
+    assert_eq!(vectors.len(), 1);
+    let peers = peers.lock().unwrap().clone();
+    assert_eq!(peers.len(), 2, "one refused try and one answered");
+    assert_ne!(
+        peers[0], peers[1],
+        "the retry reused the refused connection"
+    );
 }
 
 /// Titan as it would be reached at `url`, with the tries and the times
