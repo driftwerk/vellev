@@ -1994,7 +1994,7 @@ impl Taken {
 }
 
 /// A spell of a tenant kept by sweeps over the budget, for one reason: from
-/// the first sweep that kept it so to the last, as far as sweeps saw it.
+/// the first sweep that kept it so to the last.
 #[derive(Debug)]
 struct KeptSpell {
     why: KeptFor,
@@ -2007,6 +2007,17 @@ impl KeptSpell {
     /// How long it has run, to the last sweep that kept it.
     fn took(&self) -> Duration {
         self.last.saturating_duration_since(self.first)
+    }
+
+    /// Its events as it stands at `upper`, the first sweep that did not
+    /// keep it, or the read of one still open: how long it ran, and its
+    /// upper end.
+    fn timed(&self, upper: Instant) -> [(Timed, Duration); 2] {
+        let up_to = upper.saturating_duration_since(self.first);
+        [
+            (Timed::Kept(self.why), self.took()),
+            (Timed::KeptUpTo(self.why), up_to),
+        ]
     }
 }
 
@@ -2520,18 +2531,20 @@ impl Node {
         held + building
     }
 
-    /// The keep spells not yet ended, each as an event of how long it has
-    /// run so far, to the last sweep that kept it, as no event of an ended
-    /// spell tells it: so that a bench holds a tenant kept to the end of
-    /// its run to the keep mark.
+    /// The keep spells not yet ended, each as events of how long it has
+    /// run so far, and its upper end, to now, as no event of an ended spell
+    /// tells them: so that a bench holds a tenant kept to the end of its run
+    /// to the keep mark.
     pub fn kept_spells_open(&self) -> Vec<Event> {
-        let at = std::time::Instant::now();
+        let (now, at) = (Instant::now(), std::time::Instant::now());
         let since = self.0.kept_since.lock().expect("kept since lock");
-        let open = since.values().map(|spell| Event {
-            timed: Timed::Kept(spell.why),
-            took: spell.took(),
-            partition: spell.partition.clone(),
-            at,
+        let open = since.values().flat_map(|spell| {
+            spell.timed(now).map(|(timed, took)| Event {
+                timed,
+                took,
+                partition: spell.partition.clone(),
+                at,
+            })
         });
         open.collect()
     }
@@ -3300,9 +3313,9 @@ impl Inner {
             match goes_on {
                 true => spell.last = now,
                 false => {
-                    let took = spell.took();
-                    self.timings
-                        .record(Timed::Kept(spell.why), &spell.partition, took);
+                    for (timed, took) in spell.timed(now) {
+                        self.timings.record(timed, &spell.partition, took);
+                    }
                 }
             }
             goes_on
