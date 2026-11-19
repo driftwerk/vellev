@@ -25,8 +25,9 @@
 //! credentials still come from the environment. On Linux another process
 //! of the same user can open `/proc/<pid>/fd/<n>` in the moment before the
 //! node reads, so the pipe shortens the exposure the environment had but
-//! does not close it; taking or adding to the payload there fails the
-//! start.
+//! does not close it: such a process can read the payload, and can even
+//! replace it whole, undetected. Only a partial read or bytes added once
+//! the node reads fail the start. macOS has no such path.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -37,9 +38,12 @@ use eyre::{bail, eyre, Result};
 
 use crate::config::Config;
 
-/// The most a payload may hold: with its 4-byte length, the most a fresh
-/// pipe buffers on macOS (16 KiB; Linux's hold 64), as the supervisor
-/// writes it all before the node starts to read.
+/// The most a payload may hold: a conservative cap, so that with its 4-byte
+/// length it fits a default fresh pipe (16 KiB on macOS, 64 KiB on Linux),
+/// as the supervisor writes it all before the node starts to read. A
+/// Linux user over `pipe-user-pages-soft` gets smaller pipes; supervisors
+/// should keep the payload far below this (Desk Helper's is a few hundred
+/// bytes).
 pub const MAX_BYTES: usize = 16 * 1024 - 4;
 const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
@@ -108,7 +112,11 @@ impl Inherited {
         let framed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let framed_in = framed.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::read_frame(&mut file, &framed_in));
+            let read = Self::read_frame(&mut file, &framed_in);
+            // Closed before the answer is sent, so it is closed by the time
+            // this returns, not some time after.
+            drop(file);
+            let _ = tx.send(read);
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
@@ -617,12 +625,16 @@ mod tests {
             let (reader, mut writer) = std::io::pipe().unwrap();
             writer.write_all(&framed(BOTH)).unwrap();
             drop(writer);
+            // A second read end, held until the check, keeps the pipe in
+            // being, so no pipe made alongside can come to share its inode.
+            let pin = reader.try_clone().unwrap();
             let reader = OwnedFd::from(reader);
             let fd = reader.as_raw_fd();
             let pipe = inode(fd);
             assert!(pipe.is_some());
             Inherited::read(reader, Duration::from_secs(5)).unwrap();
             assert!(inode(fd).is_none_or(|now| Some(now) != pipe));
+            drop(pin);
         }
     }
 
