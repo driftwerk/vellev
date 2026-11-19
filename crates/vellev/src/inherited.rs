@@ -57,7 +57,8 @@ impl std::fmt::Debug for Inherited {
 
 impl Inherited {
     /// Reads the descriptor `fd`, handed down by a supervisor for this
-    /// alone, and closes it.
+    /// alone, and closes it by the time it returns, but at the deadline:
+    /// the reader is then left blocked on it, and the node, refused, exits.
     ///
     /// The number is looked at without being taken: one that isn't open,
     /// isn't a pipe, or is close-on-exec (so was opened in this process,
@@ -81,6 +82,9 @@ impl Inherited {
     ///
     /// As [`Inherited::from_descriptor`].
     unsafe fn adopt(fd: RawFd) -> Result<OwnedFd> {
+        if fd < 0 {
+            bail!("--secrets-fd {fd} isn't a descriptor");
+        }
         if fd < 3 {
             bail!("--secrets-fd {fd} is one of the standard streams");
         }
@@ -110,7 +114,8 @@ impl Inherited {
         // promises nothing else in this process owns.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: sets a flag on the descriptor just taken.
-        if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
             bail!(
                 "--secrets-fd {fd} can't be made close-on-exec: {}",
                 std::io::Error::last_os_error()
@@ -134,7 +139,8 @@ impl Inherited {
         }
         // A pipe made non-blocking (the flag belongs to the open pipe, so a
         // supervisor's choice is shared) would fail the read at once rather
-        // than wait for the deadline: it is made blocking.
+        // than wait for the deadline: it is made blocking, for every holder
+        // of that open pipe (the supervisor no longer reads it).
         let raw = file.as_raw_fd();
         // SAFETY: reads and sets the status flags of the descriptor owned
         // by `file`.
@@ -158,7 +164,11 @@ impl Inherited {
         let framed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let framed_in = framed.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::read_frame(&mut file, &framed_in));
+            let read = Self::read_frame(&mut file, &framed_in);
+            // Closed before the answer is sent, so it is closed by the time
+            // this returns, not some time after.
+            drop(file);
+            let _ = tx.send(read);
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
@@ -610,6 +620,10 @@ mod tests {
     /// and leaves alone. Whether a descriptor is still open is told by its
     /// inode, never by its number alone, which a test running alongside
     /// could reuse.
+    ///
+    /// These clear close-on-exec on descriptors of the test process, which
+    /// is sound only while no unit test in this crate starts a child (the
+    /// ones that do are integration tests, processes of their own).
     mod descriptor {
         use super::*;
         use std::os::fd::{AsRawFd, IntoRawFd};
