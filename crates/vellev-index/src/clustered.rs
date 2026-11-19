@@ -2060,12 +2060,12 @@ mod tests {
                 let mut noise = Noise(seed);
                 (0..rows).map(|_| noise.vector(dimensions)).collect()
             };
-            let numbered: Vec<(u32, &[f32])> = vectors
+            let by_row: Vec<(u32, &[f32])> = vectors
                 .iter()
                 .enumerate()
                 .map(|(n, v)| (first + n as u32 * spread, v.as_slice()))
                 .collect();
-            let built = ClusteredIndex::build(Distance::Cosine, &numbered).unwrap();
+            let built = ClusteredIndex::build(Distance::Cosine, &by_row).unwrap();
             let read: ClusteredIndex =
                 rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
             let last = first + (rows as u32 - 1) * spread;
@@ -2414,11 +2414,7 @@ mod tests {
         assert_eq!(crate::pool::tuning().current_num_threads(), 1);
         let vectors = grouped(5, 3_000, 16, 12, 0.3);
         let index = indexed(Distance::Cosine, &vectors);
-        let numbered: Vec<(u32, &[f32])> = vectors
-            .iter()
-            .enumerate()
-            .map(|(row, v)| (row as u32 * 2, v.as_slice()))
-            .collect();
+        let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
         let (release, held) = std::sync::mpsc::channel::<()>();
         let held = std::sync::Arc::new(std::sync::Mutex::new(held));
         let (started, busy) = std::sync::mpsc::channel::<()>();
@@ -2438,7 +2434,7 @@ mod tests {
             scope.spawn(|| {
                 done.send(
                     index
-                        .sample_ranks(&numbered, &samples, crate::pool::tuning())
+                        .sample_ranks(&by_row, &samples, crate::pool::tuning())
                         .len(),
                 )
                 .unwrap()
@@ -2471,12 +2467,8 @@ mod tests {
             let read: ClusteredIndex =
                 rmp_serde::from_slice(&rmp_serde::to_vec_named(&built).unwrap()).unwrap();
             proptest::prop_assert_eq!(read.rows_curve(), None);
-            let numbered: Vec<(u32, &[f32])> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
-                .collect();
-            proptest::prop_assert_eq!(read.curve_of_rows(&numbered), built.rows_curve());
+            let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
+            proptest::prop_assert_eq!(read.curve_of_rows(&by_row), built.rows_curve());
         }
     }
 
@@ -2502,14 +2494,10 @@ mod tests {
                 (0..rows).map(|n| distinct[n % distinct.len()].clone()).collect()
             };
             let index = indexed(metric, &vectors);
-            let numbered: Vec<(u32, &[f32])> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (row as u32 * 2, v.as_slice()))
-                .collect();
+            let by_row: Vec<(u32, &[f32])> = numbered(&vectors).collect();
             let samples: Vec<usize> = (0..rows).step_by(7).collect();
-            let found = index.nearest_of_samples(&numbered, &samples, &Stop::new()).unwrap();
-            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &numbered, &samples));
+            let found = index.nearest_of_samples(&by_row, &samples, &Stop::new()).unwrap();
+            proptest::prop_assert_eq!(found, neighbours_sample_by_sample(&index, &by_row, &samples));
 
             let curve = index.rows_curve().expect("a built index has a curve of its rows");
             proptest::prop_assert_eq!(curve.source, crate::curve::Source::Rows);
@@ -2755,13 +2743,38 @@ mod tests {
         }
     }
 
-    fn indexed(metric: Distance, vectors: &[Vec<f32>]) -> ClusteredIndex {
-        let rows: Vec<(u32, &[f32])> = vectors
+    /// Each vector with its row: every other row, so that rows the index
+    /// does not hold lie between them.
+    fn numbered(vectors: &[Vec<f32>]) -> impl Iterator<Item = (u32, &[f32])> {
+        vectors
             .iter()
             .enumerate()
             .map(|(row, v)| (row as u32 * 2, v.as_slice()))
-            .collect();
+    }
+
+    fn indexed(metric: Distance, vectors: &[Vec<f32>]) -> ClusteredIndex {
+        let rows: Vec<(u32, &[f32])> = numbered(vectors).collect();
         ClusteredIndex::build(metric, &rows).unwrap()
+    }
+
+    /// The `count` rows nearest `query`, nearest first and ties in row
+    /// order.
+    fn nearest_exactly<'a>(
+        metric: Distance,
+        query: &[f32],
+        rows: impl IntoIterator<Item = (u32, &'a [f32])>,
+        count: usize,
+    ) -> Vec<u32> {
+        let mut measured: Vec<(f32, u32)> = rows
+            .into_iter()
+            .map(|(row, v)| (distance(metric, query, v), row))
+            .collect();
+        measured.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        measured
+            .into_iter()
+            .take(count)
+            .map(|(_, row)| row)
+            .collect()
     }
 
     /// Of the true nearest ten of every twentieth vector, how many a
@@ -2774,16 +2787,10 @@ mod tests {
     ) -> (usize, usize) {
         let (mut found, mut total) = (0, 0);
         for query in vectors.iter().step_by(vectors.len() / 20) {
-            let mut exact: Vec<(f32, u32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
-                .collect();
-            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
             let shortlist = index.shortlist(query, count, None, &[], &in_row_order);
-            found += exact[..10]
+            found += nearest_exactly(metric, query, numbered(vectors), 10)
                 .iter()
-                .filter(|(_, row)| shortlist.contains(row))
+                .filter(|row| shortlist.contains(row))
                 .count();
             total += 10;
         }
@@ -2880,6 +2887,55 @@ mod tests {
         assert!(found * 100 >= total * 95, "{found} of {total} shortlisted");
     }
 
+    /// Queries that lie apart from the rows, as a question's vector lies
+    /// apart from the passages' (recall note, §3): halfway between two rows
+    /// drawn at random, jittered.
+    #[test]
+    fn the_tuned_probes_hold_the_nearest_ten_of_queries_apart_from_the_rows() {
+        let vectors = grouped(5, 20_000, 64, 200, 0.6);
+        let index = indexed(Distance::Cosine, &vectors);
+        let mut noise = Noise(77);
+        let mut random = Random(13);
+        let queries = 200;
+        let held: usize = (0..queries)
+            .map(|_| {
+                let (a, b) = (random.below(vectors.len()), random.below(vectors.len()));
+                let query: Vec<f32> = vectors[a]
+                    .iter()
+                    .zip(&vectors[b])
+                    .zip(noise.vector(64))
+                    .map(|((x, y), e)| (x + y) / 2.0 + 0.1 * e)
+                    .collect();
+                let probed: Vec<usize> = index
+                    .order(&index.prepared(&query))
+                    .into_iter()
+                    .take(index.probes())
+                    .map(|(_, cluster)| cluster)
+                    .collect();
+                nearest_exactly(Distance::Cosine, &query, numbered(&vectors), 10)
+                    .into_iter()
+                    .filter(|row| {
+                        let position = index.position(*row).unwrap();
+                        probed.contains(&(index.at[position].0 as usize))
+                    })
+                    .count()
+            })
+            .sum();
+        assert!(
+            index.probes() * 10 <= index.clusters(),
+            "{} probes of {} clusters",
+            index.probes(),
+            index.clusters()
+        );
+        assert!(
+            held * 100 >= queries * 10 * 99,
+            "{held} of {} at {} probes of {} clusters",
+            queries * 10,
+            index.probes(),
+            index.clusters()
+        );
+    }
+
     #[test]
     fn probes_are_as_few_as_the_recall_floor_allows() {
         let tight = indexed(Distance::L2, &grouped(1, 5000, 64, 50, 0.05));
@@ -2940,18 +2996,13 @@ mod tests {
         let few: RoaringBitmap = (0..6000u32).filter(|row| row % 100 == 0).collect();
         let mut by_rows = index.shortlist(query, 30, Some(&few), &[], &in_row_order);
         by_rows.sort_unstable();
-        let mut exact: Vec<(f32, u32)> = few
-            .iter()
-            .map(|row| {
-                (
-                    distance(Distance::L2, query, &vectors[row as usize / 2]),
-                    row,
-                )
-            })
-            .collect();
-        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let nearest: std::collections::BTreeSet<u32> =
-            exact[..10].iter().map(|(_, row)| *row).collect();
+        let nearest = nearest_exactly(
+            Distance::L2,
+            query,
+            few.iter()
+                .map(|row| (row, vectors[row as usize / 2].as_slice())),
+            10,
+        );
         let found = by_rows.iter().filter(|row| nearest.contains(row)).count();
         assert_eq!(by_rows.len(), 30);
         assert!(found >= 9, "{found} of the nearest ten allowed rows");
@@ -2988,8 +3039,8 @@ mod tests {
             for metric in [Distance::Dot, Distance::L2] {
                 let index = indexed(metric, &vectors);
                 assert!(index.unmeasured(None, &[]).is_empty());
-                for (at, vector) in vectors.iter().enumerate().step_by(7) {
-                    let (cluster, place) = index.at[index.position(at as u32 * 2).unwrap()];
+                for (row, vector) in numbered(&vectors).step_by(7) {
+                    let (cluster, place) = index.at[index.position(row).unwrap()];
                     let centroid = index.centroid(cluster as usize);
                     let centroid: f64 = centroid.iter().map(|v| f64::from(*v).powi(2)).sum();
                     let factor = index.clusters[cluster as usize].factors[place as usize];
@@ -3086,15 +3137,9 @@ mod tests {
                 let shortlist = index.shortlist(query, 100, None, &[], &in_row_order);
                 assert_eq!(shortlist.len(), 100);
                 assert!(shortlist.iter().all(|row| *row < 6000), "{metric:?}");
-                let mut exact: Vec<(f32, u32)> = vectors[..3000]
+                found += nearest_exactly(metric, query, numbered(&vectors[..3000]), 10)
                     .iter()
-                    .enumerate()
-                    .map(|(row, v)| (distance(metric, query, v), row as u32 * 2))
-                    .collect();
-                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-                found += exact[..10]
-                    .iter()
-                    .filter(|(_, row)| shortlist.contains(row))
+                    .filter(|row| shortlist.contains(row))
                     .count();
             }
             assert!(found >= 90, "{metric:?}: {found} of 100 true neighbours");
