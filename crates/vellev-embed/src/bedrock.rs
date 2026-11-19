@@ -325,6 +325,25 @@ impl Bedrock {
         }
     }
 
+    /// The SDK's behaviour version, held rather than `latest()`: an SDK
+    /// update must not change how calls are retried. `ATTEMPTS`,
+    /// `UNREACHED_FOR` and `CALL_TIMEOUT` are tuned for this one's retries,
+    /// where an error that is not throttling (a 5xx, a timeout, a
+    /// connection that failed) backs off from the configured initial backoff
+    /// (1 s), costs 10 of the retry budget, and drops a connection that
+    /// answered 5xx. `latest()` became Retry Behavior 2.1 in
+    /// `aws-smithy-runtime-api` 1.20: those errors back off from a fixed
+    /// 50 ms whatever is configured, cost 14, and the connection is kept.
+    /// Moving to it is its own change, with those timings looked at again.
+    /// The crates are built without `behavior-version-latest`, so a client
+    /// made without a behaviour version panics when it is made rather than
+    /// taking `latest()` unseen. (`aws-config`'s own STS and SSO credential
+    /// clients use `latest()` whatever is held here.)
+    #[allow(deprecated)]
+    pub fn behavior() -> BehaviorVersion {
+        BehaviorVersion::v2026_01_12()
+    }
+
     pub fn retries() -> RetryConfig {
         RetryConfig::standard().with_max_attempts(ATTEMPTS)
     }
@@ -339,7 +358,7 @@ impl Bedrock {
     async fn client(&self) -> &Client {
         self.client
             .get_or_init(|| async {
-                let config = aws_config::defaults(BehaviorVersion::latest())
+                let config = aws_config::defaults(Self::behavior())
                     .region(Region::new(self.region.clone()))
                     .retry_config(Self::retries())
                     .timeout_config(Self::timeouts())
