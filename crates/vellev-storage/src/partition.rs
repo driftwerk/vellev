@@ -1312,7 +1312,7 @@ impl RefusalGate {
 /// timed as it is let go.
 struct Building<'a> {
     /// The lock, unless whoever asked holds it, and goes on holding it past
-    /// this: see [`Writer::flush_holding`].
+    /// this: see [`BuildingHeld::flush`].
     _guard: Option<MutexGuard<'a, ()>>,
     holder: Holder,
     since: Instant,
@@ -1344,9 +1344,34 @@ impl Drop for Building<'_> {
 }
 
 /// A writer's building lock, held from outside the writer for as long as
-/// this is kept: see [`Writer::building_if_free`].
+/// this is kept, and the writer whose lock it is, which flushes under it:
+/// see [`Writer::building_if_free`].
 #[derive(Debug)]
-pub struct BuildingHeld(OwnedMutexGuard<()>);
+pub struct BuildingHeld {
+    writer: Arc<Writer>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl BuildingHeld {
+    /// As [`Writer::flush`], whatever the rows, under this lock, which is
+    /// held on past it: as a node flushes a tenant it lets go, whose lock it
+    /// took as it took the tenant out, and holds until the hold on the
+    /// tenant is lost. Says how long it held the lock for its flush, its
+    /// whole build and commit, or `None` if it found nothing to flush and so
+    /// built nothing. Having no wait for the lock, it times none.
+    pub async fn flush(&mut self) -> Result<(LogPosition, Option<Duration>)> {
+        let writer = &self.writer;
+        let mut building = Building {
+            _guard: None,
+            holder: Holder::Flush,
+            since: Instant::now(),
+            writer,
+            timed: true,
+        };
+        let position = writer.flushing_held(&mut building).await?;
+        Ok((position, building.timed.then(|| building.held())))
+    }
+}
 
 /// How a merge that had its turn ended.
 enum Ended {
@@ -2147,43 +2172,26 @@ impl Writer {
 
     /// The building lock, if nothing holds it or queues for it this moment,
     /// to hold for as long as what is returned is kept. It never waits.
-    pub fn building_if_free(&self) -> Option<BuildingHeld> {
+    pub fn building_if_free(self: &Arc<Self>) -> Option<BuildingHeld> {
         let guard = self.building.clone().try_lock_owned().ok()?;
-        Some(BuildingHeld(guard))
+        let writer = self.clone();
+        Some(BuildingHeld {
+            writer,
+            _guard: guard,
+        })
     }
 
     /// The building lock, once it is free, held for as long as what is
     /// returned is kept, by a test: it holds no tenant of a node's, and so
     /// reaches what only a sweep that finds nothing else holding one sees.
     #[doc(hidden)]
-    pub async fn building_when_free(&self) -> BuildingHeld {
-        BuildingHeld(self.building.clone().lock_owned().await)
-    }
-
-    /// As [`Self::flush`], whatever the rows, with the building lock `held`
-    /// already, by whoever goes on holding it past this: as a node flushes a
-    /// tenant it lets go, whose lock it took as it took the tenant out, and
-    /// holds until the hold on the tenant is lost. Says how long it held the
-    /// lock for its flush, its whole build and commit, or `None` if it found
-    /// nothing to flush and so built nothing. Having no wait for the lock,
-    /// it times none.
-    pub async fn flush_holding(
-        &self,
-        held: &BuildingHeld,
-    ) -> Result<(LogPosition, Option<Duration>)> {
-        assert!(
-            Arc::ptr_eq(OwnedMutexGuard::mutex(&held.0), &self.building),
-            "a flush under another writer's building lock"
-        );
-        let mut building = Building {
-            _guard: None,
-            holder: Holder::Flush,
-            since: Instant::now(),
-            writer: self,
-            timed: true,
-        };
-        let position = self.flushing_held(&mut building).await?;
-        Ok((position, building.timed.then(|| building.held())))
+    pub async fn building_when_free(self: &Arc<Self>) -> BuildingHeld {
+        let guard = self.building.clone().lock_owned().await;
+        let writer = self.clone();
+        BuildingHeld {
+            writer,
+            _guard: guard,
+        }
     }
 
     /// As [`Self::flush`], saying how long it waited for the building lock

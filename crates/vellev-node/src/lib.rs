@@ -1451,7 +1451,7 @@ impl TenantWork {
     /// which is safe with the hold lost at once.
     async fn flush_to_let_go(
         &self,
-        building: &BuildingHeld,
+        building: &mut BuildingHeld,
         flushes: &Semaphore,
         deadline: Instant,
     ) -> Result<bool> {
@@ -1466,7 +1466,7 @@ impl TenantWork {
         let Some(Ok(_flush)) = flush else {
             return Ok(false);
         };
-        let Some(flushed) = before(deadline, self.writer.flush_holding(building)).await else {
+        let Some(flushed) = before(deadline, building.flush()).await else {
             return Ok(false);
         };
         self.flush_tried(flushed.is_ok());
@@ -2854,9 +2854,12 @@ impl Inner {
     /// then is its lease given up: every let-go gets there, and waits for no
     /// other's.
     async fn let_go_of(&self, going: Going, flushes: &Semaphore, deadline: Instant) {
-        let Going { tenant, building } = going;
+        let Going {
+            tenant,
+            mut building,
+        } = going;
         let work = &tenant.work;
-        match work.flush_to_let_go(&building, flushes, deadline).await {
+        match work.flush_to_let_go(&mut building, flushes, deadline).await {
             Ok(true) => {}
             Ok(false) => {
                 self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);

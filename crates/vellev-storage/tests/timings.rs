@@ -205,9 +205,9 @@ async fn a_flush_can_be_made_under_a_building_lock_held_already() {
     writer.flush().await.unwrap();
     writer.commit(notes(10, 3)).await.unwrap();
     timings.drain_events();
-    let held = writer.building_if_free().expect("nothing holds the lock");
+    let mut held = writer.building_if_free().expect("nothing holds the lock");
     assert!(writer.building_if_free().is_none(), "held, and free");
-    let flushing = writer.flush_holding(&held);
+    let flushing = held.flush();
     let (_, built) = tokio::time::timeout(Duration::from_secs(10), flushing)
         .await
         .expect("a flush under a lock held waited for that lock")
@@ -219,7 +219,7 @@ async fn a_flush_can_be_made_under_a_building_lock_held_already() {
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 0);
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
     // Nothing written since: nothing to flush, and no flush's hold.
-    let (_, built) = writer.flush_holding(&held).await.unwrap();
+    let (_, built) = held.flush().await.unwrap();
     assert_eq!(built, None);
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 0);
@@ -252,19 +252,6 @@ async fn a_lock_queued_for_is_not_free() {
         .expect("the flush queued ended")
         .unwrap()
         .unwrap();
-}
-
-/// A flush says what it flushes under by the lock it is given, which is
-/// worth nothing if the lock is another writer's.
-#[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "another writer's building lock")]
-async fn a_flush_under_another_writer_s_lock_is_refused() {
-    let (first, second) = (Cluster::new().await, Cluster::new().await);
-    let timings = Arc::new(Timings::default());
-    let writer = timed_writer(&first, &timings, 0, MergeBuilds::new(1)).await;
-    let other = timed_writer(&second, &timings, 0, MergeBuilds::new(1)).await;
-    let held = other.building_if_free().expect("nothing holds the lock");
-    let _ = writer.flush_holding(&held).await;
 }
 
 /// Merge work given up is timed apart from what finished, phase by phase:
