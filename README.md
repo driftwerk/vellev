@@ -420,15 +420,16 @@ its environment, which other processes of the same user can read:
 `serve --secrets-fd 3` reads, from descriptor 3, a 4-byte big-endian length
 and then a JSON object holding `VELLEV_DATABASE_URL` and `VELLEV_API_KEYS`.
 Both are required, and neither may also be set on the command line or in
-the environment. The descriptor must be a pipe that the supervisor wrote the
-payload to once and closed its own end of before starting the node, and no
-other copy of the write end may survive, in the supervisor's other children
-included. The payload may be at most 16 KiB less its 4-byte length, so it
-fits a default fresh pipe written before the node starts. On Linux, a user
-over `pipe-user-pages-soft` gets pipes of as little as one page, so keep the
-payload and its length within 4 KiB. Bytes after the payload and a name
-given twice are refused, and the node gives up after 10 seconds. Only these
-two secrets take the pipe; embedding keys and an object store's credentials
+the environment. The descriptor must be the read end of an inherited pipe
+(not close-on-exec) that the supervisor wrote the payload to once and closed
+its own end of before starting the node, and no other copy of the write end
+may survive, in the supervisor's other children included. The payload may be
+at most 16 KiB less its 4-byte length, so it fits a default fresh pipe
+written before the node starts. On Linux, a user over `pipe-user-pages-soft`
+gets pipes of as little as one page, so keep the payload and its length
+within 4 KiB. Bytes after the payload and a name given twice are refused,
+and the node gives up after 10 seconds (about 15 at most). Only these two
+secrets take the pipe; embedding keys and an object store's credentials
 still come from the environment. On Linux, another process of the same
 user can open the pipe through `/proc`, from when the supervisor makes it
 until the node has read it, and so copy the payload or replace it whole

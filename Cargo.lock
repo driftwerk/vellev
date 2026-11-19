@@ -4278,6 +4278,7 @@ dependencies = [
  "eyre",
  "http-body-util",
  "jsonwebtoken",
+ "libc",
  "object_store",
  "prometheus-client",
  "rayon",
