@@ -24,7 +24,7 @@ use vellev_storage::coordinator::{
     Versions, MAX_RESTORE_WINDOW,
 };
 use vellev_storage::format::{DEFAULT_MAX_FORMAT, FORMAT_VERSION};
-use vellev_storage::timings::{Timed, Timings};
+use vellev_storage::timings::{KeptFor, Timed, Timings};
 use vellev_storage::{
     Batch, BuildingHeld, Embedded, FlushFirst, GroupCommitter, MergeBuilds, Mutation, Receipt,
     State, Stop, StorageError, Transfers, Unembedded, Vectorize, Writer, MERGE_BUILDS,
@@ -1812,8 +1812,9 @@ struct Taken {
     /// How many chosen, written for, nothing else held but with their
     /// building lock busy.
     kept_for_building: u64,
-    /// Of those, the ones chosen for the budget, by tenant and partition.
-    building_for_budget: Vec<(TenantId, String)>,
+    /// The tenants written for that it kept, chosen for the budget, by
+    /// tenant, why, and partition: see [`Inner::kept_spells`].
+    kept_for_budget: Vec<(TenantId, KeptFor, String)>,
     /// About how many bytes what was taken out held.
     freed: usize,
     /// How many were taken out for being idle, and for the budget.
@@ -1865,7 +1866,8 @@ impl Taken {
                     }
                     if free_of_others && for_budget {
                         let partition = tenant.work.writer.lease().key.to_string();
-                        self.building_for_budget.push((held.id.clone(), partition));
+                        let kept = (held.id.clone(), KeptFor::Building, partition);
+                        self.kept_for_budget.push(kept);
                     }
                 }
                 false
@@ -1956,10 +1958,9 @@ struct Inner {
     /// holding, and how many they kept with their building lock busy.
     held_elsewhere: AtomicU64,
     kept_for_building: AtomicU64,
-    /// Since when each tenant sweeps over the budget have kept for its
-    /// building lock busy has been kept so, and its partition: see
-    /// [`Self::kept_for_building_spells`].
-    kept_for_building_since: Mutex<HashMap<TenantId, (Instant, String)>>,
+    /// Why, and since when, each tenant sweeps over the budget have kept
+    /// has been kept so, and its partition: see [`Self::kept_spells`].
+    kept_since: Mutex<HashMap<TenantId, (KeptFor, Instant, String)>>,
     /// How many merges sweeps have stopped so that a tenant over the
     /// budget could be let go.
     stopped_for_budget: AtomicU64,
@@ -2233,7 +2234,7 @@ impl Node {
             started: Instant::now(),
             held_elsewhere: AtomicU64::new(0),
             kept_for_building: AtomicU64::new(0),
-            kept_for_building_since: Mutex::default(),
+            kept_since: Mutex::default(),
             stopped_for_budget: AtomicU64::new(0),
             merges_stopped: Arc::default(),
             let_go_idle: AtomicU64::new(0),
@@ -2897,7 +2898,7 @@ impl Inner {
             .fetch_add(taken.held_elsewhere, Ordering::Relaxed);
         self.kept_for_building
             .fetch_add(taken.kept_for_building, Ordering::Relaxed);
-        self.kept_for_building_spells(&taken.building_for_budget);
+        self.kept_spells(&taken.kept_for_budget);
         self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
         self.let_go_for_budget
             .fetch_add(taken.for_budget, Ordering::Relaxed);
@@ -3115,37 +3116,35 @@ impl Inner {
             .collect()
     }
 
+    /// Go on with the spell of each tenant in `kept`, kept by this sweep
+    /// over the budget, for the same reason as the last, or begin one; and
+    /// end, timed, that of each not kept so now: taken out, kept for the
+    /// other reason, or not over the budget any more.
+    fn kept_spells(&self, kept: &[(TenantId, KeptFor, String)]) {
+        let now = Instant::now();
+        let mut since = self.kept_since.lock().expect("kept since lock");
+        since.retain(|tenant, (why, began, partition)| {
+            let goes_on = kept
+                .iter()
+                .any(|(kept, now_why, _)| kept == tenant && now_why == why);
+            if !goes_on {
+                let spell = now.saturating_duration_since(*began);
+                self.timings.record(Timed::Kept(*why), partition, spell);
+            }
+            goes_on
+        });
+        for (tenant, why, partition) in kept {
+            since
+                .entry(tenant.clone())
+                .or_insert_with(|| (*why, now, partition.clone()));
+        }
+    }
+
     /// Take out of what the node holds each of `idle`, and then, while what
     /// is left of `total` is over the budget, each of `older` in turn: each
     /// only if [`Taken::take`] finds it free to go. Those something else
     /// holds are kept, and the next is tried, so that what can go goes
     /// first.
-    /// Go on with the spell of each tenant in `kept`, kept by this sweep,
-    /// over the budget, for its building lock busy, or begin one; and end,
-    /// timed, that of each not kept so now: taken out, kept for something
-    /// else holding it, or not over the budget any more.
-    fn kept_for_building_spells(&self, kept: &[(TenantId, String)]) {
-        let now = Instant::now();
-        let mut since = self
-            .kept_for_building_since
-            .lock()
-            .expect("kept for building lock");
-        since.retain(|tenant, (began, partition)| {
-            let goes_on = kept.iter().any(|(kept, _)| kept == tenant);
-            if !goes_on {
-                let spell = now.saturating_duration_since(*began);
-                self.timings
-                    .record(Timed::KeptForBuilding, partition, spell);
-            }
-            goes_on
-        });
-        for (tenant, partition) in kept {
-            since
-                .entry(tenant.clone())
-                .or_insert_with(|| (now, partition.clone()));
-        }
-    }
-
     fn taken_out(&self, idle: &[&Held], older: &[&Held], total: usize) -> Taken {
         let mut open = self.opened();
         let mut taken = Taken::default();

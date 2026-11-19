@@ -19,7 +19,7 @@ use vellev_node::{
 };
 use vellev_storage::blobs::{Blobs, Listed, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator, Point};
-use vellev_storage::timings::{Holder, Timed};
+use vellev_storage::timings::{Holder, KeptFor, Timed};
 use vellev_storage::{Holding, Mutation, State, StorageError, Writer};
 
 fn tenant(name: &str) -> TenantId {
@@ -556,7 +556,7 @@ async fn a_tenant_kept_for_its_building_lock_is_timed_as_one_spell() {
     let events = node.timings().drain_events();
     let spells: Vec<Duration> = events
         .iter()
-        .filter(|event| event.timed == Timed::KeptForBuilding)
+        .filter(|event| event.timed == Timed::Kept(KeptFor::Building))
         .map(|event| event.took)
         .collect();
     assert_eq!(spells.len(), 1, "{events:?}");

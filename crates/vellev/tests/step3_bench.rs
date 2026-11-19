@@ -41,7 +41,7 @@ use vellev_embed::Embedders;
 use vellev_node::{MergePool, Node, Settings};
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::timings::{Event, Holder, MergePhase, OpenWaits, Timed};
+use vellev_storage::timings::{Event, Holder, KeptFor, MergePhase, OpenWaits, Timed};
 use vellev_storage::{Disk, Mutation, Transfers, MERGE_BUILDS};
 
 /// The node's allocator, as the binary runs on it.
@@ -2066,7 +2066,7 @@ fn kept_for_building_mark(events: &[Event]) -> Value {
                 .collect(),
         )
     };
-    let spells = secs(Timed::KeptForBuilding);
+    let spells = secs(Timed::Kept(KeptFor::Building));
     let flush_held = secs(Timed::BuildingHeld(Holder::Flush));
     let (longest, held_p99) = (spells.last().copied(), percentile(&flush_held, 99.0));
     json!({
@@ -2093,7 +2093,7 @@ fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
         at,
     };
     let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
-    let spell = |took: f64| event(Timed::KeptForBuilding, took);
+    let spell = |took: f64| event(Timed::Kept(KeptFor::Building), took);
     let passed = |events: &[Event]| kept_for_building_mark(events)["passed"] == json!(true);
     assert!(!passed(&[flush_held(40.0), spell(300.0)]), "kept 300 s");
     assert!(passed(&[flush_held(40.0), spell(50.0)]), "kept 50 s");
@@ -2446,7 +2446,7 @@ fn reported(
     );
     timings.insert(
         "kept_for_building".into(),
-        summary(of(Timed::KeptForBuilding)),
+        summary(of(Timed::Kept(KeptFor::Building))),
     );
 
     // Merge debt: each tenant carried forward while let go, from its

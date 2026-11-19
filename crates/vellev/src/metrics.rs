@@ -33,7 +33,7 @@ use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::registry::Registry;
 use vellev_node::Node;
-use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Seconds, Timed};
+use vellev_storage::timings::{Holder, KeptFor, MergeEnd, MergePhase, Seconds, Timed};
 use vellev_storage::Work;
 
 use crate::allocator::Allocator;
@@ -478,15 +478,17 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
             "Each spell a tenant held as many rows unflushed as it may, refusing writes: from reaching that to the commit that took it below",
             Timed::Backlog,
         ),
-        (
-            "kept_for_building_seconds",
-            "Spells sweeps over the memory budget kept a tenant for its busy building lock alone",
-            Timed::KeptForBuilding,
-        ),
     ] {
         let seconds = ConstSeconds(timings.seconds(timed));
         seconds.encode(encoder.encode_descriptor(name, help, None, MetricType::Histogram)?)?;
     }
+    histograms(
+        encoder,
+        "sweep_kept_seconds",
+        "Spells sweeps over the memory budget kept a tenant, by reason: held elsewhere (held) or building lock busy (building)",
+        "reason",
+        KeptFor::ALL.map(|why| (why.name(), timings.seconds(Timed::Kept(why)))),
+    )?;
     histograms(
         encoder,
         "flush_to_let_go_seconds",
