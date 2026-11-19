@@ -187,6 +187,8 @@ pub struct MergeBuilds {
     /// and once its rows were gathered.
     last_planned: AtomicUsize,
     last_reckoned: AtomicUsize,
+    /// How many places are in the queue for a turn: see [`Self::asking`].
+    queued: Arc<AtomicUsize>,
     /// Whether each build's output carries a [`Probe`], as a test asks.
     probing: AtomicBool,
     /// How the builds stood as the last probe was dropped.
@@ -334,6 +336,7 @@ impl MergeBuilds {
             held_at_most: Mutex::new(STORE_HELD_AT_MOST),
             last_planned: AtomicUsize::new(0),
             last_reckoned: AtomicUsize::new(0),
+            queued: Arc::default(),
             probing: AtomicBool::new(false),
             probed: Mutex::default(),
             slots_free: Mutex::new((0..pools.len()).rev().collect()),
@@ -429,6 +432,20 @@ impl MergeBuilds {
     pub fn hold(&self, holding: Option<Holding>) {
         *lock(&self.holding) = holding;
         self.let_go.notify_all();
+    }
+
+    /// How many places are in the queue for a turn now. A merge makes its
+    /// place once it has looked for a restore under way, as it takes its
+    /// turn and building lock, so a test that counts one more place than it
+    /// made knows a merge is past that look. Each is counted from when it is
+    /// made until its turn is had, the turns are closed, or its place goes:
+    /// one granted at once is counted for the moment its task takes to
+    /// acquire the turn, and one a merge keeps as it gives way to a flush
+    /// is counted as it waits. For tests that order what they do on a merge
+    /// being there.
+    #[doc(hidden)]
+    pub fn asking(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
     }
 
     /// How many builds wait where a test holds them now. For tests.
@@ -663,8 +680,11 @@ impl Reservation {
         let kept = Arc::new(Kept::default());
         let parked = *lock(&builds.parked_at_most);
         let (turns, granted) = (builds.turns.clone(), kept.clone());
+        let counted = Place::counted(&builds.queued);
         let asking = tokio::spawn(async move {
-            match turns.acquire_owned().await {
+            let acquired = turns.acquire_owned().await;
+            drop(counted);
+            match acquired {
                 Ok(turn) => *lock(&granted.turn) = Granted::Turn(turn),
                 Err(_) => *lock(&granted.turn) = Granted::Gone,
             }
@@ -707,6 +727,23 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         self.asking.abort();
         *lock(&self.kept.turn) = Granted::Gone;
+    }
+}
+
+/// A place in the queue for a turn, counted from when it is made until its
+/// turn is had, the turns are closed, or the task asking for it is aborted.
+struct Place(Arc<AtomicUsize>);
+
+impl Place {
+    fn counted(queued: &Arc<AtomicUsize>) -> Self {
+        queued.fetch_add(1, Ordering::SeqCst);
+        Self(queued.clone())
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1131,6 +1168,32 @@ mod nesting {
         let global = MergeBuilds::new(2);
         let unslotted = turn_of(&global, "one").await;
         assert_eq!(*lock(&unslotted.counted.slot), None);
+    }
+
+    /// A merge is counted asking for a turn from the moment its place is
+    /// made until it has its turn, or its place goes while it asks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_asking_for_a_turn_is_counted_until_it_has_one_or_goes() {
+        let builds = MergeBuilds::new(1);
+        let held = turn_of(&builds, "one").await;
+        assert_eq!(builds.asking(), 0, "a turn had at once is not asked for");
+        let waiting = Reservation::new(&builds);
+        assert_eq!(builds.asking(), 1);
+        drop(held);
+        let granted = waiting.granted().await.expect("the turn let go");
+        assert_eq!(builds.asking(), 0, "counted once it has its turn");
+        let gone = Reservation::new(&builds);
+        assert_eq!(builds.asking(), 1);
+        drop(gone);
+        let counted_out = async {
+            while builds.asking() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), counted_out)
+            .await
+            .expect("still counted once its place went");
+        drop(granted);
     }
 
     /// A slot goes back before the turn that held it, so that a turn
