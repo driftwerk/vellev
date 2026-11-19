@@ -1471,11 +1471,15 @@ impl TenantWork {
         if !self.read(State::holds_unflushed) {
             return Ok(LetGoFlush::Done);
         }
-        // A hold lost, or a writer closed, as by a reopen here that fenced
-        // the lease, has nothing to flush for: its commit would be refused.
-        let superseded = || self.hold.is_lost() || self.writer.is_closed();
-        if superseded() {
-            return Ok(LetGoFlush::Superseded);
+        // A hold lost, as by a reopen here that fenced the lease, has
+        // nothing to flush for; a writer closed can flush nothing.
+        let unflushable = || match (self.hold.is_lost(), self.writer.is_closed()) {
+            (true, _) => Some(LetGoFlush::Superseded),
+            (false, true) => Some(LetGoFlush::Closed),
+            (false, false) => None,
+        };
+        if let Some(ended) = unflushable() {
+            return Ok(ended);
         }
         let timings = self.writer.timings();
         let partition = &self.writer.lease().key;
@@ -1488,8 +1492,8 @@ impl TenantWork {
             return Ok(LetGoFlush::Skipped);
         };
         timings.record(Timed::LetGoFlushQueued, partition, waited);
-        if superseded() {
-            return Ok(LetGoFlush::Superseded);
+        if let Some(ended) = unflushable() {
+            return Ok(ended);
         }
         // Stopped at the cut: the flush's build, off the async threads, is
         // not dropped with it.
@@ -1729,9 +1733,13 @@ enum LetGoFlush {
     /// Cut in its commit, which closed the writer: its rows replay unless
     /// its commit landed.
     Unknown,
-    /// Not made, as the hold on the tenant was lost or its writer closed
-    /// before it began: superseded, as by the tenant opened here again.
+    /// Not made, as the hold on the tenant was lost before it began:
+    /// superseded, as by the tenant opened here again.
     Superseded,
+    /// Not made, as the writer had closed, its hold intact, as after a
+    /// commit whose outcome is unknown: its rows replay unless that commit
+    /// landed.
+    Closed,
 }
 
 /// What `work` comes to, if it ends before `deadline`. Unlike
@@ -2994,6 +3002,10 @@ impl Inner {
             }
             Ok(LetGoFlush::Superseded) => {
                 tracing::info!(tenant = %tenant.id(), "flush before letting go not made: the hold on the tenant was lost");
+            }
+            Ok(LetGoFlush::Closed) => {
+                self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(tenant = %tenant.id(), "flush before letting go not made: the writer had closed; its rows replay unless its last commit landed");
             }
             Ok(LetGoFlush::Unknown) => {
                 self.let_go_flushes_skipped.fetch_add(1, Ordering::Relaxed);
