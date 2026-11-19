@@ -1826,14 +1826,11 @@ struct Taken {
     /// The tenants written for that something else held, left as they are,
     /// with what each holds, in the order they were chosen.
     kept: Vec<(Arc<Tenant>, usize)>,
-    /// How many chosen, written for or copied, something else held.
-    held_elsewhere: u64,
-    /// How many chosen, written for, nothing else held but with their
-    /// building lock busy.
-    kept_for_building: u64,
-    /// The tenants written for that it kept, chosen for the budget, by
-    /// tenant, why, and partition: see [`Inner::kept_spells`].
-    kept_for_budget: Vec<(TenantId, KeptFor, String)>,
+    /// How many chosen, written for or copied, it kept, by why.
+    kept_by: KeptBySweeps,
+    /// The tenants written for that it kept, chosen for the budget: see
+    /// [`Inner::kept_spells`].
+    kept_for_budget: Vec<KeptForBudget>,
     /// About how many bytes what was taken out held.
     freed: usize,
     /// How many were taken out for being idle, and for the budget.
@@ -1879,17 +1876,14 @@ impl Taken {
                     return true;
                 } else if same {
                     self.kept.push((tenant.clone(), held.size));
-                    match free_of_others {
-                        true => self.kept_for_building += 1,
-                        false => self.held_elsewhere += 1,
-                    }
+                    let why = match free_of_others {
+                        true => KeptFor::Building,
+                        false => KeptFor::Held,
+                    };
+                    self.kept_by.count(why);
                     if for_budget {
-                        let why = match free_of_others {
-                            true => KeptFor::Building,
-                            false => KeptFor::Held,
-                        };
-                        let partition = tenant.work.writer.lease().key.to_string();
-                        self.kept_for_budget.push((held.id.clone(), why, partition));
+                        let tenant = tenant.clone();
+                        self.kept_for_budget.push(KeptForBudget { tenant, why });
                     }
                 }
                 false
@@ -1904,12 +1898,18 @@ impl Taken {
                     self.freed += held.size;
                     return true;
                 } else if same {
-                    self.held_elsewhere += 1;
+                    self.kept_by.count(KeptFor::Held);
                 }
                 false
             }
         }
     }
+}
+
+/// A tenant written for that a sweep over the budget kept, and why.
+struct KeptForBudget {
+    tenant: Arc<Tenant>,
+    why: KeptFor,
 }
 
 #[derive(Debug, Default)]
@@ -1976,10 +1976,8 @@ struct Inner {
     sweep_hold: Mutex<Option<Arc<SweepHold>>>,
     /// When the node was made: how old its census is until its first sweep.
     started: Instant,
-    /// How many tenants sweeps chose to let go but found something else
-    /// holding, and how many they kept with their building lock busy.
-    held_elsewhere: AtomicU64,
-    kept_for_building: AtomicU64,
+    /// How many tenants sweeps chose to let go but kept, by why.
+    kept_by_sweeps: Mutex<KeptBySweeps>,
     /// Why, and since when, each tenant sweeps over the budget have kept
     /// has been kept so, and its partition: see [`Self::kept_spells`].
     kept_since: Mutex<HashMap<TenantId, (KeptFor, Instant, String)>>,
@@ -2106,6 +2104,20 @@ pub struct KeptBySweeps {
     pub held: u64,
     /// With its building lock busy, nothing else holding it.
     pub building: u64,
+}
+
+impl KeptBySweeps {
+    fn count(&mut self, why: KeptFor) {
+        match why {
+            KeptFor::Held => self.held += 1,
+            KeptFor::Building => self.building += 1,
+        }
+    }
+
+    fn add(&mut self, more: KeptBySweeps) {
+        self.held += more.held;
+        self.building += more.building;
+    }
 }
 
 /// What this node holds open, and what it reckons that holds in memory:
@@ -2254,8 +2266,7 @@ impl Node {
             sweep_on_time: AtomicBool::new(false),
             sweep_hold: Mutex::default(),
             started: Instant::now(),
-            held_elsewhere: AtomicU64::new(0),
-            kept_for_building: AtomicU64::new(0),
+            kept_by_sweeps: Mutex::default(),
             kept_since: Mutex::default(),
             stopped_for_budget: AtomicU64::new(0),
             merges_stopped: Arc::default(),
@@ -2411,10 +2422,7 @@ impl Node {
 
     /// [`Self::tenants_kept_by_sweeps`] by why each was kept.
     pub fn kept_by_sweeps(&self) -> KeptBySweeps {
-        KeptBySweeps {
-            held: self.0.held_elsewhere.load(Ordering::Relaxed),
-            building: self.0.kept_for_building.load(Ordering::Relaxed),
-        }
+        *self.0.kept_by_sweeps.lock().expect("kept by sweeps lock")
     }
 
     /// What the last sweep found this node holding, as it began: what it
@@ -2931,10 +2939,10 @@ impl Inner {
             hold.reached_here().await;
         }
         let taken = self.taken_out(&idle, &older, total);
-        self.held_elsewhere
-            .fetch_add(taken.held_elsewhere, Ordering::Relaxed);
-        self.kept_for_building
-            .fetch_add(taken.kept_for_building, Ordering::Relaxed);
+        self.kept_by_sweeps
+            .lock()
+            .expect("kept by sweeps lock")
+            .add(taken.kept_by);
         self.kept_spells(&taken.kept_for_budget);
         self.let_go_idle.fetch_add(taken.idle, Ordering::Relaxed);
         self.let_go_for_budget
@@ -3161,23 +3169,24 @@ impl Inner {
     /// over the budget, for the same reason as the last, or begin one; and
     /// end, timed, that of each not kept so now: taken out, kept for the
     /// other reason, or not over the budget any more.
-    fn kept_spells(&self, kept: &[(TenantId, KeptFor, String)]) {
+    fn kept_spells(&self, kept: &[KeptForBudget]) {
         let now = Instant::now();
         let mut since = self.kept_since.lock().expect("kept since lock");
         since.retain(|tenant, (why, began, partition)| {
             let goes_on = kept
                 .iter()
-                .any(|(kept, now_why, _)| kept == tenant && now_why == why);
+                .any(|kept| kept.tenant.id() == tenant && kept.why == *why);
             if !goes_on {
                 let spell = now.saturating_duration_since(*began);
                 self.timings.record(Timed::Kept(*why), partition, spell);
             }
             goes_on
         });
-        for (tenant, why, partition) in kept {
-            since
-                .entry(tenant.clone())
-                .or_insert_with(|| (*why, now, partition.clone()));
+        for KeptForBudget { tenant, why } in kept {
+            since.entry(tenant.id().clone()).or_insert_with(|| {
+                let partition = tenant.work.writer.lease().key.to_string();
+                (*why, now, partition)
+            });
         }
     }
 
