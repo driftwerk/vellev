@@ -405,9 +405,16 @@ impl Settings {
     /// Why a sweep could not let tenants go by these settings, if it could
     /// not: with no flush at once, or no time for them, it would skip every
     /// one; with no release at once, or no time for them, it would give up
-    /// no lease; and more at once than a semaphore holds would panic.
+    /// no lease; and more at once than a semaphore holds, or more time
+    /// than a deadline can be set by, would panic.
     pub fn let_go_problem(&self) -> Option<String> {
         let most = Semaphore::MAX_PERMITS;
+        let longest = LET_GO_TIME_AT_MOST;
+        if self.let_go_flush_within > longest || self.release_within > longest {
+            return Some(format!(
+                "a sweep gives its flushes and its releases at most {longest:?} each"
+            ));
+        }
         if self.let_go_flushes_at_once == 0 || self.let_go_flush_within.is_zero() {
             return Some(
                 "a sweep that flushes no tenant at once, or gives its flushes no time, \
@@ -1827,6 +1834,11 @@ pub const LET_GO_FLUSHES_AT_ONCE: usize = 2;
 
 /// The default [`Settings::release_within`].
 pub const RELEASE_WITHIN: Duration = Duration::from_secs(5);
+
+/// The most [`Settings::let_go_flush_within`] and
+/// [`Settings::release_within`] can each be: a day, far past any use, and
+/// far short of what a deadline set by them would overflow.
+pub const LET_GO_TIME_AT_MOST: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The default [`Settings::releases_at_once`].
 pub const RELEASES_AT_ONCE: usize = 4;
