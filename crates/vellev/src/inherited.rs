@@ -921,6 +921,31 @@ mod tests {
             drop(reader);
         }
 
+        /// On Linux an `O_PATH` descriptor of a named pipe reads as open
+        /// for reading only, but can't be read: it is refused untouched.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_path_only_descriptor_is_refused_and_left_open() {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = tempfile::tempdir().unwrap();
+            let fifo =
+                std::ffi::CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path; `mkfifo` and `open` take
+            // nothing of this process's.
+            let fd = unsafe {
+                assert_eq!(libc::mkfifo(fifo.as_ptr(), 0o600), 0);
+                libc::open(fifo.as_ptr(), libc::O_PATH)
+            };
+            assert!(fd >= 3, "{}", std::io::Error::last_os_error());
+            // SAFETY: the descriptor just opened, owned here alone.
+            let path_only = std::mem::ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(fd) });
+            let before = inode(fd);
+            let err = format!("{:#}", take(fd).unwrap_err());
+            assert!(err.contains("isn't open for reading only"), "{err}");
+            assert_eq!(inode(fd), before);
+            drop(std::mem::ManuallyDrop::into_inner(path_only));
+        }
+
         /// A pipe that turns out not to hold the secrets (another
         /// program's, named by mistake) is refused without its shared state
         /// being changed: its non-blocking flag is as it was.

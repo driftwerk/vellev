@@ -22,9 +22,27 @@ fn framed(payload: &[u8]) -> Vec<u8> {
 static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Starts the node with `payload` on descriptor 3 and only `env` in its
-/// environment, and waits for it to stop.
+/// environment, and waits for it to stop, for a minute at most: a node
+/// that wrongly took the payload would wait for its database for ever, so
+/// it is then killed (and reaped) and the test fails, rather than hanging.
 fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
-    start(payload, env).wait_with_output().unwrap()
+    let mut child = start(payload, env);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stopped = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if !stopped {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(stopped, "the node didn't stop: {}", stderr(&output));
+    output
 }
 
 /// Starts the node with `payload` on descriptor 3, listening on a port of
