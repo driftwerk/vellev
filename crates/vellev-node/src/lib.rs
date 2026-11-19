@@ -1560,7 +1560,7 @@ impl TenantWork {
                 .await
                 .map_err(|error| self.failed(error))?;
             if merged.is_none() {
-                return Ok(());
+                return self.not_lost();
             }
         }
     }
