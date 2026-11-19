@@ -1992,9 +1992,8 @@ impl CachedBlobs {
         };
         let (given_up, told) = (taking.given_up.clone(), self.disk.spills_are_told());
         let taken = self.disk.run(0, move || {
-            if let Some(told) = &told {
-                told.taken_up();
-            }
+            let told = told.as_deref();
+            let _ended = told.map(SpillsTold::taken_up);
             let given_up = || given_up.load(Ordering::SeqCst);
             let gone = || std::io::Error::other("taking the spill up was given up");
             let parent = path

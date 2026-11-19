@@ -1108,7 +1108,7 @@ async fn a_rename_given_up_leaves_a_copy_put_in_its_place() {
     let told = Arc::new(SpillsTold::default());
     let disk = Disk::new(Duration::from_secs(10), 20 * 1024 * 1024, 8).spills_told(told.clone());
     let cached = Cached::on(STOPPED, Some(disk)).await;
-    told.looks_again_in.store(2_000, Ordering::SeqCst);
+    told.looks_held.store(true, Ordering::SeqCst);
     let merging = cached.merging();
     let copy = |dir: &Path| -> Option<String> {
         let all = files(dir).into_iter();
@@ -1127,7 +1127,14 @@ async fn a_rename_given_up_leaves_a_copy_put_in_its_place() {
     settled("what was uploaded stays", || !dir.join(&key).exists()).await;
     std::fs::create_dir_all(dir.join(&key).parent().unwrap()).unwrap();
     std::fs::write(dir.join(&key), b"another copy, by a fetch since").unwrap();
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        told.taken_up_ended.load(Ordering::SeqCst),
+        0,
+        "looked too soon"
+    );
+    told.looks_held.store(false, Ordering::SeqCst);
+    let ended = || told.taken_up_ended.load(Ordering::SeqCst) == 1;
+    settled("the taking up never looked again", ended).await;
     assert!(
         dir.join(&key).exists(),
         "taken back though it was not its own"

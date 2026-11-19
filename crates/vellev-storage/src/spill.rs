@@ -44,7 +44,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -567,9 +567,12 @@ pub struct SpillsTold {
     pub written: AtomicU64,
     /// How long, in milliseconds, a spill's name takes to remove.
     pub unlinking: AtomicU64,
-    /// How long, in milliseconds, a cache goes before it looks again, once
-    /// it has taken a spill up.
-    pub looks_again_in: AtomicU64,
+    /// While set, a cache that has taken a spill up waits before it looks
+    /// again at what it took.
+    pub looks_held: AtomicBool,
+    /// How many takings up of a spill have ended, whatever came of them,
+    /// counted on the disk's thread as the last thing each does.
+    pub taken_up_ended: AtomicU64,
     /// How many bytes the disk says are free, if not [`Self::ASK_THE_DISK`].
     pub free: AtomicU64,
     /// Where the last spill made is mapped, and where it ends: for a store
@@ -587,11 +590,21 @@ impl Default for SpillsTold {
             reading: AtomicU64::new(0),
             written: AtomicU64::new(0),
             unlinking: AtomicU64::new(0),
-            looks_again_in: AtomicU64::new(0),
+            looks_held: AtomicBool::new(false),
+            taken_up_ended: AtomicU64::new(0),
             free: AtomicU64::new(Self::ASK_THE_DISK),
             mapped_from: AtomicUsize::new(0),
             mapped_to: AtomicUsize::new(0),
         }
+    }
+}
+
+/// A taking up of a spill under way, as [`SpillsTold::taken_up`] counts it.
+pub(crate) struct TakenUp<'a>(&'a SpillsTold);
+
+impl Drop for TakenUp<'_> {
+    fn drop(&mut self) {
+        self.0.taken_up_ended.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -613,8 +626,9 @@ impl SpillsTold {
 
     /// A cache about to look again at a spill it took up, as told.
     pub(crate) fn looks_again(&self) {
-        let taking = self.looks_again_in.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(taking));
+        while self.looks_held.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// A piece about to be read as it goes up, as told.
@@ -623,10 +637,12 @@ impl SpillsTold {
         std::thread::sleep(Duration::from_millis(taking));
     }
 
-    /// A spill about to be taken up, as told.
-    pub(crate) fn taken_up(&self) {
+    /// A spill about to be taken up, as told: what this gives counts the
+    /// taking up as ended once it is let go.
+    pub(crate) fn taken_up(&self) -> TakenUp<'_> {
         let taking = self.taken_up_in.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(taking));
+        TakenUp(self)
     }
 
     /// A write that comes to `end` bytes of its spill, as told.
