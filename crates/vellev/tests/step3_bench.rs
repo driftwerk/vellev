@@ -2111,6 +2111,35 @@ fn a_keep_for_a_busy_lock_past_twice_a_flush_s_hold_fails_its_mark() {
     assert!(!passed(&[spell(50.0)]), "no flush hold");
 }
 
+/// Desk's widened gate: a tenant kept as held, as by its own merge, for
+/// longer than flushes hold the lock fails the same mark; one kept for
+/// less passes; each reason is held to the bound on its own.
+#[test]
+fn a_keep_as_held_past_twice_a_flush_s_hold_fails_the_mark() {
+    let at = Instant::now();
+    let event = |timed: Timed, took: f64| Event {
+        timed,
+        took: Duration::from_secs_f64(took),
+        partition: "t0/0".into(),
+        at,
+    };
+    let flush_held = |took: f64| event(Timed::BuildingHeld(Holder::Flush), took);
+    let held = |took: f64| event(Timed::Kept(KeptFor::Held), took);
+    let building = |took: f64| event(Timed::Kept(KeptFor::Building), took);
+    let passed = |events: &[Event]| kept_for_building_mark(events)["passed"] == json!(true);
+    assert!(!passed(&[flush_held(40.0), held(300.0)]), "held 300 s");
+    assert!(passed(&[flush_held(40.0), held(50.0)]), "held 50 s");
+    assert!(
+        !passed(&[flush_held(40.0), building(50.0), held(300.0)]),
+        "a short building keep does not pass a long held one"
+    );
+    assert!(
+        !passed(&[flush_held(40.0), held(50.0), building(300.0)]),
+        "a short held keep does not pass a long building one"
+    );
+    assert!(!passed(&[held(50.0)]), "held, no flush hold");
+}
+
 /// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
 /// lock was never waited for; one a flush's own time does not (review of
 /// #169).
