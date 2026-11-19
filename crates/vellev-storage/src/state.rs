@@ -1294,11 +1294,21 @@ fn clusters_of(rows: f64) -> f64 {
     rows.sqrt().clamp(1.0, 4096.0).floor()
 }
 
+/// What each row comes to in a clustered index's file past its code's bits:
+/// its row's number, a `u32`, and its three `f32` factors.
+const FILED_EACH_ROW: f64 = 16.0;
+
+/// What each value of a centroid comes to in a clustered index's file: an
+/// `f32`, which MessagePack writes after a byte that says so.
+const FILED_EACH_VALUE: f64 = 5.0;
+
 /// About how many bytes the file of a clustered index of `rows` vectors of
 /// `dimensions` comes to, encoded before its merge's vectors go up and held
-/// as they do: its codes and factors, as [`coded_bytes`], and its centroids.
+/// as they do: each row's code and what it keeps beside it, and the
+/// centroids.
 fn index_file_bytes(rows: f64, dimensions: usize) -> f64 {
-    coded_bytes(rows, dimensions) + clusters_of(rows) * rotated_width(dimensions) * 4.0
+    let width = rotated_width(dimensions);
+    rows * (width / 8.0 + FILED_EACH_ROW) + clusters_of(rows) * width * FILED_EACH_VALUE
 }
 
 /// About how many bytes a segment's vector indexes take in memory: its
@@ -4297,7 +4307,7 @@ mod tests {
     /// coded, not clustered, writes no index file.
     #[test]
     fn a_clustered_merge_reckons_its_index_file_going_up() {
-        for (rows, width) in [(5_000, 4), (4_000, 384)] {
+        for (rows, width) in [(5_000, 4), (4_096, 384)] {
             let built = of_vectors(rows, width);
             let whole = Merge {
                 run: 0..1,
