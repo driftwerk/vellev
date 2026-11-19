@@ -3703,11 +3703,11 @@ impl Inner {
                 let Some(deadline) = deadline.upgrade() else {
                     return;
                 };
-                if stopped.load(Ordering::SeqCst) {
-                    hold.lose(Lost::Shutdown);
+                if hold.is_lost() {
                     return;
                 }
-                if hold.is_lost() {
+                if stopped.load(Ordering::SeqCst) {
+                    hold.lose(Lost::Shutdown);
                     return;
                 }
                 let unusable = hold
