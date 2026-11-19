@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn the_database_url_and_keys_are_read_from_the_pipe() {
         let read = through_pipe(&framed(
-            br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":"k1-fixture,k2-fixture"}"#,
+            br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":" k1-fixture, ,k2-fixture"}"#,
         ))
         .unwrap();
         assert_eq!(
@@ -193,16 +193,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn they_replace_what_the_command_line_and_environment_gave() {
+    const BOTH: &[u8] =
+        br#"{"VELLEV_DATABASE_URL":"postgres://from-pipe","VELLEV_API_KEYS":"k-fixture"}"#;
+
+    /// A config as clap leaves it with neither secret on the command line
+    /// or in the environment.
+    fn bare_config() -> Config {
         let mut config = crate::config::tests::config(&[]);
-        let read = through_pipe(&framed(
-            br#"{"VELLEV_DATABASE_URL":"postgres://from-pipe","VELLEV_API_KEYS":"k-fixture"}"#,
-        ))
-        .unwrap();
-        read.apply(&mut config);
+        config.database_url.clear();
+        config.api_keys.clear();
+        config
+    }
+
+    #[test]
+    fn they_become_the_nodes_database_and_keys() {
+        let mut config = bare_config();
+        through_pipe(&framed(BOTH))
+            .unwrap()
+            .apply(&mut config)
+            .unwrap();
         assert_eq!(config.database_url, "postgres://from-pipe");
         assert_eq!(config.api_keys, ["k-fixture"]);
+    }
+
+    /// With a pipe, the pipe is the only source: a database URL or keys
+    /// also given on the command line or in the environment (both readable
+    /// by other processes) are refused, naming the variable, not the value.
+    #[test]
+    fn with_a_pipe_neither_may_also_come_from_the_command_line_or_environment() {
+        let mut url = bare_config();
+        url.database_url = "postgres://u:pw-fixture@h/db".into();
+        let mut keys = bare_config();
+        keys.api_keys = vec!["env-key-fixture".into()];
+        for (mut config, named) in [(url, "VELLEV_DATABASE_URL"), (keys, "VELLEV_API_KEYS")] {
+            let err = format!(
+                "{:#}",
+                through_pipe(&framed(BOTH))
+                    .unwrap()
+                    .apply(&mut config)
+                    .unwrap_err()
+            );
+            assert!(err.contains(named), "{err}");
+            assert!(
+                !err.contains("pw-fixture") && !err.contains("env-key-fixture"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A pipe that leaves either secret out is refused, rather than the
+    /// node starting on whatever else it was given.
+    #[test]
+    fn the_pipe_must_hand_over_both() {
+        for (payload, missing) in [
+            (&br#"{"VELLEV_API_KEYS":"k-fixture"}"#[..], "VELLEV_DATABASE_URL"),
+            (br#"{"VELLEV_DATABASE_URL":"postgres://db"}"#, "VELLEV_API_KEYS"),
+            (br#"{}"#, "VELLEV_DATABASE_URL"),
+        ] {
+            let err = format!("{:#}", through_pipe(&framed(payload)).unwrap_err());
+            assert!(err.contains(missing), "{err}");
+        }
+    }
+
+    /// Anything after the frame is refused: the supervisor writes one
+    /// payload and closes its end, so more bytes mean something else wrote
+    /// to the pipe.
+    #[test]
+    fn bytes_after_the_frame_are_refused() {
+        let mut twice = framed(BOTH);
+        twice.extend(framed(br#"{"VELLEV_API_KEYS":"forged-fixture"}"#));
+        let err = format!("{:#}", through_pipe(&twice).unwrap_err());
+        assert!(err.contains("after"), "{err}");
+        assert!(!err.contains("forged-fixture"), "{err}");
     }
 
     /// A name the node doesn't take is refused, and is not repeated: a
@@ -239,13 +301,18 @@ mod tests {
     fn malformed_or_short_payloads_are_refused_without_repeating_them() {
         let mut short = framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#);
         short.truncate(short.len() - 2);
-        for bad in [
-            short,
-            framed(br#"{"VELLEV_API_KEYS": 12345678}"#),
-            framed(b"VELLEV_API_KEYS=k-fixture"),
-            ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
+        for (bad, reason) in [
+            (short, "ended before their length"),
+            (vec![0, 0], "ended before their length"),
+            (framed(br#"{"VELLEV_API_KEYS": 12345678}"#), "line 1, column"),
+            (framed(b"VELLEV_API_KEYS=k-fixture"), "line 1, column"),
+            (
+                ((MAX_BYTES as u32) + 1).to_be_bytes().to_vec(),
+                "over 65536 bytes",
+            ),
         ] {
             let err = through_pipe(&bad).unwrap_err().to_string();
+            assert!(err.contains(reason), "{reason}: {err}");
             assert!(
                 !err.contains("k-fixture") && !err.contains("12345678"),
                 "{err}"
@@ -254,7 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_pipe_times_out_and_a_held_write_end_does_not_hang() {
+    /// A supervisor that never writes, or whose write end stays open after
+    /// the payload (so the end of it can't be confirmed), is an error at
+    /// the deadline, never a node waiting for ever.
+    #[test]
+    fn a_silent_pipe_or_a_held_write_end_is_refused_at_the_deadline() {
         let (reader, writer) = std::io::pipe().unwrap();
         let err = Inherited::read(reader.into(), Duration::from_millis(200))
             .unwrap_err()
@@ -262,11 +333,11 @@ mod tests {
         assert!(err.contains("within"), "{err}");
         drop(writer);
         let (reader, mut writer) = std::io::pipe().unwrap();
-        writer
-            .write_all(&framed(br#"{"VELLEV_API_KEYS":"k-fixture"}"#))
-            .unwrap();
-        let read = Inherited::read(reader.into(), Duration::from_secs(5)).unwrap();
-        assert_eq!(read.api_keys, ["k-fixture"]);
+        writer.write_all(&framed(BOTH)).unwrap();
+        let err = Inherited::read(reader.into(), Duration::from_millis(200))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("within"), "{err}");
         drop(writer);
     }
 
