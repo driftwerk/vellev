@@ -712,7 +712,6 @@ impl Config {
         if let Some(problem) = settings.request_bounds.claim_problem(claim) {
             bail!("VELLEV_BACKUP_CLAIM_SECS cannot be as it is set: {problem}");
         }
-        // What is left to check is set by no variable: its own defaults.
         settings
             .check()
             .wrap_err("the node's settings cannot be as they are set")?;

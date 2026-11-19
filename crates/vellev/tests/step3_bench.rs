@@ -2052,8 +2052,9 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
 }
 
 /// The keep mark (§9.6): for each reason a sweep over the budget kept a
-/// tenant, held or its building lock busy, the longest spell, from the
-/// first sweep that kept it to the last, against twice a flush's hold p99. The bound is read from flush holds only. A reason
+/// tenant, held or its building lock busy, the longest spell against
+/// twice a flush's hold p99, with the longest upper end reported beside it
+/// and held to nothing. The bound is read from flush holds only. A reason
 /// with no spell passes; spells with no flush hold to set them against do
 /// not, as the other marks take a missing series.
 fn kept_over_budget_mark(events: &[Event]) -> Value {

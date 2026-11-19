@@ -216,11 +216,10 @@ pub enum Timed {
     /// reached before it had one of its flushes, so that it never began.
     LetGoFlushNotReached,
     /// A spell a tenant was kept by sweeps over the memory budget for one
-    /// reason: from the first sweep that kept it so to the last, so timed
-    /// to a sweep's resolution, a keep by one sweep reading nothing. It
-    /// ends at the first sweep that does not keep it so, as by taking it
-    /// out, keeping it for the other reason, or finding the node no longer
-    /// over its budget.
+    /// reason: from the first sweep that kept it so to the last. It ends at
+    /// the first sweep that does not keep it so, as by taking it out,
+    /// keeping it for the other reason, or finding the node no longer over
+    /// its budget.
     Kept(KeptFor),
     /// The same spell's upper end: from the first sweep that kept the
     /// tenant so to the first that did not, or, for a spell still open, to

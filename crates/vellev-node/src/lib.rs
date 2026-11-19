@@ -1811,9 +1811,7 @@ impl Releases {
         }
     }
 
-    /// Releases with no flushes before them, as shutdown's: all over
-    /// [`Settings::release_within`] from now.
-    fn flushes_over(settings: &Settings) -> Self {
+    fn unflushed(settings: &Settings) -> Self {
         Self::new(settings, Instant::now(), 0)
     }
 
@@ -1824,7 +1822,7 @@ impl Releases {
         }
     }
 
-    /// Ends as the sweep's releases are over.
+    /// Ends as the releases are over.
     async fn over(&self) {
         let mut flushed = self.flushed.subscribe();
         let ended = tokio::select! {
@@ -2978,7 +2976,7 @@ impl Node {
             open.followers.clear();
             open.tenants.drain().map(|(_, opening)| opening).collect()
         };
-        let releases = Releases::flushes_over(&self.0.settings);
+        let releases = Releases::unflushed(&self.0.settings);
         let releasing = openings.into_iter().map(|opening| {
             let releases = &releases;
             async move {
@@ -3330,11 +3328,9 @@ impl Inner {
     }
 
     /// Go on with the spell of each tenant of `kept` this sweep kept for the
-    /// budget, for the same reason as the last, to now, or begin
-    /// one; and end, timed to the last sweep that kept it, that of each not
-    /// kept so now: taken out, kept for the other reason, or not over the
-    /// budget any more. So a spell is timed to a sweep's resolution: one
-    /// sweep's keep reads nothing, however long to the next.
+    /// budget, for the same reason as the last, to now, or begin one; and
+    /// end, timed, that of each not kept so now: taken out, kept for the
+    /// other reason, or not over the budget any more.
     fn kept_spells(&self, kept: &[Kept]) {
         let now = Instant::now();
         let kept: HashMap<&TenantId, &Kept> = kept

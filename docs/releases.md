@@ -589,9 +589,9 @@ A node of an earlier release does not know the flag and exits with status
     with rows to flush, as long as those take for each after them, and 30
     s for one never reached. A tenant with nothing to flush adds no
     sample, as before. Neither that series nor a bench's eviction flush
-    mark is comparable across this change. That wait is also told in its two halves, as `{part="queued"}`, for a let-go that
-    had a slot, and `{part="not_reached"}`, for one the deadline came to
-    first.
+    mark is comparable across this change. That wait is also told in its
+    two halves, as `{part="queued"}`, for a let-go that had a slot, and
+    `{part="not_reached"}`, for one the deadline came to first.
 
 ### Numbers are read exactly
 
