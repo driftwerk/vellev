@@ -43,9 +43,9 @@ use crate::config::Config;
 /// The most a payload may hold: a conservative cap, so that with its 4-byte
 /// length it fits a default fresh pipe (16 KiB on macOS, 64 KiB on Linux),
 /// as the supervisor writes it all before the node starts to read. A
-/// Linux user over `pipe-user-pages-soft` gets smaller pipes; supervisors
-/// should keep the payload far below this (Desk Helper's is a few hundred
-/// bytes).
+/// Linux user over `pipe-user-pages-soft` gets pipes of as little as one
+/// page, so supervisors should keep the payload and its length within
+/// 4 KiB (Desk Helper's is a few hundred bytes).
 pub const MAX_BYTES: usize = 16 * 1024 - 4;
 const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
@@ -95,8 +95,9 @@ impl Inherited {
 
     /// Reads a framed payload from the pipe `fd` within `within`, and
     /// closes it by the time it returns, except at the deadline: the
-    /// reader's thread then keeps it until its read ends (the pipe ends, or
-    /// more arrives) or the process exits.
+    /// reader's thread then keeps it until it stops reading (the pipe ends,
+    /// a byte arrives after a whole frame, or a read fails) or the process
+    /// exits.
     pub fn read(fd: OwnedFd, within: Duration) -> Result<Self> {
         use std::os::unix::fs::FileTypeExt;
         let mut file = std::fs::File::from(fd);
