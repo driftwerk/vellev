@@ -17,9 +17,16 @@
 //! written after the frame, or a name given twice in it, are refused, and a
 //! write end still open elsewhere, like a supervisor that never writes, is
 //! an error at the deadline (saying which) rather than a node waiting for
-//! ever. Errors
-//! name one of the two variables or a position, never a value, nor a name
-//! the node doesn't take.
+//! ever. The node then exits refused, and its supervisor sees a start that
+//! failed. Errors name one of the two variables or a position, never a
+//! value, nor a name the node doesn't take.
+//!
+//! Only these two take the pipe: embedding keys and an object store's
+//! credentials still come from the environment. On Linux another process
+//! of the same user can open `/proc/<pid>/fd/<n>` in the moment before the
+//! node reads, so the pipe shortens the exposure the environment had but
+//! does not close it; taking or adding to the payload there fails the
+//! start.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -30,8 +37,11 @@ use eyre::{bail, eyre, Result};
 
 use crate::config::Config;
 
-/// The most a payload may hold.
-pub const MAX_BYTES: usize = 64 * 1024;
+/// The most a payload may hold: with its 4-byte length, the most a fresh
+/// pipe buffers on macOS (16 KiB; Linux's hold 64), as the supervisor
+/// writes it all before the node starts to read.
+pub const MAX_BYTES: usize = 16 * 1024 - 4;
+const _: () = assert!(MAX_BYTES + 4 <= 16 * 1024, "a frame must fit a fresh pipe");
 /// How long the node waits for its supervisor's payload.
 pub const READ_WITHIN: Duration = Duration::from_secs(10);
 
@@ -102,10 +112,15 @@ impl Inherited {
         });
         let body = match rx.recv_timeout(within) {
             Ok(Ok(body)) => body,
-            Ok(Err(Unread::TooLong)) => bail!("the secrets are over {MAX_BYTES} bytes"),
+            Ok(Err(Unread::TooLong)) => bail!(
+                "the secrets' length is over the most the secrets may hold ({MAX_BYTES} bytes)"
+            ),
             Ok(Err(Unread::Short)) => bail!("the secrets ended before their length"),
             Ok(Err(Unread::After)) => {
-                bail!("more was written after the secrets; the supervisor writes them once")
+                bail!(
+                    "more was written after the secrets' framed length: the supervisor writes \
+                     them once, after their exact length"
+                )
             }
             Ok(Err(Unread::Io(e))) => bail!("reading the secrets: {e}"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
@@ -500,7 +515,6 @@ mod tests {
     /// exactly the most is taken, one byte more is refused.
     #[test]
     fn the_largest_frame_fits_a_fresh_pipe() {
-        assert!(MAX_BYTES + 4 <= 16 * 1024, "{MAX_BYTES}");
         let mut most = BOTH.to_vec();
         most.resize(MAX_BYTES, b' ');
         let read = through_pipe(&framed(&most)).unwrap();
