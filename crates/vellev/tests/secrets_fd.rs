@@ -21,38 +21,90 @@ fn framed(payload: &[u8]) -> Vec<u8> {
 /// would never see its pipe end (as a supervisor's `SPAWNS` guards).
 static SPAWNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Reads all of `from` on a thread of its own, so a child saying a lot
-/// can't block on a full pipe; the answer comes on the returned channel,
-/// with a marker if the read failed.
-fn drain(mut from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+/// What a reader of one of the node's outputs sends: each line as it
+/// comes, then how the read ended.
+enum Said {
+    Line(String),
+    End(std::io::Result<()>),
+}
+
+/// Reads `from` line by line on a thread of its own, so a child saying a
+/// lot can't block on a full pipe. Lines are read as bytes and shown
+/// lossily, so one that isn't UTF-8 stops nothing.
+fn lines(from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Said> {
+    use std::io::BufRead;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut all = Vec::new();
-        if let Err(e) = from.read_to_end(&mut all) {
-            all.extend_from_slice(format!("\n[reading this failed: {e}]").as_bytes());
+        let mut from = std::io::BufReader::new(from);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let said = match from.read_until(b'\n', &mut line) {
+                Ok(0) => Said::End(Ok(())),
+                Ok(_) => Said::Line(String::from_utf8_lossy(&line).trim_end().to_owned()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => Said::End(Err(e)),
+            };
+            let ended = matches!(said, Said::End(_));
+            if tx.send(said).is_err() || ended {
+                break;
+            }
         }
-        let _ = tx.send(all);
     });
     rx
 }
 
-/// What `drain` read, waited for a few seconds at most: the node's ends
-/// close when it stops, unless something else kept a copy of them.
-fn drained(rx: &std::sync::mpsc::Receiver<Vec<u8>>, name: &str) -> Vec<u8> {
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap_or_else(|_| panic!("the node's {name} stayed open after it stopped"))
+/// The rest of what `rx` says, after `got`, to its end: waited for ten
+/// seconds at most, as the node has stopped and its ends close with it
+/// unless something else kept a copy. Short of the end, it says why, with
+/// what did come.
+fn rest(
+    rx: &std::sync::mpsc::Receiver<Said>,
+    mut got: Vec<String>,
+) -> Result<Vec<String>, (Vec<String>, String)> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(end.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Said::Line(line)) => got.push(line),
+            Ok(Said::End(Ok(()))) => return Ok(got),
+            Ok(Said::End(Err(e))) => return Err((got, format!("reading it failed: {e}"))),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err((got, "it stayed open after the node ended".into()));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err((got, "its reader died".into()));
+            }
+        }
+    }
+}
+
+/// All of one output, or the test fails saying why it isn't.
+fn whole(said: Result<Vec<String>, (Vec<String>, String)>, name: &str) -> String {
+    match said {
+        Ok(lines) => lines.join("\n"),
+        Err((lines, why)) => panic!("the node's {name}: {why}; it said: {}", lines.join("\n")),
+    }
+}
+
+/// Whatever of one output came, for a failure's message.
+fn shown(said: &Result<Vec<String>, (Vec<String>, String)>) -> String {
+    match said {
+        Ok(lines) => lines.join("\n"),
+        Err((lines, why)) => format!("{} [{why}]", lines.join("\n")),
+    }
 }
 
 /// Starts the node with `payload` on descriptor 3 and only `env` in its
-/// environment, and waits for it to stop, for a minute at most: a node
-/// that wrongly took the payload would wait for its database for ever, so
-/// it is then killed (and reaped) and the test fails, rather than hanging.
-/// Its output is drained while it runs, so a node saying a lot can't block
-/// on a full pipe and look like one that never stopped.
+/// environment, and waits a minute at most for it to stop: a node that
+/// wrongly took the payload would wait for its database for ever, so it is
+/// then killed (and reaped) and the test fails, rather than hanging. Its
+/// output is read while it runs, so a node saying a lot can't block on a
+/// full pipe, and then to its end, for up to ten seconds each.
 fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
     let mut child = start(payload, env);
-    let out = drain(child.stdout.take().unwrap());
-    let err = drain(child.stderr.take().unwrap());
+    let out = lines(child.stdout.take().unwrap());
+    let err = lines(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let (status, stopped) = loop {
         match child.try_wait() {
@@ -71,18 +123,19 @@ fn serve(payload: &[u8], env: &[(&str, &str)]) -> Output {
             }
         }
     };
-    let output = Output {
-        status,
-        stdout: drained(&out, "stdout"),
-        stderr: drained(&err, "stderr"),
-    };
+    let out = rest(&out, Vec::new());
+    let err = rest(&err, Vec::new());
     assert!(
         stopped,
-        "the node didn't stop: stderr: {} stdout: {}",
-        stderr(&output),
-        String::from_utf8_lossy(&output.stdout)
+        "the node didn't stop within a minute and was killed: stderr: {} stdout: {}",
+        shown(&err),
+        shown(&out)
     );
-    output
+    Output {
+        status,
+        stdout: whole(out, "stdout").into_bytes(),
+        stderr: whole(err, "stderr").into_bytes(),
+    }
 }
 
 /// Starts the node with `payload` on descriptor 3, listening on a port of
@@ -163,43 +216,46 @@ fn a_secret_also_in_the_environment_is_refused() {
 /// database for ever), and neither secret shows in anything it said.
 #[test]
 fn a_good_payload_is_taken_and_never_repeated() {
-    use std::io::BufRead;
     let mut child = start(
         br#"{"VELLEV_DATABASE_URL":"postgres://u:pw-fixture@127.0.0.1:1/db","VELLEV_API_KEYS":"k-fixture"}"#,
         &[],
     );
-    let stdout = child.stdout.take().unwrap();
-    let err = drain(child.stderr.take().unwrap());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let out = lines(child.stdout.take().unwrap());
+    let err = lines(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = Vec::new();
-    let listening = loop {
+    let (listening, ended) = loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(line) => {
+        match out.recv_timeout(left) {
+            Ok(Said::Line(line)) => {
                 let done = line.contains("vellev listening");
                 said.push(line);
                 if done {
-                    break true;
+                    break (true, None);
                 }
             }
-            Err(_) => break false,
+            Ok(Said::End(how)) => break (false, Some(how)),
+            Err(_) => break (false, None),
         }
     };
     let _ = child.kill();
     child.wait().unwrap();
-    let err = String::from_utf8_lossy(&drained(&err, "stderr")).into_owned();
-    said.extend(rx.try_iter());
-    assert!(listening, "never listened: {err} {said:?}");
-    let said = said.join("\n");
+    // Everything it said, to the end, not only what came before listening:
+    // a secret logged after it would be missed otherwise.
+    let said = match ended {
+        Some(Ok(())) => Ok(said),
+        Some(Err(e)) => Err((said, format!("reading it failed: {e}"))),
+        None => rest(&out, said),
+    };
+    let err = rest(&err, Vec::new());
+    assert!(
+        listening,
+        "never listened: stderr: {} stdout: {}",
+        shown(&err),
+        shown(&said)
+    );
+    let said = whole(said, "stdout");
+    let err = whole(err, "stderr");
     for secret in ["pw-fixture", "k-fixture"] {
         assert!(!said.contains(secret), "stdout: {said}");
         assert!(!err.contains(secret), "stderr: {err}");
