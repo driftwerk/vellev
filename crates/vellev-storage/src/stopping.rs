@@ -100,6 +100,15 @@ impl Stopping {
         }
     }
 
+    /// For a flush, stopped by whoever holds a clone of `stop`, as a node
+    /// stops one it cut short.
+    pub(crate) fn flush(stop: Stop) -> Self {
+        Self {
+            stop,
+            ..Self::never()
+        }
+    }
+
     /// For a flush or a restore, which nothing stops.
     pub(crate) fn never() -> Self {
         Self {

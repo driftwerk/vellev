@@ -248,6 +248,11 @@ pub enum Holding {
     /// Part way through gathering its rows, at each chunk of them it comes
     /// to with some copied, until let go, stopped or not: a long gather.
     GatheringUntilLetGo,
+    /// A flush's build, at its start, until its flush is stopped: a build
+    /// that would otherwise run on. Only a flush's own, of the rows in
+    /// memory: not a merge's, nor the rows a merge's or the curve commit
+    /// flushes, nor a restore's.
+    FlushUntilStopped,
 }
 
 /// Where a merge's build asks whether a test holds it.
@@ -259,6 +264,8 @@ pub(crate) enum HeldAt {
     Gathering,
     /// Once built.
     Built,
+    /// A flush's, with its turn taken, before any row is indexed.
+    Flush,
 }
 
 /// How the builds stood as a [`Probe`] was dropped. Not for use.
@@ -432,6 +439,49 @@ impl MergeBuilds {
     pub fn hold(&self, holding: Option<Holding>) {
         *lock(&self.holding) = holding;
         self.let_go.notify_all();
+    }
+
+    /// Wait here while a test holds builds `at` this point: see
+    /// [`Self::hold`]. At most [`HELD_AT_MOST`].
+    pub(crate) fn held_here(&self, stopping: &Stopping, at: HeldAt) {
+        let mut holding = lock(&self.holding);
+        let here = match *holding {
+            None => false,
+            Some(Holding::BuiltUntilLetGo) => at == HeldAt::Built,
+            Some(Holding::UntilLetGo | Holding::UntilStopped) => at == HeldAt::Start,
+            Some(Holding::GatheringUntilLetGo) => at == HeldAt::Gathering,
+            Some(Holding::FlushUntilStopped) => at == HeldAt::Flush,
+        };
+        if !here {
+            return;
+        }
+        self.held.fetch_add(1, Ordering::SeqCst);
+        let until = Instant::now() + HELD_AT_MOST;
+        loop {
+            let goes_on = match *holding {
+                None => true,
+                Some(
+                    Holding::UntilLetGo | Holding::BuiltUntilLetGo | Holding::GatheringUntilLetGo,
+                ) => false,
+                Some(Holding::UntilStopped | Holding::FlushUntilStopped) => stopping.is_stopped(),
+            };
+            let one_let_go = !goes_on
+                && self
+                    .released
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+            if goes_on || one_let_go || Instant::now() >= until {
+                break;
+            }
+            holding = self
+                .let_go
+                .wait_timeout(holding, ASKS_EVERY)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        self.held.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// How many places are in the queue for a turn now. A merge makes its
@@ -841,46 +891,9 @@ impl MergeBuild {
     }
 
     /// Wait here while a test holds builds `at` this point: see
-    /// [`MergeBuilds::hold`]. At most [`HELD_AT_MOST`].
+    /// [`MergeBuilds::hold`].
     pub(crate) fn held_here(&self, stopping: &Stopping, at: HeldAt) {
-        let builds = &self.counted.builds;
-        let mut holding = lock(&builds.holding);
-        let here = match *holding {
-            None => false,
-            Some(Holding::BuiltUntilLetGo) => at == HeldAt::Built,
-            Some(Holding::UntilLetGo | Holding::UntilStopped) => at == HeldAt::Start,
-            Some(Holding::GatheringUntilLetGo) => at == HeldAt::Gathering,
-        };
-        if !here {
-            return;
-        }
-        builds.held.fetch_add(1, Ordering::SeqCst);
-        let until = Instant::now() + HELD_AT_MOST;
-        loop {
-            let goes_on = match *holding {
-                None => true,
-                Some(
-                    Holding::UntilLetGo | Holding::BuiltUntilLetGo | Holding::GatheringUntilLetGo,
-                ) => false,
-                Some(Holding::UntilStopped) => stopping.is_stopped(),
-            };
-            let one_let_go = !goes_on
-                && builds
-                    .released
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                        left.checked_sub(1)
-                    })
-                    .is_ok();
-            if goes_on || one_let_go || Instant::now() >= until {
-                break;
-            }
-            holding = builds
-                .let_go
-                .wait_timeout(holding, ASKS_EVERY)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
-        builds.held.fetch_sub(1, Ordering::SeqCst);
+        self.counted.builds.held_here(stopping, at);
     }
 }
 

@@ -12,7 +12,7 @@ use common::*;
 use serde_json::{json, Value};
 use vellev::metrics::{self, Stage};
 use vellev_core::TenantId;
-use vellev_node::Settings;
+use vellev_node::{Settings, LET_GO_FLUSH_WITHIN};
 
 const HYBRID: &str = "/v1/tenants/{tenant}/collections/{collection}/hybrid";
 const LIST: &str = "/v1/tenants/{tenant}/collections/{collection}/list";
@@ -664,11 +664,14 @@ async fn scraping_never_keeps_a_tenant_from_being_let_go() {
         "a sweep found tenants held that nothing but the scrapes held"
     );
     let text = served.app.metrics().encoded();
-    assert_eq!(
-        sample(&text, "vellev_sweep_tenants_kept_total", &[]),
-        Some(0.0),
-        "{text}"
-    );
+    for reason in ["held", "building"] {
+        let kept = sample(
+            &text,
+            "vellev_sweep_tenants_kept_total",
+            &[("reason", reason)],
+        );
+        assert_eq!(kept, Some(0.0), "{reason}: {text}");
+    }
     assert_eq!(
         sample(&text, "vellev_merges_stopped_for_budget_total", &[]),
         Some(0.0),
@@ -769,9 +772,9 @@ impl vellev_storage::blobs::Blobs for HeldPuts {
 
 /// M7-R4, `let_go`, the one way this reaches it while a round keeps its
 /// tenant: taken out between rounds, the tenant is flushed before it is let
-/// go, and held there, its maintenance's next round comes up on time and
-/// begins a merge. The sweep's let-go stops that merge, and it shows as
-/// `let_go`, not as a lease lost.
+/// go, and held there, within what a sweep gives its flushes, its
+/// maintenance's next round comes up on time and begins a merge. The sweep's
+/// let-go stops that merge, and it shows as `let_go`, not as a lease lost.
 #[tokio::test]
 async fn a_merge_stopped_as_its_tenant_is_let_go_is_reported_as_that() {
     let store = Arc::new(HeldPuts {
@@ -805,23 +808,34 @@ async fn a_merge_stopped_as_its_tenant_is_let_go_is_reported_as_that() {
     note_in(&served, "acme", 5).await;
     drop(tenant);
     tokio::time::pause();
-    // Unused for longer than any tenant is kept regardless.
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Its next round comes a minute from its opening, and so inside what a
+    // sweep gives its flushes, which would be cut before a round a whole
+    // minute off.
+    let round_comes_in = LET_GO_FLUSH_WITHIN - Duration::from_secs(10);
+    tokio::time::sleep(Duration::from_secs(60) - round_comes_in).await;
     store.armed.store(true, Ordering::SeqCst);
     let sweep = tokio::spawn({
         let node = served.node.clone();
         async move { node.sweep_now().await }
     });
-    while !store.held.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    let held = async {
+        while !store.held.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), held)
+        .await
+        .expect("the sweep's flush never came to the store");
     // Time for its next round, which finds the flush holding `building`.
-    tokio::time::sleep(Duration::from_secs(61)).await;
+    tokio::time::sleep(round_comes_in + Duration::from_secs(1)).await;
     store.armed.store(false, Ordering::SeqCst);
     store
         .let_go
         .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
-    sweep.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), sweep)
+        .await
+        .expect("the sweep never ended")
+        .unwrap();
     tokio::time::resume();
     let text = served.app.metrics().encoded();
     for (reason, count) in [("let_go", 1.0), ("lease", 0.0), ("drop", 0.0)] {
@@ -832,6 +846,48 @@ async fn a_merge_stopped_as_its_tenant_is_let_go_is_reported_as_that() {
             "{reason}\n{text}"
         );
     }
+    served.stop().await;
+}
+
+/// A flush a store holds past what a sweep gives it is cut, and reported as
+/// a flush skipped: the next opener replays those rows.
+#[tokio::test]
+async fn a_flush_skipped_as_its_tenant_is_let_go_is_reported_as_that() {
+    let store = Arc::new(HeldPuts {
+        inner: memory(),
+        armed: AtomicBool::new(false),
+        held: AtomicBool::new(false),
+        let_go: tokio::sync::Semaphore::new(0),
+    });
+    let cluster = Cluster::new().through(store.clone());
+    let served = cluster
+        .serve_unstarted_with(|settings| Settings {
+            memory: Some(1),
+            flush_rows: 1_000_000,
+            tenant_idle: Duration::from_secs(60 * 60),
+            ..settings
+        })
+        .await;
+    note_in(&served, "acme", 1).await;
+    tokio::time::pause();
+    // Unused for longer than any tenant is kept regardless.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    store.armed.store(true, Ordering::SeqCst);
+    let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, served.node.sweep_now())
+        .await
+        .expect("the sweep was held past its bound by a flush that hangs");
+    tokio::time::resume();
+    store.armed.store(false, Ordering::SeqCst);
+    store
+        .let_go
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    let text = served.app.metrics().encoded();
+    assert_eq!(
+        sample(&text, "vellev_let_go_flushes_skipped_total", &[]),
+        Some(1.0),
+        "{text}"
+    );
     served.stop().await;
 }
 
@@ -1180,7 +1236,7 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         let ended = sample(&text, "vellev_merges_ended_total", &[("outcome", outcome)]);
         assert!(ended.is_some(), "{outcome}: {text}");
     }
-    for part in ["wait", "held"] {
+    for part in ["wait", "queued", "not_reached", "held"] {
         let count = sample(
             &text,
             "vellev_flush_to_let_go_seconds_count",
@@ -1188,6 +1244,19 @@ async fn the_nodes_background_work_is_served_as_it_is_timed() {
         );
         assert_eq!(count, Some(0.0), "{part}: {text}");
     }
+    for reason in ["held", "building"] {
+        let count = sample(
+            &text,
+            "vellev_sweep_kept_seconds_count",
+            &[("reason", reason)],
+        );
+        assert_eq!(count, Some(0.0), "{reason}: {text}");
+    }
+    assert_eq!(
+        sample(&text, "vellev_let_go_flushes_skipped_total", &[]),
+        Some(0.0),
+        "{text}"
+    );
     for reason in ["idle", "budget"] {
         let let_go = sample(&text, "vellev_tenants_let_go_total", &[("reason", reason)]);
         assert_eq!(let_go, Some(0.0), "{reason}: {text}");

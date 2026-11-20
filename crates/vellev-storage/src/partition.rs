@@ -1,3 +1,8 @@
+//! A partition and the writer that commits to it. The writer's test seams,
+//! its gates and counts, are compiled in, as `merge_gate` first was, on
+//! purpose: each costs an atomic or an uncontended lock, and the node's
+//! tests, in another crate, need them.
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -9,7 +14,7 @@ use futures::future::{join_all, try_join_all};
 use futures::StreamExt;
 use serde::Serialize;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 use tokio::time::Instant;
 use vellev_core::{Embedding, ModelFault, ObjectError};
 
@@ -1159,8 +1164,9 @@ pub struct Writer {
     /// Held while a flush builds its segment without `writing`, and while
     /// a merge plans and while it commits, so that what replaces segments
     /// goes one at a time, and a flush never builds on a state a merge is
-    /// about to replace.
-    building: Mutex<()>,
+    /// about to replace. An `Arc`, as a sweep holds it for as long as it
+    /// lets a tenant go: see [`Self::building_if_free`].
+    building: Arc<Mutex<()>>,
     /// Set while a restore runs, when writes are refused. Shared with a
     /// gather, which a restore ends.
     restoring: Arc<AtomicBool>,
@@ -1188,9 +1194,12 @@ pub struct Writer {
     /// committed or failed, if a test has set one: see
     /// [`Self::hold_refusals`].
     refusal_gate: std::sync::Mutex<Option<Arc<RefusalGate>>>,
+    /// How many flushes have asked for the building lock: see
+    /// [`Self::flushes_asked_for_building`].
+    flushes_asked: AtomicUsize,
     /// A gate a checkpoint waits at once adopted, with what it took out of
-    /// memory, if a test has set one: where one may be dropped.
-    #[cfg(test)]
+    /// memory, if a test has set one: where one may be dropped. See
+    /// [`Self::hold_checkpoints_once_adopted`].
     adopted_gate: std::sync::Mutex<Option<Arc<MergeGate>>>,
     /// A probe for what the next checkpoint takes out of memory, if a test
     /// has set one.
@@ -1310,7 +1319,9 @@ impl RefusalGate {
 /// A writer's building lock held, for whom and since when: the hold is
 /// timed as it is let go.
 struct Building<'a> {
-    _guard: MutexGuard<'a, ()>,
+    /// The lock, unless whoever asked holds it, and goes on holding it past
+    /// this: see [`BuildingHeld::flush`].
+    _guard: Option<MutexGuard<'a, ()>>,
     holder: Holder,
     since: Instant,
     writer: &'a Writer,
@@ -1336,6 +1347,78 @@ impl Drop for Building<'_> {
         if self.timed {
             let held = self.since.elapsed();
             self.writer.timed(Timed::BuildingHeld(self.holder), held);
+        }
+    }
+}
+
+/// A writer's building lock, held from outside the writer for as long as
+/// this is kept, and the writer whose lock it is, which flushes under it:
+/// see [`Writer::building_if_free`]. For a node and its tests.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct BuildingHeld {
+    writer: Arc<Writer>,
+    _guard: OwnedMutexGuard<()>,
+    /// See [`Self::adopted`].
+    adopted: AtomicBool,
+}
+
+impl BuildingHeld {
+    fn new(writer: Arc<Writer>, guard: OwnedMutexGuard<()>) -> Self {
+        Self {
+            writer,
+            _guard: guard,
+            adopted: AtomicBool::new(false),
+        }
+    }
+
+    /// As [`Writer::flush`], whatever the rows, under this lock, which is
+    /// held on past it. Says how long it held the lock, or `None` if it
+    /// found nothing to flush. Its build and upload, off the async threads,
+    /// give up once `stop` is stopped: dropping the flush does not reach
+    /// them. `&mut`, so that one hold makes one flush at a time.
+    pub async fn flush(&mut self, stop: &Stop) -> Result<Option<Duration>> {
+        let (writer, adopted) = (&self.writer, &self.adopted);
+        adopted.store(false, Ordering::SeqCst);
+        let stopping = Stopping::flush(stop.clone());
+        let mut flushing = Cuttable {
+            building: Building {
+                _guard: None,
+                holder: Holder::Flush,
+                since: Instant::now(),
+                writer,
+                timed: true,
+            },
+            ended: false,
+        };
+        let flushed = writer
+            .flushing_held(&mut flushing.building, &stopping, Some(adopted))
+            .await;
+        flushing.ended = true;
+        flushed?;
+        let building = &flushing.building;
+        Ok(building.timed.then(|| building.held()))
+    }
+
+    /// Whether the last flush under this lock had its checkpoint committed
+    /// and adopted, whether or not it was waited for to its end.
+    pub fn adopted(&self) -> bool {
+        self.adopted.load(Ordering::SeqCst)
+    }
+}
+
+/// A let-go's flush's hold of the building lock, timed only if the flush
+/// ends, gone through or failed: one cut short, dropped where it waits, is
+/// no flush's hold.
+struct Cuttable<'a> {
+    building: Building<'a>,
+    ended: bool,
+}
+
+impl Drop for Cuttable<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.building.built_nothing();
         }
     }
 }
@@ -1374,15 +1457,6 @@ impl Default for FlushFirst<'_> {
             tried: &|_| {},
         }
     }
-}
-
-/// How long a flush waited for its partition's building lock, and then
-/// held it: its whole build and commit, or `None` if it found nothing to
-/// flush and so built nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FlushTimes {
-    pub waited: Duration,
-    pub held: Option<Duration>,
 }
 
 /// The rows a build is of, ready to index, with what else their making
@@ -1506,7 +1580,7 @@ impl Writer {
             clock: Arc::new(SystemClock),
             writing: Mutex::new(()),
             closed: AtomicBool::new(false),
-            building: Mutex::new(()),
+            building: Arc::new(Mutex::new(())),
             restoring: Arc::default(),
             held: Arc::default(),
             format: Arc::new(AtomicU16::new(DEFAULT_MAX_FORMAT)),
@@ -1515,7 +1589,7 @@ impl Writer {
             keeping: Arc::default(),
             merge_gate: std::sync::Mutex::new(None),
             refusal_gate: std::sync::Mutex::default(),
-            #[cfg(test)]
+            flushes_asked: AtomicUsize::new(0),
             adopted_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
             discarded_probe: std::sync::Mutex::new(None),
@@ -1621,10 +1695,13 @@ impl Writer {
     /// The building lock, for `holder`, its wait and then its hold timed.
     async fn building(&self, holder: Holder) -> Building<'_> {
         let asked = Instant::now();
+        if holder == Holder::Flush {
+            self.flushes_asked.fetch_add(1, Ordering::SeqCst);
+        }
         let guard = self.building.lock().await;
         self.timed(Timed::BuildingWait(holder), asked.elapsed());
         Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder,
             since: Instant::now(),
             writer: self,
@@ -2120,7 +2197,9 @@ impl Writer {
     /// checkpoint was committed at, or the current one when nothing needed
     /// flushing or a checkpoint made meanwhile left nothing to do.
     pub async fn flush(&self) -> Result<LogPosition> {
-        self.flush_timed().await.map(|(position, _)| position)
+        let mut building = self.building(Holder::Flush).await;
+        self.flushing_held(&mut building, &Stopping::never(), None)
+            .await
     }
 
     /// As [`Self::flush`], if it still holds `rows` rows unflushed once it
@@ -2134,24 +2213,38 @@ impl Writer {
             building.built_nothing();
             return Ok(None);
         }
-        self.flushing_held(&mut building).await.map(Some)
+        self.flushing_held(&mut building, &Stopping::never(), None)
+            .await
+            .map(Some)
     }
 
-    /// As [`Self::flush`], saying how long it waited for the building lock
-    /// and then held it: as a node times the flush it makes before it
-    /// lets a tenant go.
-    pub async fn flush_timed(&self) -> Result<(LogPosition, FlushTimes)> {
-        let asked = Instant::now();
-        let mut building = self.building(Holder::Flush).await;
-        let waited = asked.elapsed().saturating_sub(building.held());
-        let position = self.flushing_held(&mut building).await?;
-        let held = building.timed.then(|| building.held());
-        Ok((position, FlushTimes { waited, held }))
+    /// The building lock, if nothing holds it or queues for it this moment,
+    /// to hold for as long as what is returned is kept. It never waits. For
+    /// a node and its tests.
+    #[doc(hidden)]
+    pub fn building_if_free(self: &Arc<Self>) -> Option<BuildingHeld> {
+        let guard = self.building.clone().try_lock_owned().ok()?;
+        Some(BuildingHeld::new(self.clone(), guard))
+    }
+
+    /// Test hook: wait for the building lock, and hold it for as long as
+    /// what is returned is kept.
+    #[doc(hidden)]
+    pub async fn building_when_free(self: &Arc<Self>) -> BuildingHeld {
+        let guard = self.building.clone().lock_owned().await;
+        BuildingHeld::new(self.clone(), guard)
     }
 
     /// What [`Self::flush`] does once it holds the building lock, as
-    /// `building`: which, if there is nothing to flush, built nothing.
-    async fn flushing_held(&self, building: &mut Building<'_>) -> Result<LogPosition> {
+    /// `building`: which, if there is nothing to flush, built nothing. It
+    /// gives up before its commit once `stopping` is stopped, and sets
+    /// `adopted`, if given, as its checkpoint is adopted.
+    async fn flushing_held(
+        &self,
+        building: &mut Building<'_>,
+        stopping: &Stopping,
+        adopted: Option<&AtomicBool>,
+    ) -> Result<LogPosition> {
         // Noted under the lock it is taken under, so that no rows are
         // applied between: the rows it takes are exactly those it notes.
         let taken = self.partition.read(|state| {
@@ -2164,7 +2257,8 @@ impl Writer {
             return Ok(self.partition.read(State::position));
         };
         let mut staged = self.staging();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let at = Some(HeldAt::Flush);
+        let (snapshot, segment) = self.flushing(snapshot, &mut staged, stopping, at).await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -2177,7 +2271,13 @@ impl Writer {
         // the turn held, nothing is committed before it is adopted.
         let kept = self.partition.read(|state| state.kept(&snapshot));
         self.checkpoint(turn, &key, frame, position, Some(taking), |state| {
-            state.flushed(&key, position, snapshot, segment, Some(kept))
+            let discarded = state.flushed(&key, position, snapshot, segment, Some(kept));
+            // Committed, as `adopt` runs only once it is: told before the
+            // checkpoint frees what it took out, where a cut may yet fall.
+            if let Some(adopted) = adopted {
+                adopted.store(true, Ordering::SeqCst);
+            }
+            discarded
         })
         .await?;
         Ok(position)
@@ -2235,11 +2335,11 @@ impl Writer {
         #[cfg(test)]
         {
             discarded.probe = self.discarded_probe.lock().expect("probe lock").take();
-            let gate = self.adopted_gate.lock().expect("gate lock").clone();
-            if let Some(gate) = gate {
-                gate.reached.notify_one();
-                gate.release.notified().await;
-            }
+        }
+        let gate = self.adopted_gate.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
         }
         drop(turn);
         // The building lock is held here. All that a merge's commit took out
@@ -2258,11 +2358,15 @@ impl Writer {
     /// `snapshot` out of memory, a part at a time so that commits are not
     /// held up while all of them are, and build, upload and load back the
     /// segment of them, if there are any, which is then seen to be fit to
-    /// adopt.
+    /// adopt. Its build, upload and load give up once `stopping` is stopped.
+    /// Its build is held where a test holds builds at `held_at`, if given:
+    /// a flush's, not a merge's or the curve commit's.
     async fn flushing(
         &self,
         mut snapshot: Snapshot,
         staged: &mut Staged,
+        stopping: &Stopping,
+        held_at: Option<HeldAt>,
     ) -> Result<(Snapshot, Option<Fit>)> {
         while self
             .partition
@@ -2271,10 +2375,14 @@ impl Writer {
             tokio::task::yield_now().await;
         }
         let named_at = snapshot.position;
-        let segment = match self.uploaded(&mut snapshot, named_at, staged).await? {
+        let uploaded = self.uploaded(&mut snapshot, named_at, staged, stopping, held_at);
+        let segment = match uploaded.await? {
             Some(prepared) => {
                 let prepared = FreedOff::new(prepared);
-                Some(self.fit(prepared, &snapshot.catalog, None).await?)
+                Some(
+                    self.fit(prepared, &snapshot.catalog, Some(stopping))
+                        .await?,
+                )
             }
             None => None,
         };
@@ -2358,7 +2466,16 @@ impl Writer {
         let segment = match target.read(State::snapshot) {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
-                match self.uploaded(&mut snapshot, restored, &mut staged).await? {
+                match self
+                    .uploaded(
+                        &mut snapshot,
+                        restored,
+                        &mut staged,
+                        &Stopping::never(),
+                        None,
+                    )
+                    .await?
+                {
                     Some(prepared) => {
                         let (meta, loaded) = self.loaded(FreedOff::new(prepared), None).await?;
                         held.insert(meta.key.clone(), loaded);
@@ -2789,12 +2906,16 @@ impl Writer {
 
     /// Build and upload a segment of the rows taken out of `snapshot` and
     /// its tombstones, its files named at `named_at`; none if it has
-    /// neither.
+    /// neither. Given up, a failure, once `stopping` is stopped: asked as
+    /// the rows are indexed, and before and while each file goes up. Its
+    /// build is held at `held_at`, if a test holds builds there.
     async fn uploaded(
         &self,
         snapshot: &mut Snapshot,
         named_at: LogPosition,
         staged: &mut Staged,
+        stopping: &Stopping,
+        held_at: Option<HeldAt>,
     ) -> Result<Option<Prepared>> {
         if snapshot.rows.is_empty() && snapshot.tombstones.is_empty() {
             return Ok(None);
@@ -2810,11 +2931,23 @@ impl Writer {
             rows,
             tombstones: snapshot.tombstones.clone(),
         };
-        let built = self
-            .built(file, Some(vectors), snapshot.catalog.clone())
-            .await?;
+        let stopped = || StorageError::Background(format!("the build at {named_at:?} was stopped"));
+        let rows = move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| {
+            Ok(Some((file, Some(vectors), ())))
+        };
+        let catalog = snapshot.catalog.clone();
+        let built = self.built_stopping(rows, catalog, stopping, None, held_at);
+        let built = built.await?;
+        let Some((built, ())) = built else {
+            return Err(stopped());
+        };
         let prepared = Self::prepared(names.meta(shape), built, self.writes())?;
-        self.upload(&prepared, staged).await?;
+        if !self
+            .upload_stopping(&prepared, staged, stopping, None)
+            .await?
+        {
+            return Err(stopped());
+        }
         Ok(Some(prepared))
     }
 
@@ -2849,42 +2982,25 @@ impl Writer {
         }
     }
 
-    /// Index the segment of `file`, its vectors gathered in `vectors` or,
-    /// without, still in its rows, to be taken from them into their column;
-    /// then encode both, sealing the gathered frame, off the async threads
-    /// and out of the state's lock, before anything is written, so that
-    /// neither readers nor commits wait while a large segment is indexed.
-    async fn built(
-        &self,
-        file: SegmentFile,
-        vectors: Option<Gathering>,
-        catalog: Catalog,
-    ) -> Result<Built> {
-        let rows = move |_: &Stopping, _: Option<&MergeBuild>, _: OnPool<'_>| {
-            Ok(Some((file, vectors, ())))
-        };
-        match self
-            .built_stopping(rows, catalog, &Stopping::never(), None)
-            .await?
-        {
-            Some((built, ())) => Ok(built),
-            None => unreachable!("a build nothing stops is never stopped"),
-        }
-    }
-
-    /// As [`Self::built`], of the rows `rows` comes to, with what else it
-    /// says, giving up, `None`, if it comes to none, or once `stopping` is
-    /// stopped: asked as the rows are indexed, and before and after they
-    /// are encoded. `rows` is the work's first step, in the same turn off
-    /// the async threads, with no lock held: a merge gathers there, where
-    /// nothing waits on it. A merge's `build` is held by the work until it
-    /// ends, whoever stops waiting for it.
+    /// Index the segment of the rows `rows` comes to, their vectors gathered
+    /// or, without, still in the rows, to be taken from them into their
+    /// column; then encode both, sealing the gathered frame, off the async
+    /// threads and out of the state's lock, before anything is written, so
+    /// that neither readers nor commits wait while a large segment is
+    /// indexed. With what else `rows` says, giving up, `None`, if it comes
+    /// to none, or once `stopping` is stopped: asked as the rows are
+    /// indexed, and before and after they are encoded. `rows` is the work's
+    /// first step, in the same turn off the async threads, with no lock
+    /// held: a merge gathers there, where nothing waits on it. A merge's
+    /// `build` is held by the work until it ends, whoever stops waiting for
+    /// it. The work is held at `held_at`, if a test holds builds there.
     async fn built_stopping<T: Send + 'static>(
         &self,
         rows: impl FnOnce(&Stopping, Option<&MergeBuild>, OnPool<'_>) -> RowsToBuild<T> + Send + 'static,
         catalog: Catalog,
         stopping: &Stopping,
         build: Option<Arc<MergeBuild>>,
+        held_at: Option<HeldAt>,
     ) -> Result<Option<(Built, T)>> {
         let above = Some(self.merging.clustered_above);
         let format = self.writes();
@@ -2905,6 +3021,7 @@ impl Writer {
             None => return Ok(None),
         };
         let stopping = stopping.clone();
+        let builds = self.merge_builds.clone();
         // The merge's share of its build is let go only after everything the
         // work made or holds, whether or not anyone awaits it: it is the
         // closure's first local, so that it drops last should the work
@@ -2921,6 +3038,9 @@ impl Writer {
                 Some(build) => OnPool::merge(build),
                 None => OnPool::global(),
             };
+            if let Some(at) = held_at {
+                builds.held_here(&stopping, at);
+            }
             let cpu = vellev_index::pool::thread_cpu();
             let built = match rows(&stopping, build.as_deref(), on) {
                 Ok(Some((file, vectors, with))) => {
@@ -2987,18 +3107,7 @@ impl Writer {
 
     /// Upload a segment's files, the segment's own last so that it never
     /// sits in the store without its companions, noting each in `staged`
-    /// before it goes up.
-    async fn upload(&self, prepared: &Prepared, staged: &mut Staged) -> Result<()> {
-        match self
-            .upload_stopping(prepared, staged, &Stopping::never(), None)
-            .await?
-        {
-            true => Ok(()),
-            false => unreachable!("an upload nothing stops is never stopped"),
-        }
-    }
-
-    /// As [`Self::upload`], giving up, `false`, once `stopping` is
+    /// before it goes up; giving up, `false`, once `stopping` is
     /// stopped: asked before each file, and while each goes up. A file
     /// given up part way is aborted as its upload is dropped, its parts
     /// discarded ([`crate::Transfers`]); those that went up are deleted
@@ -3179,7 +3288,9 @@ impl Writer {
         }
         let mut staged = self.staging();
         let (snapshot, taking) = self.taken_noted();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let (snapshot, segment) = self
+            .flushing(snapshot, &mut staged, &Stopping::never(), None)
+            .await?;
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
         let key = Layout(&self.lease.key).manifest(position, &self.author);
@@ -3413,7 +3524,8 @@ impl Writer {
             names.vectors.clone(),
             catalog.clone(),
         );
-        let built = self.built_stopping(gather, catalog.clone(), stopping, Some(build.clone()));
+        let build_of = Some(build.clone());
+        let built = self.built_stopping(gather, catalog.clone(), stopping, build_of, None);
         let built = match built.await {
             // Skipped, not failed: what it would have written would have
             // filled the disk, and what frees that disk comes next. Tried
@@ -3507,7 +3619,7 @@ impl Writer {
         }
         self.timed(Timed::BuildingWait(Holder::MergeCommit), waited);
         let _building = Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder: Holder::MergeCommit,
             since: Instant::now(),
             writer: self,
@@ -3536,7 +3648,9 @@ impl Writer {
             return Ok(dropped(MergeEnd::Uncovered));
         }
         let (snapshot, taking) = self.taken_noted();
-        let (snapshot, segment) = self.flushing(snapshot, &mut staged).await?;
+        let (snapshot, segment) = self
+            .flushing(snapshot, &mut staged, &Stopping::never(), None)
+            .await?;
         let segment = FreedOff::new(segment);
         let turn = self.turn().await?;
         let position = following(self.partition.read(State::position))?;
@@ -3588,13 +3702,15 @@ impl Writer {
         flush_first: FlushFirst<'_>,
     ) -> Result<Option<LogPosition>> {
         let mut building = Building {
-            _guard: guard,
+            _guard: Some(guard),
             holder: Holder::Flush,
             since: Instant::now(),
             writer: self,
             timed: true,
         };
-        let flushed = self.flushing_held(&mut building).await;
+        let flushed = self
+            .flushing_held(&mut building, &Stopping::never(), None)
+            .await;
         (flush_first.tried)(flushed.is_ok());
         match flushed {
             Ok(position) => Ok(Some(position)),
@@ -3786,7 +3902,7 @@ impl Writer {
             self.timed(Timed::Merge(MergePhase::Turn), turn);
             self.timed(Timed::BuildingWait(Holder::MergePlan), waited);
             let planning = Building {
-                _guard: guard,
+                _guard: Some(guard),
                 holder: Holder::MergePlan,
                 since: Instant::now(),
                 writer: self,
@@ -4001,6 +4117,33 @@ impl Writer {
     #[doc(hidden)]
     pub fn kept_while_merging(&self) -> usize {
         self.keeping.lock().expect("keeping lock").len()
+    }
+
+    /// How many flushes have asked for the building lock since the writer
+    /// opened, each counted as it begins to wait for it, not one a node
+    /// makes under a lock it holds already. For tests that need a flush
+    /// to be queued for the lock.
+    #[doc(hidden)]
+    pub fn flushes_asked_for_building(&self) -> usize {
+        self.flushes_asked.load(Ordering::SeqCst)
+    }
+
+    /// Hold every checkpoint from now on once it is committed and adopted,
+    /// before it frees what it took out of memory, at the gate given back,
+    /// until it is released. For tests that cut a flush there.
+    #[doc(hidden)]
+    pub fn hold_checkpoints_once_adopted(&self) -> Arc<MergeGate> {
+        let gate = Arc::new(MergeGate::default());
+        *self.adopted_gate.lock().expect("gate lock") = Some(gate.clone());
+        gate
+    }
+
+    /// Hold no checkpoint from now on, as before
+    /// [`Self::hold_checkpoints_once_adopted`]. One held already waits
+    /// until its gate is released.
+    #[doc(hidden)]
+    pub fn stop_holding_checkpoints(&self) {
+        *self.adopted_gate.lock().expect("gate lock") = None;
     }
 
     /// Hold every merge from now on between its build and its commit, at
@@ -4849,7 +4992,13 @@ impl RestoreFrom<'_> {
             Some(mut snapshot) => {
                 target.read(|state| state.copy_rows(&mut snapshot, usize::MAX));
                 match writer
-                    .uploaded(&mut snapshot, restored, &mut staged)
+                    .uploaded(
+                        &mut snapshot,
+                        restored,
+                        &mut staged,
+                        &Stopping::never(),
+                        None,
+                    )
                     .await?
                 {
                     Some(prepared) => {

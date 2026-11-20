@@ -1733,7 +1733,7 @@ async fn a_tenant_flushes_one_at_a_time_whoever_asks() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let letting_go = tokio::spawn({
         let writer = writer.clone();
-        async move { writer.flush_timed().await }
+        async move { writer.flush().await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(uploads(), 1, "a flush went up beside another");

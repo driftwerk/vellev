@@ -33,7 +33,7 @@ use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::registry::Registry;
 use vellev_node::Node;
-use vellev_storage::timings::{Holder, MergeEnd, MergePhase, Seconds, Timed};
+use vellev_storage::timings::{Holder, KeptFor, MergeEnd, MergePhase, Seconds, Timed};
 use vellev_storage::Work;
 
 use crate::allocator::Allocator;
@@ -484,11 +484,20 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     }
     histograms(
         encoder,
+        "sweep_kept_seconds",
+        "Spells sweeps over budget kept a tenant written for, first keeping sweep to last, so to one sweep's resolution, by reason: held or building",
+        "reason",
+        KeptFor::ALL.map(|why| (why.name(), timings.seconds(Timed::Kept(why)))),
+    )?;
+    histograms(
+        encoder,
         "flush_to_let_go_seconds",
-        "The flush made before a tenant is let go: how long it waited for the building lock, and how long it held it",
+        "A let-go's flush: its wait for a slot (wait; split as queued and not_reached) and its hold (held)",
         "part",
         [
             ("wait", timings.seconds(Timed::LetGoFlushWait)),
+            ("queued", timings.seconds(Timed::LetGoFlushQueued)),
+            ("not_reached", timings.seconds(Timed::LetGoFlushNotReached)),
             ("held", timings.seconds(Timed::LetGoFlushHeld)),
         ],
     )?;
@@ -513,6 +522,13 @@ fn background(encoder: &mut DescriptorEncoder, node: &Node) -> Result<(), std::f
     for (reason, count) in [("idle", let_go.idle), ("budget", let_go.for_budget)] {
         ConstCounter::new(count).encode(family.encode_family(&[("reason", reason)])?)?;
     }
+    let counter = ConstCounter::new(let_go.flushes_skipped);
+    counter.encode(encoder.encode_descriptor(
+        "let_go_flushes_skipped",
+        "Let-go flushes not made or not known to have landed: cut or not reached by the sweep's deadline, cut in the commit, or with the writer already closed. Their rows replay unless that commit landed",
+        None,
+        counter.metric_type(),
+    )?)?;
     Ok(())
 }
 
@@ -712,13 +728,18 @@ impl Collector for Counted {
             None,
             counter.metric_type(),
         )?)?;
-        let counter = ConstCounter::new(node.tenants_kept_by_sweeps());
-        counter.encode(encoder.encode_descriptor(
+        let kept = node.kept_by_sweeps();
+        let counter = ConstCounter::new(0u64);
+        let mut family = encoder.encode_descriptor(
             "sweep_tenants_kept",
-            "Tenants a sweep chose to let go, for being idle or for the memory budget, but found something else holding, as a request or a merge does: let go at a later round",
+            "Tenants and copies sweeps kept, by reason: held or building",
             None,
             counter.metric_type(),
-        )?)?;
+        )?;
+        for why in KeptFor::ALL {
+            let reason = [("reason", why.name())];
+            ConstCounter::new(kept.of(why)).encode(family.encode_family(&reason)?)?;
+        }
         let counter = ConstCounter::new(node.tenants_given_up());
         counter.encode(encoder.encode_descriptor(
             "tenants_given_up",

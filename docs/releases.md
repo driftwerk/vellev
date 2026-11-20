@@ -541,6 +541,57 @@ A node of an earlier release does not know the flag and exits with status
   `vellev_tenants_given_up_total` counts a panic on either task, two at
   once on one tenant counting twice, and the line logged for it now reads
   "a tenant's task panicked" with the task named.
+- **A sweep waits on no tenant, and its flushes and releases are
+  bounded.**
+  - *Keeps.* A tenant chosen to be let go whose building lock is busy is
+    kept for a later sweep. `vellev_sweep_tenants_kept_total` gains a
+    `reason` label: `held`, as before, for one something else holds, and
+    `building` for one kept only for its busy lock. Their sum is the count
+    the unlabelled series gave. It counts copies, under `held`, and
+    tenants kept as they idled.
+  - *Keep spells.* `vellev_sweep_kept_seconds` is new, with the same
+    `reason` label: each spell sweeps over the memory budget kept a tenant
+    for one reason, from the first sweep that kept it for that reason to
+    the last: to a sweep's resolution, so a keep by one sweep reads 0 s,
+    however long to the next. It times only tenants written for and kept
+    over the budget, so it counts fewer keeps than
+    `vellev_sweep_tenants_kept_total`.
+  - *Flushes.* A tenant taken out has its building lock from then on,
+    with the flush before letting go made under it, so nothing comes in
+    between and whatever queued for the lock ends with the hold. A sweep's
+    tenants go together, two flushing at a time, with 30 s for all those
+    flushes. A flush cut once its checkpoint was adopted went through, and
+    is not skipped. `vellev_let_go_flushes_skipped_total` is new and counts
+    let-go flushes not made or not known to have landed: cut or not
+    reached by the sweep's deadline, cut in the commit, or with the writer
+    already closed. Their rows replay unless that commit landed; the
+    tenant goes all the same. None is a flush that failed.
+  - *Releases.* Each tenant gives its lease up as it is let go, four at a
+    time, and a sweep's releases are over 5 s after its last flush ends,
+    or after the 30 s if that comes first; one not begun by then is not
+    sent, and runs out. A tenant with nothing to flush gives its lease up
+    at once, and a sweep takes at most 35 s. An opening that fails gives
+    its lease up within the same 5 s, where it waited on the release with
+    no bound. Shutdown gives its tenants' leases up the same way, each as
+    its opening resolves, four at a time and all within 5 s, where it gave
+    them up one after another. Those not given up by then run out with
+    their lease. An opening still running then is not waited for, and
+    its lease is not renewed: it runs out. A sweep or a shutdown logs one
+    warning counting the leases it did not give up, not one for each.
+    The 30 s, the two flushes and the four releases at once, and the 5 s
+    are fixed at these defaults for a node run as `vellev`, with no
+    `VELLEV_*` variable: only an embedder of `vellev_node` sets them, as
+    `Settings` fields.
+  - *The flush wait.* `vellev_flush_to_let_go_seconds{part="wait"}` no
+    longer reads a wait for the building lock, which a sweep tries and
+    never waits for. It reads the wait, with that lock held, for one of
+    the sweep's two flushes: nothing for the first two tenants of a sweep
+    with rows to flush, as long as those take for each after them, and 30
+    s for one never reached. A tenant with nothing to flush adds no
+    sample, as before. Neither that series nor a bench's eviction flush
+    mark is comparable across this change. That wait is also told in its
+    two halves, as `{part="queued"}`, for a let-go that had a slot, and
+    `{part="not_reached"}`, for one the deadline came to first.
 
 ### Numbers are read exactly
 

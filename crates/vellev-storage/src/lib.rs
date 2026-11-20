@@ -44,7 +44,7 @@ pub use mutation::{
     Batch, Condition, Mutation, Outcome, Receipt, Unembedded, Vectorize, Weight, DELETED_AT_MOST,
 };
 pub use partition::{
-    Embedded, FlushFirst, FlushTimes, Follower, MergeGate, Partition, RefusalGate, RestoreFrom,
+    BuildingHeld, Embedded, FlushFirst, Follower, MergeGate, Partition, RefusalGate, RestoreFrom,
     Writer, GATHERED_AT_ONCE,
 };
 pub use published::FreesHeld;
@@ -62,4 +62,5 @@ pub use vellev_index::curve;
 pub use vellev_index::filter::{Filter, FilterError};
 pub use vellev_index::fusion::Fusion;
 pub use vellev_index::pool::merge_slots;
+pub use vellev_index::stop::Stop;
 pub use work::Work;

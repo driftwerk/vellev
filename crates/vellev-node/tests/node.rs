@@ -19,7 +19,7 @@ use vellev_core::{
 use vellev_embed::{Embedders, Settings as EmbedSettings};
 use vellev_node::{
     ClaimClock, Freshness, Node, NodeError, Reader, RequestBounds, Served, Settings, Tenant,
-    LOOKED_OVER_EVERY, REMEMBERED,
+    LET_GO_FLUSH_WITHIN, LOOKED_OVER_EVERY, RELEASES_AT_ONCE, RELEASE_WITHIN, REMEMBERED,
 };
 use vellev_storage::backups::{Backup, Backups, DELETED_AT_ONCE};
 use vellev_storage::blobs::{Blobs, CachedBlobs, Listed, ObjectBlobs};
@@ -76,6 +76,13 @@ struct Store {
     segments_written: AtomicUsize,
     /// How many listings were asked for: cleaning up lists the tenant.
     listings: AtomicUsize,
+    /// How many deletes were asked for.
+    deletes: AtomicUsize,
+    /// Whether the next delete waits, once it has said so in
+    /// `delete_reached`, until `deletes_let_go` lets it through.
+    holding_a_delete: AtomicBool,
+    delete_reached: tokio::sync::Notify,
+    deletes_let_go: tokio::sync::Notify,
 }
 
 impl Store {
@@ -171,6 +178,11 @@ impl Blobs for Store {
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        if self.holding_a_delete.swap(false, Ordering::SeqCst) {
+            self.delete_reached.notify_one();
+            self.deletes_let_go.notified().await;
+        }
         self.inner.delete(key).await
     }
     async fn forget_local(&self, prefix: &str) -> vellev_storage::Result<()> {
@@ -207,6 +219,10 @@ impl Cluster {
                 merged_panics: AtomicBool::new(false),
                 segments_written: AtomicUsize::new(0),
                 listings: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                holding_a_delete: AtomicBool::new(false),
+                delete_reached: tokio::sync::Notify::new(),
+                deletes_let_go: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -817,6 +833,35 @@ async fn an_opening_that_fails_lets_go_of_the_tenant_and_a_stopped_node_opens_no
     assert_eq!(second.tenant(&tenant("acme")).await.unwrap().read(count), 1);
 }
 
+/// Review of f800a51, L3: an opening that fails gives its lease up within
+/// [`RELEASE_WITHIN`], whatever the coordinator does with the release: one
+/// that hangs holds up no caller past that, and the lease runs out.
+#[tokio::test(start_paused = true)]
+async fn a_failed_opening_s_release_that_hangs_ends_within_its_bound() {
+    let cluster = Cluster::new();
+    let first = cluster.node();
+    first.create_tenant(&tenant("acme")).await.unwrap();
+    let acme = first.tenant(&tenant("acme")).await.unwrap();
+    acme.write(vec![schema(EmbeddingProvider::None), note(1, "fox", None)])
+        .await
+        .unwrap();
+    acme.flush().await.unwrap();
+    first.shutdown().await;
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let second = node_leasing(&cluster, coordinator.clone(), LEASE);
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    cluster.store.unreadable.store(true, Ordering::SeqCst);
+    let asked = tokio::time::Instant::now();
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    let opened = tokio::time::timeout(bound, second.tenant(&tenant("acme")))
+        .await
+        .expect("a failed opening waited past its release's bound");
+    assert!(matches!(opened, Err(NodeError::Storage(_))), "{opened:?}");
+    assert!(asked.elapsed() >= RELEASE_WITHIN, "{:?}", asked.elapsed());
+}
+
 #[tokio::test]
 async fn a_writer_lost_to_a_failed_flush_is_replaced_on_the_next_call() {
     let cluster = Cluster::new();
@@ -945,6 +990,26 @@ async fn restorable(node: &Node, acme: &TenantId) -> vellev_storage::Receipt {
         .unwrap();
     opened.write(vec![note(2, "hen", None)]).await.unwrap();
     kept
+}
+
+/// Review of f800a51, L2: the hold a test puts on a flush's build holds no
+/// restore's. A restore to a point with rows in memory builds a segment of
+/// them, which nothing stops: held as a flush's, it would wait out the
+/// hold's bound.
+#[tokio::test]
+async fn a_restore_s_build_is_not_held_as_a_flush_s() {
+    let cluster = Cluster::new();
+    let node = cluster.node();
+    let acme = tenant("acme");
+    let kept = restorable(&node, &acme).await;
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::FlushUntilStopped));
+    let point = Point::Position(kept.position);
+    let restoring = node.restore(&acme, point, RequestId::generate());
+    let restored = tokio::time::timeout(Duration::from_secs(20), restoring).await;
+    builds.hold(None);
+    let restored = restored.expect("the restore's build was held as a flush's");
+    assert!(restored.is_ok(), "{restored:?}");
 }
 
 #[tokio::test]
@@ -1851,6 +1916,791 @@ async fn a_tenant_let_go_flushes_no_more() {
     assert_eq!(opened.read(count), 10, "its rows were lost");
 }
 
+/// A node on `coordinator` and the cluster's store, over its memory budget
+/// from its first row, flushing only when asked, as `set` sets it up.
+fn node_over_budget(
+    cluster: &Cluster,
+    coordinator: &Arc<Unrenewing>,
+    set: impl FnOnce(&mut Settings),
+) -> Node {
+    let mut settings = Settings {
+        memory: Some(1),
+        flush_rows: 1_000_000,
+        tenant_idle: Duration::from_secs(60 * 60),
+        ..cluster.settings()
+    };
+    set(&mut settings);
+    Node::new(
+        coordinator.clone(),
+        cluster.store.clone(),
+        Arc::new(Embedders::new(EmbedSettings::default())),
+        settings,
+    )
+}
+
+/// A sweep is held up by no lease it gives up: sweeps run one at a time, so
+/// one that never heard back would hold every let-go of the node. The
+/// tenants let go by one sweep wait for their releases together, past the
+/// limit on flushes at once, and the node goes on: their leases run out, and
+/// until then each can be taken up again here, as a lease of the holder's own
+/// always can.
+#[tokio::test(start_paused = true)]
+async fn a_release_that_hangs_holds_up_no_sweep() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    let names = ["acme", "globex", "initech"];
+    for name in names {
+        node.create_tenant(&tenant(name)).await.unwrap();
+        let held = node.tenant(&tenant(name)).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let asked = tokio::time::Instant::now();
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep was held by a release that hangs");
+    assert!(asked.elapsed() >= RELEASE_WITHIN, "{:?}", asked.elapsed());
+    assert_eq!(node.let_go().for_budget, 3, "{:?}", node.let_go());
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the next sweep");
+    coordinator
+        .lease_releases_hang
+        .store(false, Ordering::SeqCst);
+    let opened = node.tenant(&tenant("acme")).await.unwrap();
+    assert!(opened.held_until() > tokio::time::Instant::now());
+}
+
+/// Review A of #177, M3, and review B, M1: a sweep's releases share the
+/// coordinator's pool with every live tenant's renewals and commits. Of a
+/// hundred tenants let go with nothing to flush, on a coordinator whose
+/// release hangs, at most [`RELEASES_AT_ONCE`] are released at once, and
+/// all of them within one [`RELEASE_WITHIN`]: a release not begun by then is
+/// not sent, and its lease runs out. Every tenant is let go.
+#[tokio::test(start_paused = true)]
+async fn a_sweep_s_releases_are_bounded_in_number_and_in_time() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    let tenants = 100;
+    for n in 0..tenants {
+        let name = tenant(&format!("idle-{n}"));
+        node.create_tenant(&name).await.unwrap();
+        let held = node.tenant(&name).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+        // Nothing to flush as it is let go: straight to its release.
+        held.flush().await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.sweep_now())
+        .await
+        .expect("the sweep's releases outlasted their one bound");
+    let most = coordinator
+        .most_lease_releases_in_flight
+        .load(Ordering::SeqCst);
+    assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
+    assert_eq!(node.let_go().for_budget, tenants, "{:?}", node.let_go());
+    assert_eq!(node.tenant_figures().len(), 0, "not let go");
+}
+
+/// Review of 79b8103, L3: shutdown gives its tenants' leases up as a sweep
+/// does. Of twenty tenants held as a node shuts down, on a coordinator whose
+/// release hangs, at most [`RELEASES_AT_ONCE`] are released at once, and all
+/// within one [`RELEASE_WITHIN`], not one after another.
+#[tokio::test(start_paused = true)]
+async fn shutdown_s_releases_are_bounded_in_number_and_in_time() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    for n in 0..20 {
+        let name = tenant(&format!("held-{n}"));
+        node.create_tenant(&name).await.unwrap();
+        let held = node.tenant(&name).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+    }
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("shutdown's releases outlasted their one bound");
+    let most = coordinator
+        .most_lease_releases_in_flight
+        .load(Ordering::SeqCst);
+    assert_eq!(most, RELEASES_AT_ONCE, "releases at once");
+}
+
+/// `tenant` opening on `node`, on a task of its own, held at its lease's
+/// acquire by `coordinator`'s gate, which holds every acquire from now on.
+async fn acquire_gated(
+    coordinator: &Unrenewing,
+    node: &Node,
+    tenant: TenantId,
+) -> tokio::task::JoinHandle<Result<(), NodeError>> {
+    coordinator.acquires_wait.store(true, Ordering::SeqCst);
+    let opening = tokio::spawn({
+        let node = node.clone();
+        async move { node.tenant(&tenant).await.map(|_| ()) }
+    });
+    until("the opening at its acquire", || {
+        coordinator.acquires_waiting.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    opening
+}
+
+/// Review of 31452e7, M1: a node that has shut down renews no lease. An
+/// opening held in `Writer::open`, its lease acquired, is not waited for by
+/// shutdown, and once shutdown returns its lease is renewed no more: it runs
+/// out at its TTL.
+#[tokio::test(start_paused = true)]
+async fn a_stuck_opening_s_lease_is_renewed_no_more_once_shutdown_returns() {
+    let cluster = Cluster::new();
+    let stuck = tenant("stuck");
+    let first = cluster.node();
+    first.create_tenant(&stuck).await.unwrap();
+    let held = first.tenant(&stuck).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_notes(0)).await.unwrap();
+    drop(held);
+    first.shutdown().await;
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let opening = acquire_gated(&coordinator, &node, stuck).await;
+    // Its reads take a day: it holds its lease in Writer::open.
+    *cluster.store.slow.lock().unwrap() = Some(Duration::from_secs(24 * 60 * 60));
+    coordinator.acquire_gate.add_permits(1);
+    until("the opening's lease", || {
+        coordinator.acquires_waiting.load(Ordering::SeqCst) == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !given_up(&cluster, "stuck").await,
+        "the opening holds no lease"
+    );
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("shutdown waited for the stuck opening");
+    let renewed = coordinator.lease_renewals.load(Ordering::SeqCst);
+    // The cluster's clock goes on with the node's, a second at a time.
+    for _ in 0..(LEASE * 2).as_secs() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cluster.clock.advance(Duration::from_secs(1));
+    }
+    assert!(!opening.is_finished(), "the opening ended");
+    assert_eq!(
+        coordinator.lease_renewals.load(Ordering::SeqCst),
+        renewed,
+        "renewed after shutdown"
+    );
+    assert!(given_up(&cluster, "stuck").await, "its lease never ran out");
+}
+
+/// Wait until `holds`, at most 5 s, or fail saying `what` never came.
+async fn until(what: &str, holds: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !holds() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} never came"));
+}
+
+/// Review of b4ddefb, L1: a hold shutdown has lost is lost once. A merge
+/// begun on a tenant's writer after shutdown, by a caller still holding the
+/// tenant, its lease not yet given up, is not stopped, nor counted as
+/// stopped by shutdown, when the tenant's renewal next wakes. Real time, on
+/// a short lease, as a merge's build is held off the async threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
+    let lease = Duration::from_secs(3);
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = lease;
+        settings.release_within = Duration::from_millis(100);
+    });
+    let name = tenant("merging");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    let renewal = held.held_until() - lease + lease / 3;
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    // Its release unanswered: the lease is still the tenant's.
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    node.shutdown().await;
+    let stopped = || node.merges().stopped.shutdown;
+    assert_eq!(stopped(), 0, "{:?}", node.merges().stopped);
+    let writer = held.writer().clone();
+    for from in [10, 20, 30, 40] {
+        writer.commit(ten_notes(from)).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+    // Held at the start of its build, where a stop finds it.
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilStopped));
+    let merging = tokio::spawn(async move { writer.merge().await });
+    until("the merge after shutdown at its build", || {
+        builds.held() > 0
+    })
+    .await;
+    assert!(
+        tokio::time::Instant::now() < renewal,
+        "the merge came to build only after the renewal was due"
+    );
+    // Past the renewal, which asks for its lease in no time.
+    tokio::time::sleep_until(renewal + lease / 6).await;
+    let still_held = builds.held();
+    builds.hold(None);
+    assert_eq!(stopped(), 0, "{:?}", node.merges().stopped);
+    assert_eq!(still_held, 1, "the merge after shutdown was stopped");
+    let merged = tokio::time::timeout(Duration::from_secs(30), merging)
+        .await
+        .expect("the merge after shutdown never ended")
+        .unwrap();
+    assert!(matches!(merged, Ok(Some(_))), "{merged:?}");
+}
+
+/// Write `held` forty notes from `from`, ten at a time, and flush each ten.
+async fn flushed_four(held: &Tenant, from: u64) {
+    for at in (from..from + 40).step_by(10) {
+        held.write(ten_notes(at)).await.unwrap();
+        held.flush().await.unwrap();
+    }
+}
+
+/// What [`lost_tenant_flushed_four`] makes.
+struct LostTenant {
+    cluster: Cluster,
+    coordinator: Arc<Unrenewing>,
+    node: Node,
+    held: Arc<Tenant>,
+    name: TenantId,
+}
+
+/// Tenant "lost", held on a node with a three-second lease whose renewals
+/// its coordinator refuses once told to, and flushed four times.
+async fn lost_tenant_flushed_four() -> LostTenant {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+        settings.lease = Duration::from_secs(3);
+    });
+    let name = tenant("lost");
+    node.create_tenant(&name).await.unwrap();
+    let held = node.tenant(&name).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    flushed_four(&held, 10).await;
+    LostTenant {
+        cluster,
+        coordinator,
+        node,
+        held,
+        name,
+    }
+}
+
+/// Wait until a write on `held` is refused: its hold is lost.
+async fn until_lost(held: &Tenant) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while held.write(ten_notes(90)).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the refused renewal never lost the hold");
+}
+
+/// [`lost_tenant_flushed_four`], its hold lost as renewal is refused while
+/// a request's compact is held at its merge's build: the merge is stopped,
+/// and counted once as a lease lost. The stopped compact is refused as a
+/// write is, and cleans nothing up. Merge builds are still held: the
+/// caller lets them go.
+async fn lost_with_its_merge_stopped() -> (Node, Arc<Tenant>, TenantId) {
+    let LostTenant {
+        cluster,
+        coordinator,
+        node,
+        held,
+        name,
+    } = lost_tenant_flushed_four().await;
+    // Held at the start of its build, where a stop finds it.
+    let builds = node.merge_builds().clone();
+    builds.hold(Some(vellev_storage::Holding::UntilStopped));
+    let first = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    until("the first merge at its build", || builds.held() > 0).await;
+    let listed = cluster.store.listings.load(Ordering::SeqCst);
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    until("the merge stopped by the refused renewal", || {
+        node.merges().stopped == LEASE_LOST
+    })
+    .await;
+    let answered = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the stopped merge's request never ended")
+        .unwrap();
+    assert_eq!(
+        cluster.store.listings.load(Ordering::SeqCst),
+        listed,
+        "the compact whose merge was stopped cleaned up"
+    );
+    assert!(
+        matches!(answered, Err(NodeError::Storage(StorageError::Closed))),
+        "the compact whose merge was stopped: {answered:?}"
+    );
+    (node, held, name)
+}
+
+/// Review of 038be00, M1: a hold is lost once, whoever finds it lost. Its
+/// renewal refused, a node loses its hold on a tenant and stops a request's
+/// merge, counted once. A merge begun after on the tenant's writer, by a
+/// caller still holding the tenant, is neither stopped nor counted when the
+/// tenant is next asked for and its hold is found lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() {
+    let (node, held, name) = lost_with_its_merge_stopped().await;
+    let builds = node.merge_builds().clone();
+    let writer = held.writer().clone();
+    let second = tokio::spawn(async move { writer.merge().await });
+    until("the merge after the hold was lost at its build", || {
+        builds.held() > 0
+    })
+    .await;
+    assert_eq!(node.merges().stopped, LEASE_LOST);
+    // The hold found lost as the tenant is asked for again.
+    tokio::time::timeout(Duration::from_secs(5), node.tenant(&name))
+        .await
+        .expect("the tenant asked for again never opened")
+        .expect("the tenant asked for again");
+    let stopped = node.merges().stopped;
+    let still_held = builds.held();
+    builds.hold(None);
+    assert_eq!(stopped, LEASE_LOST);
+    assert_eq!(
+        still_held, 1,
+        "the merge after the hold was lost was stopped"
+    );
+    let merged = tokio::time::timeout(Duration::from_secs(30), second)
+        .await
+        .expect("the merge after the hold was lost never ended")
+        .unwrap();
+    // Not stopped, it went on to its commit, which the lease taken afresh
+    // fenced.
+    assert!(
+        matches!(
+            merged,
+            Err(StorageError::Coordinator(CoordinatorError::Fenced { .. }))
+        ),
+        "{merged:?}"
+    );
+}
+
+/// Review of d8fb3ca, M1: once its hold is lost, a tenant does no more
+/// work for a request that holds it still. A compact or a flush is refused
+/// at once, as a write is, and the compact takes no turn among the node's
+/// merge builds: nothing goes on building the tenant's data in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
+    let (node, held, _) = lost_with_its_merge_stopped().await;
+    let builds = node.merge_builds().clone();
+    builds.hold(None);
+    let turns = builds.turns_taken();
+    let refused = |what: &str, outcome: Result<(), NodeError>| {
+        assert!(
+            matches!(outcome, Err(NodeError::Storage(StorageError::Closed))),
+            "{what} on a lost hold: {outcome:?}"
+        );
+    };
+    refused("a write", held.write(ten_notes(50)).await.map(drop));
+    let compacted = tokio::time::timeout(
+        Duration::from_secs(5),
+        held.compact(Duration::from_secs(60 * 60)),
+    )
+    .await
+    .expect("a compact on a lost hold never ended");
+    assert_eq!(builds.turns_taken(), turns, "the compact took a merge turn");
+    refused("a compact", compacted.map(drop));
+    refused("a flush", held.flush().await.map(drop));
+}
+
+/// Review of 97abfe6, L1: a compact looks at the hold before each merge,
+/// not only its first. The hold lost while its first merge waits to
+/// commit, past where a stop ends it, the merge commits, and the next one,
+/// with segments flushed meanwhile to merge, is refused: it takes no turn
+/// among the node's merge builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
+    let LostTenant {
+        coordinator,
+        node,
+        held,
+        ..
+    } = lost_tenant_flushed_four().await;
+    let gate = held.hold_merges_before_commit();
+    let compacting = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::from_secs(60 * 60)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+        .await
+        .expect("the first merge never came to its commit");
+    flushed_four(&held, 50).await;
+    let builds = node.merge_builds().clone();
+    let turns = builds.turns_taken();
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    until_lost(&held).await;
+    assert_eq!(node.merges().stopped, vellev_node::MergesStopped::default());
+    held.writer().stop_holding_merges();
+    gate.release.notify_one();
+    let compacted = tokio::time::timeout(Duration::from_secs(30), compacting)
+        .await
+        .expect("the compact never ended")
+        .unwrap();
+    assert_eq!(builds.turns_taken(), turns, "the next merge took a turn");
+    assert!(
+        matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
+        "{compacted:?}"
+    );
+}
+
+/// Review of 93df871, L1: a compact's clean looks at the hold before each
+/// `Writer::clean` call, not only before it cleans. With more files to
+/// delete than one call does, the hold lost during the first call, the
+/// clean deletes no more once that call is done, and the compact is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_while_a_compact_cleans_ends_the_clean_after_its_call() {
+    let LostTenant {
+        cluster,
+        coordinator,
+        held,
+        name,
+        ..
+    } = lost_tenant_flushed_four().await;
+    // Files no checkpoint names, older than the grace.
+    let at_once = Writer::CLEANED_AT_ONCE;
+    for n in 0..at_once + at_once / 2 {
+        let key = format!("{name}/0/segment/{:020}-left-{n}.segment", 1);
+        cluster
+            .store
+            .inner
+            .put(&key, Bytes::from_static(b"left over"))
+            .await
+            .unwrap();
+    }
+    cluster.store.holding_a_delete.store(true, Ordering::SeqCst);
+    let deleted = cluster.store.deletes.load(Ordering::SeqCst);
+    let compacting = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::ZERO).await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        cluster.store.delete_reached.notified(),
+    )
+    .await
+    .expect("the compact never came to clean up");
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    until_lost(&held).await;
+    cluster.store.deletes_let_go.notify_one();
+    let compacted = tokio::time::timeout(Duration::from_secs(30), compacting)
+        .await
+        .expect("the compact never ended")
+        .unwrap();
+    assert_eq!(
+        cluster.store.deletes.load(Ordering::SeqCst) - deleted,
+        at_once,
+        "the clean went on past its call"
+    );
+    assert!(
+        matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
+        "{compacted:?}"
+    );
+}
+
+/// Review of ab07a2e, L1: shutdown gives each tenant's lease up as its
+/// opening resolves. One tenant still opening, its lease's acquire
+/// unanswered, holds up no other tenant's release.
+#[tokio::test(start_paused = true)]
+async fn a_slow_opening_holds_up_no_other_release_at_shutdown() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let open = tenant("open");
+    node.create_tenant(&open).await.unwrap();
+    let held = node.tenant(&open).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    drop(held);
+    let slow = tenant("slow");
+    node.create_tenant(&slow).await.unwrap();
+    let opening = acquire_gated(&coordinator, &node, slow).await;
+    let shutting = tokio::spawn({
+        let node = node.clone();
+        async move { node.shutdown().await }
+    });
+    let released = tokio::time::timeout(RELEASE_WITHIN, async {
+        while !given_up(&cluster, "open").await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(!opening.is_finished(), "the slow opening ended");
+    coordinator.acquire_gate.add_permits(1);
+    released.expect("a slow opening held up another tenant's release");
+    tokio::time::timeout(RELEASE_WITHIN, shutting)
+        .await
+        .expect("shutdown outlasted its releases")
+        .unwrap();
+}
+
+/// Review of ab07a2e, L1: shutdown waits for a tenant's opening only as
+/// long as its releases go on. One whose lease's acquire is never answered
+/// holds shutdown up no longer than [`RELEASE_WITHIN`].
+#[tokio::test(start_paused = true)]
+async fn an_opening_that_never_ends_holds_shutdown_up_no_longer_than_its_releases() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |settings| {
+        settings.memory = None;
+    });
+    let stuck = tenant("stuck");
+    node.create_tenant(&stuck).await.unwrap();
+    let _opening = acquire_gated(&coordinator, &node, stuck).await;
+    let bound = RELEASE_WITHIN + Duration::from_secs(1);
+    tokio::time::timeout(bound, node.shutdown())
+        .await
+        .expect("an opening that never ended held shutdown up");
+}
+
+/// `name` made on `node` with ten notes with vectors, flushed if
+/// `flushed`, and no longer used.
+async fn written_to_let_go(node: &Node, name: &str, flushed: bool) {
+    node.create_tenant(&tenant(name)).await.unwrap();
+    let held = node.tenant(&tenant(name)).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_with_vectors(0)).await.unwrap();
+    if flushed {
+        held.flush().await.unwrap();
+    }
+}
+
+/// Whether another node can take `name`'s lease now: whether this one gave
+/// it up, as the cluster's clock does not move for a lease to run out.
+async fn given_up(cluster: &Cluster, name: &str) -> bool {
+    let other = NodeId::generate("other");
+    let acquired = cluster.coordinator.acquire(&key(name), &other, LEASE).await;
+    matches!(acquired, Ok(Acquired::Lease { .. }))
+}
+
+/// Review of f800a51, M2: a tenant a sweep lets go with nothing to flush
+/// gives its lease up at once, not once the slowest flush of its sweep
+/// ends: another node waits on no lease nobody uses.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_with_nothing_to_flush_is_released_while_another_flushes() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    written_to_let_go(&node, "idle", true).await;
+    written_to_let_go(&node, "slow", false).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    let sweeping = node.sweep_now();
+    tokio::pin!(sweeping);
+    let released = async {
+        while !given_up(&cluster, "idle").await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        () = &mut sweeping => panic!("the sweep ended with a flush held"),
+        released = tokio::time::timeout(Duration::from_secs(10), released) => {
+            released.expect("its lease was held while another tenant flushed");
+        }
+    }
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let bound = LET_GO_FLUSH_WITHIN + RELEASE_WITHIN;
+    tokio::time::timeout(bound, sweeping)
+        .await
+        .expect("the sweep outlasted its bound");
+    let let_go = node.let_go();
+    assert_eq!(
+        (let_go.for_budget, let_go.flushes_skipped),
+        (2, 0),
+        "{let_go:?}"
+    );
+    assert!(
+        given_up(&cluster, "slow").await,
+        "the flushed tenant's lease"
+    );
+}
+
+/// Review of f800a51, M2, as Desk asked: a flush that ends just short of
+/// the flush deadline still has its release tried, and the release phase,
+/// a release that hangs included, is over by the flush deadline and
+/// [`RELEASE_WITHIN`] after it: the sweep stays within its 35 s.
+#[tokio::test(start_paused = true)]
+async fn a_release_after_a_flush_near_its_deadline_ends_within_the_sweep_s_bound() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    written_to_let_go(&node, "slow", false).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    cluster.store.fault(Some(("vectors", Fault::Gated)));
+    coordinator
+        .lease_releases_hang
+        .store(true, Ordering::SeqCst);
+    let asked = tokio::time::Instant::now();
+    let sweeping = node.sweep_now();
+    tokio::pin!(sweeping);
+    let near = LET_GO_FLUSH_WITHIN - Duration::from_secs(1);
+    tokio::select! {
+        () = &mut sweeping => panic!("the sweep ended with its flush held"),
+        () = tokio::time::sleep(near) => {}
+    }
+    cluster.store.fault(None);
+    cluster.store.gate.add_permits(1);
+    let bound = LET_GO_FLUSH_WITHIN + RELEASE_WITHIN;
+    tokio::time::timeout_at(asked + bound, sweeping)
+        .await
+        .expect("the sweep outlasted its bound");
+    let took = asked.elapsed();
+    assert!(
+        took >= near + RELEASE_WITHIN,
+        "its release was not tried: {took:?}"
+    );
+    assert_eq!(node.let_go().flushes_skipped, 0, "{:?}", node.let_go());
+}
+
+/// M7-R5b: a let-go's flush cut in its commit closes its writer, which costs
+/// nothing with the hold lost at once. The next opener finds every row,
+/// whether the commit never landed, and it replays them, or landed unheard,
+/// and it reads them from the head.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_s_flush_cut_in_its_commit_costs_no_row() {
+    for landed in [false, true] {
+        let cluster = Cluster::new();
+        let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+        let node = node_over_budget(&cluster, &coordinator, |settings| {
+            // Longer than a commit is bounded to by the lease: only what a
+            // sweep gives its flushes ends this one.
+            settings.lease = Duration::from_secs(10 * 60);
+        });
+        let acme = tenant("acme");
+        node.create_tenant(&acme).await.unwrap();
+        let held = node.tenant(&acme).await.unwrap();
+        held.write(vec![schema(EmbeddingProvider::None)])
+            .await
+            .unwrap();
+        held.write(ten_notes(0)).await.unwrap();
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let unheard = match landed {
+            true => &coordinator.hang_after_commit,
+            false => &coordinator.unanswered_commits,
+        };
+        unheard.store(true, Ordering::SeqCst);
+        let bound = LET_GO_FLUSH_WITHIN + Duration::from_secs(1);
+        tokio::time::timeout(bound, node.sweep_now())
+            .await
+            .expect("the sweep was held past its bound by a commit unanswered");
+        assert_eq!(node.let_go().flushes_skipped, 1, "landed: {landed}");
+        assert_eq!(node.let_go().for_budget, 1, "landed: {landed}");
+        unheard.store(false, Ordering::SeqCst);
+        let opened = node.tenant(&acme).await.unwrap();
+        assert_eq!(opened.read(count), 10, "rows lost, landed: {landed}");
+        let replayed = opened.read(State::unflushed);
+        assert_eq!(replayed, if landed { 0 } else { 10 }, "landed: {landed}");
+    }
+}
+
+/// Review of f800a51, L1: a let-go of a tenant whose writer closed with its
+/// hold intact is no superseded one: its rows replay unless the commit that
+/// closed it landed, and its flush is counted as skipped. A write whose
+/// caller went is committed all the same, and one never answered closes
+/// the writer with no caller to lose the hold: it stays until the lease's
+/// next renewal finds the writer closed.
+#[tokio::test(start_paused = true)]
+async fn a_let_go_of_a_tenant_whose_writer_closed_counts_a_skip() {
+    let cluster = Cluster::new();
+    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
+    let node = node_over_budget(&cluster, &coordinator, |_| {});
+    let acme = tenant("acme");
+    node.create_tenant(&acme).await.unwrap();
+    let held = node.tenant(&acme).await.unwrap();
+    held.write(vec![schema(EmbeddingProvider::None)])
+        .await
+        .unwrap();
+    held.write(ten_notes(0)).await.unwrap();
+    let writer = held.writer().clone();
+    coordinator.unanswered_commits.store(true, Ordering::SeqCst);
+    let gone = tokio::time::timeout(Duration::from_secs(1), held.write(ten_notes(10))).await;
+    assert!(gone.is_err(), "the write was answered: {gone:?}");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !writer.is_closed() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the writer never closed");
+    coordinator
+        .unanswered_commits
+        .store(false, Ordering::SeqCst);
+    drop(writer);
+    node.sweep_now().await;
+    let let_go = node.let_go();
+    assert_eq!(
+        (let_go.for_budget, let_go.flushes_skipped),
+        (1, 1),
+        "{let_go:?}"
+    );
+}
+
 /// A flush under way keeps its tenant, as a round does: a sweep takes out
 /// only a tenant between rounds, and letting go of one mid-flush would wait
 /// for it with no bound (node memory note, M7b).
@@ -2018,6 +2868,8 @@ async fn a_node_notices_that_another_took_its_tenant() {
 struct Unrenewing {
     inner: Arc<MemoryCoordinator>,
     failing: AtomicBool,
+    /// Renewals of leases are refused, as a lease another node took is.
+    refusing: AtomicBool,
     /// How long each renewal takes to be answered.
     slowly: Duration,
     unanswered_commits: AtomicBool,
@@ -2102,12 +2954,43 @@ struct Unrenewing {
     /// How long each renewal of a claim on a backup or a purge that is
     /// answered takes to be.
     claim_renewals_slowly: Duration,
+    /// Whether giving a lease up early goes unanswered.
+    lease_releases_hang: AtomicBool,
+    /// How many lease releases are being answered now, and the most that
+    /// ever were at once.
+    lease_releases_in_flight: AtomicUsize,
+    most_lease_releases_in_flight: AtomicUsize,
     /// Whether commits fail as a backend would, none of them landing.
     commits_failing: AtomicBool,
     /// What happens once, just after a claim on a backup is next taken.
     backup_claimed: Hook,
     /// How many claims on backups were asked for.
     claims: AtomicUsize,
+    /// Whether a lease's acquire waits for a permit from
+    /// [`Self::acquire_gate`].
+    acquires_wait: AtomicBool,
+    /// How many acquires wait for a permit now.
+    acquires_waiting: AtomicUsize,
+    /// Permits for acquires to go on, none to begin with.
+    acquire_gate: tokio::sync::Semaphore,
+}
+
+/// A call counted in flight until it ends, however it ends.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    /// Counted in `now`, with the most at once kept in `most`.
+    fn counted(now: &'a AtomicUsize, most: &AtomicUsize) -> Self {
+        let at_once = now.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(at_once, Ordering::SeqCst);
+        Self(now)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Unrenewing {
@@ -2123,6 +3006,7 @@ impl Unrenewing {
         Self {
             inner,
             failing: AtomicBool::new(false),
+            refusing: AtomicBool::new(false),
             history_forgotten: AtomicUsize::new(0),
             slowly: Duration::ZERO,
             losing_claim: AtomicBool::new(false),
@@ -2153,9 +3037,15 @@ impl Unrenewing {
             release_asked: tokio::sync::Notify::new(),
             release_let_through: tokio::sync::Notify::new(),
             claim_renewals_slowly: Duration::ZERO,
+            lease_releases_hang: AtomicBool::new(false),
+            lease_releases_in_flight: AtomicUsize::new(0),
+            most_lease_releases_in_flight: AtomicUsize::new(0),
             commits_failing: AtomicBool::new(false),
             backup_claimed: Hook::default(),
             claims: AtomicUsize::new(0),
+            acquires_wait: AtomicBool::new(false),
+            acquires_waiting: AtomicUsize::new(0),
+            acquire_gate: tokio::sync::Semaphore::new(0),
             unanswered_commits: AtomicBool::new(false),
             hang_after_commit: AtomicBool::new(false),
             landed: tokio::sync::Notify::new(),
@@ -2222,6 +3112,12 @@ impl Coordinator for Unrenewing {
         holder: &NodeId,
         ttl: Duration,
     ) -> Result<Acquired, CoordinatorError> {
+        if self.acquires_wait.load(Ordering::SeqCst) {
+            self.acquires_waiting.fetch_add(1, Ordering::SeqCst);
+            let permit = self.acquire_gate.acquire().await.expect("acquire gate");
+            permit.forget();
+            self.acquires_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
         self.inner.acquire(key, holder, ttl).await
     }
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease, CoordinatorError> {
@@ -2229,10 +3125,21 @@ impl Coordinator for Unrenewing {
         if self.failing.load(Ordering::SeqCst) {
             return Err(CoordinatorError::Backend("connection reset".into()));
         }
+        if self.refusing.load(Ordering::SeqCst) {
+            let taken = vellev_storage::coordinator::Generation(lease.generation.0 + 1);
+            return Err(lease.fenced_by(taken));
+        }
         tokio::time::sleep(self.slowly).await;
         self.inner.renew(lease, ttl).await
     }
     async fn release(&self, lease: &Lease) -> Result<(), CoordinatorError> {
+        let _in_flight = InFlight::counted(
+            &self.lease_releases_in_flight,
+            &self.most_lease_releases_in_flight,
+        );
+        if self.lease_releases_hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.inner.release(lease).await
     }
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<Committed, CoordinatorError> {
@@ -9661,6 +10568,121 @@ fn settings_with_a_backlog_below_a_flush_are_refused() {
             "{:?} {:?}",
             refused.backlog_rows,
             refused.flush_backoff
+        );
+    }
+}
+
+/// Review B of #177, L7: a sweep that may flush no tenant at once as it
+/// lets them go would skip every flush. Such settings are refused.
+#[test]
+fn settings_that_flush_no_tenant_let_go_are_refused() {
+    let at_once = |let_go_flushes_at_once| Settings {
+        let_go_flushes_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(at_once(1).check().is_ok());
+    let refused = at_once(0).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// A sweep that may give up no lease at once would give up none: every
+/// tenant let go would keep its lease until it ran out. Such settings are
+/// refused.
+#[test]
+fn settings_that_release_no_lease_at_once_are_refused() {
+    let at_once = |releases_at_once| Settings {
+        releases_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(at_once(1).check().is_ok());
+    let refused = at_once(0).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// A sweep given no time for its let-go flushes would skip every one, as
+/// its deadline has passed before the first begins. Such settings are
+/// refused.
+#[test]
+fn settings_that_give_let_go_flushes_no_time_are_refused() {
+    let within = |let_go_flush_within| Settings {
+        let_go_flush_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(within(Duration::from_millis(1)).check().is_ok());
+    let refused = within(Duration::ZERO).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// A sweep given no time for its releases would send none. Such settings
+/// are refused.
+#[test]
+fn settings_that_give_releases_no_time_are_refused() {
+    let within = |release_within| Settings {
+        release_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(within(Duration::from_millis(1)).check().is_ok());
+    let refused = within(Duration::ZERO).check();
+    assert!(
+        matches!(refused, Err(NodeError::Settings(_))),
+        "{refused:?}"
+    );
+}
+
+/// Review of 79b8103, L4: a time for let-go flushes or releases so long that
+/// a sweep's deadline overflows the clock would panic in the sweep. Such
+/// settings are refused, a day allowed.
+#[test]
+fn settings_that_give_let_go_flushes_or_releases_endless_time_are_refused() {
+    let day = Duration::from_secs(24 * 60 * 60);
+    let given = |let_go_flush_within, release_within| Settings {
+        let_go_flush_within,
+        release_within,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(given(day, day).check().is_ok());
+    for (flushes, releases) in [
+        (Duration::MAX, RELEASE_WITHIN),
+        (LET_GO_FLUSH_WITHIN, Duration::MAX),
+    ] {
+        let refused = given(flushes, releases).check();
+        assert!(
+            matches!(refused, Err(NodeError::Settings(_))),
+            "{flushes:?}, {releases:?}: {refused:?}"
+        );
+    }
+}
+
+/// More flushes or releases at once than a semaphore can hold would panic
+/// in the sweep that makes one. Such settings are refused, the most it can
+/// hold allowed.
+#[test]
+fn settings_that_do_more_at_once_than_a_sweep_can_count_are_refused() {
+    let most = tokio::sync::Semaphore::MAX_PERMITS;
+    let flushes = |let_go_flushes_at_once| Settings {
+        let_go_flushes_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let releases = |releases_at_once| Settings {
+        releases_at_once,
+        ..Settings::new(NodeId::generate("node"))
+    };
+    assert!(flushes(most).check().is_ok());
+    assert!(releases(most).check().is_ok());
+    for refused in [flushes(most + 1), releases(most + 1)] {
+        let refused = refused.check();
+        assert!(
+            matches!(refused, Err(NodeError::Settings(_))),
+            "{refused:?}"
         );
     }
 }

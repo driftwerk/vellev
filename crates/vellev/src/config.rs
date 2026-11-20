@@ -708,9 +708,13 @@ impl Config {
         if let Some(problem) = settings.backlog_problem() {
             bail!("VELLEV_BACKLOG_ROWS cannot be as it is set: {problem}");
         }
+        let claim = settings.backup_claim;
+        if let Some(problem) = settings.request_bounds.claim_problem(claim) {
+            bail!("VELLEV_BACKUP_CLAIM_SECS cannot be as it is set: {problem}");
+        }
         settings
             .check()
-            .wrap_err("VELLEV_BACKUP_CLAIM_SECS cannot be as it is set")?;
+            .wrap_err("the node's settings cannot be as they are set")?;
         Ok(settings)
     }
 }

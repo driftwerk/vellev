@@ -165,6 +165,27 @@ impl MergeEnd {
     }
 }
 
+/// Why a sweep over the memory budget kept a tenant it chose to let go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeptFor {
+    /// Something else held it: a request, a round of its maintenance, as
+    /// a merge's, or a restore.
+    Held,
+    /// Nothing else held it, but its building lock was busy.
+    Building,
+}
+
+impl KeptFor {
+    pub const ALL: [KeptFor; 2] = [KeptFor::Held, KeptFor::Building];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KeptFor::Held => "held",
+            KeptFor::Building => "building",
+        }
+    }
+}
+
 /// What is timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Timed {
@@ -183,11 +204,27 @@ pub enum Timed {
     /// A spell at the backlog: from a tenant's rows unflushed reaching the
     /// most it may hold to the commit that took it below.
     Backlog,
-    /// The flush a node makes before it lets a tenant go: its wait for
-    /// the building lock.
+    /// A let-go's flush: its wait for one of its sweep's flush slots,
+    /// whether it had one or not. Not recorded if there was nothing to flush.
     LetGoFlushWait,
     /// The same flush's hold of the lock: its whole build and commit.
     LetGoFlushHeld,
+    /// [`Timed::LetGoFlushWait`] of a let-go that had one of its sweep's
+    /// flushes: its wait in the queue for it.
+    LetGoFlushQueued,
+    /// [`Timed::LetGoFlushWait`] of a let-go that its sweep's deadline
+    /// reached before it had one of its flushes, so that it never began.
+    LetGoFlushNotReached,
+    /// A spell a tenant was kept by sweeps over the memory budget for one
+    /// reason: from the first sweep that kept it so to the last. It ends at
+    /// the first sweep that does not keep it so, as by taking it out,
+    /// keeping it for the other reason, or finding the node no longer over
+    /// its budget.
+    Kept(KeptFor),
+    /// The same spell's upper end: from the first sweep that kept the
+    /// tenant so to the first that did not, or, for a spell still open, to
+    /// when it is read. For a bench: no metric serves it.
+    KeptUpTo(KeptFor),
 }
 
 impl Timed {
@@ -203,7 +240,11 @@ impl Timed {
             Timed::Backlog,
             Timed::LetGoFlushWait,
             Timed::LetGoFlushHeld,
+            Timed::LetGoFlushQueued,
+            Timed::LetGoFlushNotReached,
         ]);
+        all.extend(KeptFor::ALL.map(Timed::Kept));
+        all.extend(KeptFor::ALL.map(Timed::KeptUpTo));
         all
     }
 
@@ -212,6 +253,8 @@ impl Timed {
         let phases = MergePhase::ALL.len();
         let index = |holder: Holder| Holder::ALL.iter().position(|h| *h == holder).unwrap();
         let of = |phase: MergePhase| MergePhase::ALL.iter().position(|p| *p == phase).unwrap();
+        let kept = |why: KeptFor| KeptFor::ALL.iter().position(|k| *k == why).unwrap();
+        let kept_base = 2 * holders + 2 * phases + 6;
         match self {
             Timed::BuildingWait(holder) => index(holder),
             Timed::BuildingHeld(holder) => holders + index(holder),
@@ -221,11 +264,15 @@ impl Timed {
             Timed::Backlog => 2 * holders + 2 * phases + 1,
             Timed::LetGoFlushWait => 2 * holders + 2 * phases + 2,
             Timed::LetGoFlushHeld => 2 * holders + 2 * phases + 3,
+            Timed::LetGoFlushQueued => 2 * holders + 2 * phases + 4,
+            Timed::LetGoFlushNotReached => 2 * holders + 2 * phases + 5,
+            Timed::Kept(why) => kept_base + kept(why),
+            Timed::KeptUpTo(why) => kept_base + KeptFor::ALL.len() + kept(why),
         }
     }
 }
 
-const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 4;
+const SLOTS: usize = 2 * Holder::ALL.len() + 2 * MergePhase::ALL.len() + 6 + 2 * KeptFor::ALL.len();
 
 /// The bucket bounds, in seconds: a millisecond, and twice as long each
 /// time, to 2,097 seconds, about 35 minutes. Past the last is counted only

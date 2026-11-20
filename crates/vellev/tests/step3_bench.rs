@@ -41,8 +41,8 @@ use vellev_embed::Embedders;
 use vellev_node::{MergePool, Node, Settings};
 use vellev_storage::blobs::{Blobs, CachedBlobs, ObjectBlobs};
 use vellev_storage::coordinator::{Coordinator, MemoryCoordinator};
-use vellev_storage::timings::{Event, Holder, MergePhase, OpenWaits, Timed};
-use vellev_storage::{Disk, Mutation, Transfers, MERGE_BUILDS};
+use vellev_storage::timings::{Event, Holder, KeptFor, MergePhase, OpenWaits, Timed};
+use vellev_storage::{Disk, MergeGate, Mutation, State, Transfers, MERGE_BUILDS};
 
 /// The node's allocator, as the binary runs on it.
 #[global_allocator]
@@ -2051,6 +2051,311 @@ fn flush_due_mark(due: &[f64], held: &[f64], builds: &[f64]) -> Value {
     })
 }
 
+/// The keep mark (§9.6): for each reason a sweep over the budget kept a
+/// tenant, held or its building lock busy, the longest spell against
+/// twice a flush's hold p99, with the longest upper end reported beside it
+/// and held to nothing. The bound is read from flush holds only. A reason
+/// with no spell passes; spells with no flush hold to set them against do
+/// not, as the other marks take a missing series.
+fn kept_over_budget_mark(events: &[Event]) -> Value {
+    let secs = |want: Timed| {
+        sorted(
+            events
+                .iter()
+                .filter(|event| event.timed == want)
+                .map(|event| event.took.as_secs_f64())
+                .collect(),
+        )
+    };
+    let flush_held = secs(Timed::BuildingHeld(Holder::Flush));
+    let held_p99 = percentile(&flush_held, 99.0);
+    let mut mark = json!({
+        "passed": true,
+        "flush_held_p99_s": held_p99,
+        "mark": "longest keep over budget, held or for a busy building lock, first keeping sweep to last, so to one sweep's resolution, each < 2 x flush hold p99",
+    });
+    for why in KeptFor::ALL {
+        let spells = secs(Timed::Kept(why));
+        let longest = spells.last().copied();
+        let longest_upper = secs(Timed::KeptUpTo(why)).last().copied();
+        let passed = match (longest, held_p99) {
+            (None, _) => true,
+            (Some(longest), Some(held)) => longest < 2.0 * held,
+            (Some(_), None) => false,
+        };
+        mark[why.name()] = json!({
+            "passed": passed,
+            "spells": spells.len(),
+            "longest_s": longest,
+            "longest_upper_s": longest_upper,
+        });
+        if !passed {
+            mark["passed"] = json!(false);
+        }
+    }
+    mark
+}
+
+/// One case of the keep mark's table: its name, the spells timed, and
+/// whether the mark passes them.
+type KeepCase<'a> = (&'a str, &'a [(Timed, f64)], bool);
+
+/// A keep, of either reason, longer than twice a flush's hold fails the
+/// keep mark, and a shorter one passes; a short keep of one reason passes
+/// no long one of the other; the bound is a flush's hold, however long
+/// anything else holds the lock; no keep passes; and keeps with no flush
+/// hold to set them against do not, as the other marks take a missing
+/// series.
+#[test]
+fn the_keep_mark_holds_each_reason_to_twice_a_flush_s_hold() {
+    let flush = Timed::BuildingHeld(Holder::Flush);
+    let commit = Timed::BuildingHeld(Holder::MergeCommit);
+    let (held, building) = (Timed::Kept(KeptFor::Held), Timed::Kept(KeptFor::Building));
+    let cases: [KeepCase; 11] = [
+        ("building 300 s", &[(flush, 40.0), (building, 300.0)], false),
+        ("building 50 s", &[(flush, 40.0), (building, 50.0)], true),
+        ("held 300 s", &[(flush, 40.0), (held, 300.0)], false),
+        ("held 50 s", &[(flush, 40.0), (held, 50.0)], true),
+        ("none kept", &[(flush, 40.0)], true),
+        ("none kept, nothing flushed", &[], true),
+        (
+            "bound read from other holds than a flush's",
+            &[(flush, 40.0), (commit, 400.0), (building, 300.0)],
+            false,
+        ),
+        (
+            "a short building keep does not pass a long held one",
+            &[(flush, 40.0), (building, 50.0), (held, 300.0)],
+            false,
+        ),
+        (
+            "a short held keep does not pass a long building one",
+            &[(flush, 40.0), (held, 50.0), (building, 300.0)],
+            false,
+        ),
+        ("building, no flush hold", &[(building, 50.0)], false),
+        ("held, no flush hold", &[(held, 50.0)], false),
+    ];
+    let at = Instant::now();
+    for (case, events, passes) in cases {
+        let events: Vec<Event> = events
+            .iter()
+            .map(|&(timed, took)| Event {
+                timed,
+                took: Duration::from_secs_f64(took),
+                partition: "t0/0".into(),
+                at,
+            })
+            .collect();
+        let mark = kept_over_budget_mark(&events);
+        assert_eq!(mark["passed"], json!(passes), "{case}: {mark}");
+    }
+}
+
+/// A node over the budget, flushing every ten rows, keeping its events,
+/// with tenant `name` made on it, held by the caller, as `before` has set
+/// it up, and written `flushes` times: the last flush held at its adopted
+/// gate for `flush_held`, its one flush hold of note.
+async fn written_with_a_held_flush<T>(
+    name: &str,
+    flushes: u128,
+    flush_held: Duration,
+    before: impl FnOnce(&vellev_node::Tenant) -> T,
+) -> (Node, Arc<vellev_node::Tenant>, T) {
+    const ROWS: u128 = 10;
+    let notes = CollectionName::new("notes").unwrap();
+    let note = |n: u128| Mutation::Upsert {
+        collection: notes.clone(),
+        id: ObjectId(uuid::Uuid::from_u128(n)),
+        properties: json!({ "title": format!("note {n}") })
+            .as_object()
+            .unwrap()
+            .clone(),
+        vector: Some(vec![1.0, n as f32]),
+        only_if_version: None,
+    };
+    let blobs: Arc<dyn Blobs> = Arc::new(ObjectBlobs::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let settings = Settings {
+        warm: None,
+        memory: Some(1),
+        flush_rows: ROWS as usize,
+        tenant_idle: Duration::from_secs(60 * 60),
+        ..Settings::new(NodeId::generate("node"))
+    };
+    let node = node(&Arc::default(), &blobs, settings);
+    node.timings().keep_events(true);
+    let tenant = TenantId::new(name).unwrap();
+    node.create_tenant(&tenant).await.unwrap();
+    let held = node.tenant(&tenant).await.unwrap();
+    let writer = held.writer().clone();
+    let set_up = before(&held);
+    let schema = Collection {
+        name: notes.clone(),
+        properties: vec![Property::new("title", DataType::Text).searchable()],
+        embedding: Embedding {
+            provider: EmbeddingProvider::None,
+            model: "stand-in".into(),
+            dimensions: 2,
+            query_prefix: None,
+            document_prefix: None,
+            properties: vec![],
+        },
+        distance: Distance::Cosine,
+        bm25: Bm25::default(),
+        access_rule: None,
+    };
+    held.write(vec![Mutation::CreateCollection(Box::new(schema))])
+        .await
+        .unwrap();
+    for flush in 0..flushes {
+        let flushing = writer.hold_checkpoints_once_adopted();
+        let last = flush + 1 == flushes;
+        if !last {
+            writer.stop_holding_checkpoints();
+        }
+        let rows: Vec<Mutation> = (0..ROWS).map(|n| note(flush * ROWS + n)).collect();
+        held.write(rows).await.unwrap();
+        if last {
+            reached(&flushing, "the flush never came to adopt").await;
+            tokio::time::sleep(flush_held).await;
+            writer.stop_holding_checkpoints();
+            flushing.release.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while held.read(State::unflushed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the node never flushed the tenant");
+    }
+    (node, held, set_up)
+}
+
+/// Waits for `gate` to be reached, or panics with `what`.
+async fn reached(gate: &MergeGate, what: &str) {
+    let reached = gate.reached.notified();
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect(what);
+}
+
+/// The keep mark as a node's own events read it (review of f800a51, M4):
+/// a tenant whose fourth flush holds the building lock for `flush_held`,
+/// its one real flush hold of note, and whose merge then holds the lock in
+/// its commit for `commit_held`, swept over the budget every 30 s and as
+/// it ends, read while that commit is held: so its spell is still open
+/// (M1).
+async fn kept_in_a_merge_commit(flush_held: Duration, commit_held: Duration) -> Value {
+    let (node, held, before_commit) = written_with_a_held_flush("merging", 4, flush_held, |held| {
+        held.hold_merges_before_commit()
+    })
+    .await;
+    let writer = held.writer().clone();
+    reached(&before_commit, "the merge never came to its commit").await;
+    let committing = writer.hold_checkpoints_once_adopted();
+    writer.stop_holding_merges();
+    before_commit.release.notify_one();
+    reached(&committing, "the merge never came into its commit").await;
+    drop(held);
+    let every = Duration::from_secs(30);
+    for _ in 0..commit_held.as_secs() / every.as_secs() {
+        node.sweep_now().await;
+        tokio::time::sleep(every).await;
+    }
+    node.sweep_now().await;
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    writer.stop_holding_checkpoints();
+    committing.release.notify_one();
+    kept_over_budget_mark(&events)
+}
+
+/// A merge's commit holding the building lock for 150 s, against a flush
+/// that held it 40 s, fails the keep mark on its held spell, still open as
+/// it is read; one held 60 s, against a flush that held it 100 s, passes.
+#[tokio::test(start_paused = true)]
+async fn a_node_s_own_long_merge_commit_fails_the_keep_mark() {
+    let mark = kept_in_a_merge_commit(Duration::from_secs(40), Duration::from_secs(150)).await;
+    assert_eq!(mark["held"]["passed"], json!(false), "{mark}");
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or_default();
+    assert!(longest >= 150.0, "{mark}");
+    let flush_p99 = mark["flush_held_p99_s"].as_f64().unwrap_or_default();
+    assert!((40.0..41.0).contains(&flush_p99), "{mark}");
+    assert_eq!(mark["passed"], json!(false), "{mark}");
+    let mark = kept_in_a_merge_commit(Duration::from_secs(100), Duration::from_secs(60)).await;
+    assert_eq!(mark["passed"], json!(true), "{mark}");
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+}
+
+/// Review of 79b8103, M3: a keep spell runs from the first sweep that kept
+/// the tenant to the last that did. A tenant a request holds through one
+/// sweep over the budget, on a quiet node, and taken out by a sweep 10 s
+/// later, was kept by one sweep: its spell reads near nothing, not the 10 s
+/// to the next sweep, and passes the keep mark against a flush that held the
+/// lock 2 s.
+#[tokio::test(start_paused = true)]
+async fn a_keep_by_one_sweep_on_a_quiet_node_passes_the_keep_mark() {
+    let (node, held, ()) =
+        written_with_a_held_flush("quiet", 1, Duration::from_secs(2), |_| ()).await;
+    // Unused for long enough to be chosen, but held by the caller.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.kept_by_sweeps().held, 1, "{:?}", node.kept_by_sweeps());
+    drop(held);
+    let quiet = Duration::from_secs(10);
+    tokio::time::sleep(quiet).await;
+    assert_eq!(node.let_go().for_budget, 0, "let go before the quiet ended");
+    node.sweep_now().await;
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    let mark = kept_over_budget_mark(&events);
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or(f64::MAX);
+    assert!(
+        longest < 0.5,
+        "a spell of one sweep read {longest} s: {mark}"
+    );
+    let flush_p99 = mark["flush_held_p99_s"].as_f64().unwrap_or_default();
+    assert!((2.0..2.5).contains(&flush_p99), "{mark}");
+    assert_eq!(mark["passed"], json!(true), "{mark}");
+}
+
+/// Review of ab07a2e, M1: the mark passes on a spell's first-to-last
+/// figure, and reports its upper end beside it, to the first sweep that did
+/// not keep the tenant, with no rule of its own. On a quiet node, a request
+/// holds a tenant 9.9 s, seen by one sweep, and the next sweep, at 10 s,
+/// takes it out: the spell reads near nothing, and its upper end 10 s, and
+/// the mark passes against a flush that held the lock 2 s.
+#[tokio::test(start_paused = true)]
+async fn a_keep_between_two_sweeps_reports_its_upper_end_beside_the_mark() {
+    let (node, held, ()) =
+        written_with_a_held_flush("between", 1, Duration::from_secs(2), |_| ()).await;
+    // Unused for long enough to be chosen, but held by the caller.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.sweep_now().await;
+    assert_eq!(node.kept_by_sweeps().held, 1, "{:?}", node.kept_by_sweeps());
+    tokio::time::sleep(Duration::from_millis(9_900)).await;
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(node.let_go().for_budget, 0, "let go before the next sweep");
+    node.sweep_now().await;
+    assert_eq!(node.let_go().for_budget, 1, "{:?}", node.let_go());
+    let mut events = node.timings().drain_events();
+    events.extend(node.kept_spells_open());
+    let mark = kept_over_budget_mark(&events);
+    assert_eq!(mark["held"]["spells"], json!(1), "{mark}");
+    let longest = mark["held"]["longest_s"].as_f64().unwrap_or(f64::MAX);
+    assert!(longest < 0.5, "{mark}");
+    let upper = mark["held"]["longest_upper_s"].as_f64().unwrap_or_default();
+    assert!((10.0..10.5).contains(&upper), "upper end {upper} s: {mark}");
+    assert_eq!(mark["passed"], json!(true), "{mark}");
+}
+
 /// Waits behind a merge build, as the 110-156 s of §9.9, fail though the
 /// lock was never waited for; one a flush's own time does not (review of
 /// #169).
@@ -2371,10 +2676,24 @@ fn reported(
         "let_go_flush.wait".into(),
         summary(of(Timed::LetGoFlushWait)),
     );
+    // The wait in its two halves, reported and held to no mark.
+    timings.insert(
+        "let_go_flush.queued".into(),
+        summary(of(Timed::LetGoFlushQueued)),
+    );
+    timings.insert(
+        "let_go_flush.not_reached".into(),
+        summary(of(Timed::LetGoFlushNotReached)),
+    );
     timings.insert(
         "let_go_flush.held".into(),
         summary(of(Timed::LetGoFlushHeld)),
     );
+    for why in KeptFor::ALL {
+        let (spells, upper) = (of(Timed::Kept(why)), of(Timed::KeptUpTo(why)));
+        timings.insert(format!("kept.{}", why.name()), summary(spells));
+        timings.insert(format!("kept_up_to.{}", why.name()), summary(upper));
+    }
 
     // Merge debt: each tenant carried forward while let go, from its
     // preload until it is first seen held.
@@ -2490,6 +2809,7 @@ fn reported(
             "wait_p99_s": percentile(&let_go_wait, 99.0), "flushes": let_go_wait.len(),
             "mark": "p99 wait < 2 s",
         },
+        "kept_over_budget": kept_over_budget_mark(&events),
         "backlog_refusals": { "refused": at_end.backlogged - before.backlogged, "mark": "no more than arm (a)'s" },
     });
     let invalid = NodeValidity {
@@ -2979,6 +3299,8 @@ async fn arm(bench: Bench, running: Running) {
     let at_end = Reading::of(&node, &app);
     let _ = tokio::time::timeout(Duration::from_secs(30), sampler).await;
     events.lock().unwrap().extend(node.timings().drain_events());
+    // A tenant kept to the end is held to the keep mark as it stands.
+    events.lock().unwrap().extend(node.kept_spells_open());
     // Served until the load generator has its last answers and has
     // reported, or for ten minutes at most.
     let load_reported = appeared(&load_path(&bench), Duration::from_secs(10 * 60))

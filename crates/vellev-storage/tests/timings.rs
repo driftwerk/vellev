@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use common::*;
 use vellev_storage::timings::{Event, Holder, MergeEnd, MergePhase, Timed, Timings};
-use vellev_storage::{Holding, MergeBuilds, Merging};
+use vellev_storage::{Holding, MergeBuilds, Merging, Stop};
 
 /// Rows a flush is due at here.
 const DUE: usize = 50;
@@ -173,8 +173,7 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     writer.flush().await.unwrap();
     timings.drain_events();
     // Nothing written since: nothing to flush.
-    let (_, times) = writer.flush_timed().await.unwrap();
-    assert_eq!(times.held, None, "{times:?}");
+    writer.flush().await.unwrap();
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
     assert_eq!(
@@ -184,11 +183,76 @@ async fn a_flush_with_nothing_to_flush_is_no_hold_of_a_flush() {
     );
     // One that flushes is held, and timed so.
     writer.commit(notes(10, 3)).await.unwrap();
-    let (_, times) = writer.flush_timed().await.unwrap();
-    assert!(times.held.is_some(), "{times:?}");
+    writer.flush().await.unwrap();
     let events = timings.drain_events();
     assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 1);
     assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
+}
+
+/// What a node lets a tenant go under: the building lock tried, never
+/// waited for, and a flush made with it held, which holds it no longer than
+/// whoever took it does. The flush is timed as a flush's hold, and has no wait
+/// for the lock to time: the flush wait mark sets those against a flush's own
+/// build, and a run of zeros would make it read better than it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flush_can_be_made_under_a_building_lock_held_already() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    writer.commit(notes(0, 3)).await.unwrap();
+    writer.flush().await.unwrap();
+    writer.commit(notes(10, 3)).await.unwrap();
+    timings.drain_events();
+    let mut held = writer.building_if_free().expect("nothing holds the lock");
+    assert!(writer.building_if_free().is_none(), "held, and free");
+    let stop = Stop::new();
+    let flushing = held.flush(&stop);
+    let built = tokio::time::timeout(Duration::from_secs(10), flushing)
+        .await
+        .expect("a flush under a lock held waited for that lock")
+        .unwrap();
+    assert!(built.is_some(), "nothing flushed");
+    assert_eq!(writer.partition().read(State::unflushed), 0);
+    assert!(writer.building_if_free().is_none(), "let go by the flush");
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingWait(Holder::Flush)).len(), 0);
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 1);
+    // Nothing written since: nothing to flush, and no flush's hold.
+    let built = held.flush(&stop).await.unwrap();
+    assert_eq!(built, None);
+    let events = timings.drain_events();
+    assert_eq!(kept(&events, Timed::BuildingHeld(Holder::Flush)).len(), 0);
+    drop(held);
+    assert!(writer.building_if_free().is_some(), "held for good");
+}
+
+/// A queue for the lock is holding it: what tries the lock finds it busy, and
+/// so never goes ahead of a merge or a flush that waits for it.
+#[tokio::test]
+async fn a_lock_queued_for_is_not_free() {
+    let cluster = Cluster::new().await;
+    let timings = Arc::new(Timings::default());
+    let writer = timed_writer(&cluster, &timings, 0, MergeBuilds::new(1)).await;
+    let held = writer.building_if_free().expect("nothing holds the lock");
+    let queued = tokio::spawn({
+        let writer = writer.clone();
+        async move { writer.flush().await }
+    });
+    until("the flush never asked for the lock", || {
+        writer.flushes_asked_for_building() == 1
+    })
+    .await;
+    assert!(!queued.is_finished(), "a flush went ahead of the lock held");
+    drop(held);
+    assert!(
+        writer.building_if_free().is_none(),
+        "the lock let go to whoever queued is free to try"
+    );
+    tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .expect("the flush queued ended")
+        .unwrap()
+        .unwrap();
 }
 
 /// Merge work given up is timed apart from what finished, phase by phase:
