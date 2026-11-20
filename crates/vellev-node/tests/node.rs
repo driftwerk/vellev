@@ -76,6 +76,13 @@ struct Store {
     segments_written: AtomicUsize,
     /// How many listings were asked for: cleaning up lists the tenant.
     listings: AtomicUsize,
+    /// How many deletes were asked for.
+    deletes: AtomicUsize,
+    /// Whether the next delete waits, once it has said so in
+    /// `delete_reached`, until `deletes_let_go` lets it through.
+    holding_a_delete: AtomicBool,
+    delete_reached: tokio::sync::Notify,
+    deletes_let_go: tokio::sync::Notify,
 }
 
 impl Store {
@@ -171,6 +178,11 @@ impl Blobs for Store {
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> vellev_storage::Result<()> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        if self.holding_a_delete.swap(false, Ordering::SeqCst) {
+            self.delete_reached.notify_one();
+            self.deletes_let_go.notified().await;
+        }
         self.inner.delete(key).await
     }
     async fn forget_local(&self, prefix: &str) -> vellev_storage::Result<()> {
@@ -207,6 +219,10 @@ impl Cluster {
                 merged_panics: AtomicBool::new(false),
                 segments_written: AtomicUsize::new(0),
                 listings: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                holding_a_delete: AtomicBool::new(false),
+                delete_reached: tokio::sync::Notify::new(),
+                deletes_let_go: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -2351,6 +2367,55 @@ async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
         .expect("the compact never ended")
         .unwrap();
     assert_eq!(builds.turns_taken(), turns, "the next merge took a turn");
+    assert!(
+        matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
+        "{compacted:?}"
+    );
+}
+
+/// Review of 93df871, L1: a compact looks at the hold before each lot its
+/// clean deletes, not only before it cleans. The hold lost while the first
+/// lot is deleted, of more files left over than a lot holds, the clean
+/// deletes no more once that lot is done, and the compact is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_lost_while_a_compact_cleans_ends_the_clean_at_its_lot() {
+    let (cluster, coordinator, _node, held, name) = lost_tenant_flushed_four().await;
+    // Left over from writes long past, as a flush that never committed
+    // leaves its files: nothing lists them.
+    let lots = Writer::CLEANED_AT_ONCE;
+    for n in 0..lots + lots / 2 {
+        let key = format!("{name}/0/segment/{:020}-left-{n}.segment", 1);
+        cluster
+            .store
+            .inner
+            .put(&key, Bytes::from_static(b"left over"))
+            .await
+            .unwrap();
+    }
+    cluster.store.holding_a_delete.store(true, Ordering::SeqCst);
+    let deleted = cluster.store.deletes.load(Ordering::SeqCst);
+    let compacting = tokio::spawn({
+        let held = held.clone();
+        async move { held.compact(Duration::ZERO).await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        cluster.store.delete_reached.notified(),
+    )
+    .await
+    .expect("the compact never came to clean up");
+    coordinator.refusing.store(true, Ordering::SeqCst);
+    until_lost(&held).await;
+    cluster.store.deletes_let_go.notify_one();
+    let compacted = tokio::time::timeout(Duration::from_secs(30), compacting)
+        .await
+        .expect("the compact never ended")
+        .unwrap();
+    assert_eq!(
+        cluster.store.deletes.load(Ordering::SeqCst) - deleted,
+        lots,
+        "the clean went on past its lot"
+    );
     assert!(
         matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
         "{compacted:?}"
