@@ -2193,17 +2193,15 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
     assert!(matches!(merged, Ok(Some(_))), "{merged:?}");
 }
 
-/// Write `held` ten notes from `from` and flush them, four times over.
+/// Write `held` forty notes from `from`, ten at a time, and flush each ten.
 async fn flushed_four(held: &Tenant, from: u64) {
-    for from in (from..from + 40).step_by(10) {
-        held.write(ten_notes(from)).await.unwrap();
+    for at in (from..from + 40).step_by(10) {
+        held.write(ten_notes(at)).await.unwrap();
         held.flush().await.unwrap();
     }
 }
 
-/// Tenant `name`, "lost", `held` on a `node` with a three-second lease
-/// whose renewals `coordinator` refuses once told to, and flushed four
-/// times.
+/// What [`lost_tenant_flushed_four`] makes.
 struct LostTenant {
     cluster: Cluster,
     coordinator: Arc<Unrenewing>,
@@ -2212,7 +2210,8 @@ struct LostTenant {
     name: TenantId,
 }
 
-/// See [`LostTenant`].
+/// Tenant "lost", held on a node with a three-second lease whose renewals
+/// its coordinator refuses once told to, and flushed four times.
 async fn lost_tenant_flushed_four() -> LostTenant {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
