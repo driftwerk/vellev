@@ -23,6 +23,41 @@ use crate::stop::{Stage, Stop, Stopped};
 
 const LANES: usize = 16;
 
+/// What a score reads of a vector, counted a thread at a time so that a rule
+/// can say how many passes over a row a distance made, which no clock says
+/// without being slow some of the time.
+#[cfg(test)]
+mod passes {
+    use std::cell::Cell;
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Made {
+        /// Of `dot_and_norm`, in `f32`.
+        pub narrow: usize,
+        /// Of `wide_dot_and_norm`, in `f64`.
+        pub wide: usize,
+        /// Looking for any bit set but a sign.
+        pub zero_looks: usize,
+    }
+
+    thread_local!(static MADE: Cell<Made> = const { Cell::new(Made { narrow: 0, wide: 0, zero_looks: 0 }) });
+
+    pub(crate) fn note(change: impl FnOnce(&mut Made)) {
+        MADE.with(|made| {
+            let mut now = made.get();
+            change(&mut now);
+            made.set(now);
+        });
+    }
+
+    /// What `work` made, and nothing before it.
+    pub(crate) fn during<T>(work: impl FnOnce() -> T) -> (T, Made) {
+        MADE.with(|made| made.set(Made::default()));
+        let result = work();
+        (result, MADE.with(Cell::get))
+    }
+}
+
 /// The dot product, accumulated in independent lanes so that it compiles to
 /// wide vector instructions without any being named; on x86-64 with AVX2,
 /// in those instructions, to the same result bit for bit (see [`f32s`]).
@@ -47,6 +82,8 @@ pub fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
 fn dot_and_norm(a: &[f32], b: &[f32]) -> (f32, f32) {
     // Of other lengths the ways would pair other elements in the tail.
     debug_assert_eq!(a.len(), b.len());
+    #[cfg(test)]
+    passes::note(|made| made.narrow += 1);
     (f32s::chosen().dot_and_norm)(a, b)
 }
 
@@ -233,6 +270,8 @@ pub(crate) mod f32s {
 /// whatever finite values the vectors hold: for a vector whose squared
 /// length an `f32` cannot hold in full, being too long or too short.
 fn wide_dot_and_norm(a: &[f32], b: &[f32]) -> (f64, f64) {
+    #[cfg(test)]
+    passes::note(|made| made.wide += 1);
     let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
     let tail = a_chunks.remainder().iter().zip(b_chunks.remainder()).fold(
         (0.0, 0.0),
@@ -353,6 +392,8 @@ impl<'q> Scorer<'q> {
         // summed again: no value of it has a bit set but its sign. Told so,
         // without a branch a value, rather than by comparing each to zero,
         // which stops at the first that is not and so cannot be vectorised.
+        #[cfg(test)]
+        passes::note(|made| made.zero_looks += 1);
         let set = vector
             .iter()
             .fold(0, |set, value| set | (value.to_bits() << 1));
@@ -1491,54 +1532,57 @@ mod tests {
         assert_eq!(distances, [0.0f32.to_bits(); 3]);
     }
 
-    /// Scoring a vector by cosine reads it once, as the inner product does,
-    /// and costs little more: a shape of its sums that defeats the
-    /// compiler's vectorising has made it three times as slow before. A
-    /// zero row, which takes a path of its own, costs little more than any
-    /// other row by cosine, and is held to that rather than to the inner
-    /// product, as the two differ less from one processor to another: it
-    /// has cost three times as much. The vectors fit in the processor's
-    /// cache, so that it is the arithmetic that is timed and not the memory
-    /// it is read from, and each kind is timed at its fastest of many
-    /// rounds, which whatever else the machine is doing slows least.
-    /// Timings mean nothing unoptimised, so this runs only in a release
-    /// build.
+    /// Scoring a vector by cosine reads it once, as the inner product does:
+    /// one pass that sums the inner product and the squared length together,
+    /// and none in `f64`. A zero row, which takes a path of its own, is
+    /// looked at once more, for any bit set, and is not summed again. This
+    /// counts the passes made, which are the same on every machine and every
+    /// run, where timing them once failed at a ratio of 3.35 to a limit of
+    /// 3.0 on a machine busy with other work. It runs in a debug build too.
+    ///
+    /// What it cannot see is how fast a pass runs: a sum shaped so that the
+    /// compiler does not vectorise it makes the same number of passes. That
+    /// is covered only as far as the release benchmark's search latency
+    /// shows it; no rule here times a score.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "timings mean nothing unoptimised")]
-    fn scoring_by_cosine_costs_little_more_than_by_inner_product() {
-        use std::hint::black_box;
-
+    fn scoring_by_cosine_reads_each_row_once() {
         let mut random = Random(59);
-        let vectors: Vec<Vec<f32>> = (0..32).map(|_| random.vector(768)).collect();
-        let zero = vec![vec![0.0; 768]; 32];
+        let rows: Vec<Vec<f32>> = (0..32).map(|_| random.vector(768)).collect();
+        let zero = vec![0.0; 768];
         let query = random.vector(768);
-        let fastest = |metric: Distance, vectors: &[Vec<f32>]| {
-            let scorer = Scorer::new(metric, &query);
-            (0..50)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    for vector in vectors.iter().cycle().take(3200) {
-                        black_box(scorer.distance(black_box(vector)));
-                    }
-                    started.elapsed()
-                })
-                .min()
-                .map_or(0.0, |fastest| fastest.as_secs_f64())
-        };
-        let inner = fastest(Distance::Dot, &vectors);
-        let cosine = fastest(Distance::Cosine, &vectors);
-        let over_zero = fastest(Distance::Cosine, &zero);
-        let (by_cosine, zero_by_cosine) = (cosine / inner, over_zero / cosine);
-        println!(
-            "a cosine score takes {by_cosine:.2} times an inner product's; over a zero row \
-             it takes {zero_by_cosine:.2} times its own over any other, and {:.2} times an \
-             inner product's",
-            over_zero / inner
+        // Taking the query's own measure is one pass, in `f32`, and no more.
+        let (scorer, made) = passes::during(|| Scorer::new(Distance::Cosine, &query));
+        assert_eq!(
+            made,
+            passes::Made {
+                narrow: 1,
+                wide: 0,
+                zero_looks: 0
+            },
+            "a scorer for an ordinary query"
         );
-        assert!(by_cosine < 3.0, "{by_cosine:.2} times an inner product's");
-        assert!(
-            zero_by_cosine < 2.5,
-            "{zero_by_cosine:.2} times a cosine score over any other row"
+
+        for row in &rows {
+            let (_, made) = passes::during(|| scorer.distance(row));
+            assert_eq!(
+                made,
+                passes::Made {
+                    narrow: 1,
+                    wide: 0,
+                    zero_looks: 0
+                },
+                "a row of ordinary values"
+            );
+        }
+        let (_, made) = passes::during(|| scorer.distance(&zero));
+        assert_eq!(
+            made,
+            passes::Made {
+                narrow: 1,
+                wide: 0,
+                zero_looks: 1
+            },
+            "a zero row"
         );
     }
 
