@@ -2177,12 +2177,9 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
     assert!(matches!(merged, Ok(Some(_))), "{merged:?}");
 }
 
-/// Tenant "lost" on a node with a three-second lease, its hold lost as
-/// renewal is refused while a request's compact is held at its merge's
-/// build: the merge is stopped, and counted once as a lease lost. The
-/// stopped compact is refused as a write is, and cleans nothing up. Builds
-/// are left held until stopped.
-async fn lost_with_its_merge_stopped() -> (Cluster, Arc<Unrenewing>, Node, Arc<Tenant>) {
+/// Tenant "lost" on a node with a three-second lease whose renewals
+/// `coordinator` refuses once told to, held, and flushed four times.
+async fn lost_tenant_flushed_four() -> (Cluster, Arc<Unrenewing>, Node, Arc<Tenant>, TenantId) {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
     let node = node_over_budget(&cluster, &coordinator, |settings| {
@@ -2199,6 +2196,27 @@ async fn lost_with_its_merge_stopped() -> (Cluster, Arc<Unrenewing>, Node, Arc<T
         held.write(ten_notes(from)).await.unwrap();
         held.flush().await.unwrap();
     }
+    (cluster, coordinator, node, held, name)
+}
+
+/// Wait until a write on `held` is refused: its hold is lost.
+async fn until_lost(held: &Tenant) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while held.write(ten_notes(90)).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the refused renewal never lost the hold");
+}
+
+/// [`lost_tenant_flushed_four`], its hold lost as renewal is refused while
+/// a request's compact is held at its merge's build: the merge is stopped,
+/// and counted once as a lease lost. The stopped compact is refused as a
+/// write is, and cleans nothing up. Merge builds are still held: the
+/// caller lets them go.
+async fn lost_with_its_merge_stopped() -> (Node, Arc<Tenant>, TenantId) {
+    let (cluster, coordinator, node, held, name) = lost_tenant_flushed_four().await;
     // Held at the start of its build, where a stop finds it.
     let builds = node.merge_builds().clone();
     builds.hold(Some(vellev_storage::Holding::UntilStopped));
@@ -2226,7 +2244,7 @@ async fn lost_with_its_merge_stopped() -> (Cluster, Arc<Unrenewing>, Node, Arc<T
         matches!(answered, Err(NodeError::Storage(StorageError::Closed))),
         "the compact whose merge was stopped: {answered:?}"
     );
-    (cluster, coordinator, node, held)
+    (node, held, name)
 }
 
 /// Review of 038be00, M1: a hold is lost once, whoever finds it lost. Its
@@ -2236,8 +2254,8 @@ async fn lost_with_its_merge_stopped() -> (Cluster, Arc<Unrenewing>, Node, Arc<T
 /// tenant is next asked for and its hold is found lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() {
-    let (_cluster, _coordinator, node, held) = lost_with_its_merge_stopped().await;
-    let (name, builds) = (tenant("lost"), node.merge_builds().clone());
+    let (node, held, name) = lost_with_its_merge_stopped().await;
+    let builds = node.merge_builds().clone();
     let writer = held.writer().clone();
     let second = tokio::spawn(async move { writer.merge().await });
     until("the merge after the hold was lost at its build", || {
@@ -2279,7 +2297,7 @@ async fn a_merge_begun_once_a_hold_is_lost_is_not_stopped_as_it_is_found_lost() 
 /// merge builds: nothing goes on building the tenant's data in memory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
-    let (_cluster, _coordinator, node, held) = lost_with_its_merge_stopped().await;
+    let (node, held, _) = lost_with_its_merge_stopped().await;
     let builds = node.merge_builds().clone();
     builds.hold(None);
     let turns = builds.turns_taken();
@@ -2308,28 +2326,7 @@ async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
 /// among the node's merge builds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
-    let cluster = Cluster::new();
-    let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
-    let node = node_over_budget(&cluster, &coordinator, |settings| {
-        settings.memory = None;
-        settings.lease = Duration::from_secs(3);
-    });
-    let name = tenant("lost");
-    node.create_tenant(&name).await.unwrap();
-    let held = node.tenant(&name).await.unwrap();
-    held.write(vec![schema(EmbeddingProvider::None)])
-        .await
-        .unwrap();
-    let flushed_four = |from: u64| {
-        let held = held.clone();
-        async move {
-            for from in (from..from + 40).step_by(10) {
-                held.write(ten_notes(from)).await.unwrap();
-                held.flush().await.unwrap();
-            }
-        }
-    };
-    flushed_four(10).await;
+    let (_cluster, coordinator, node, held, _) = lost_tenant_flushed_four().await;
     let gate = held.hold_merges_before_commit();
     let compacting = tokio::spawn({
         let held = held.clone();
@@ -2338,18 +2335,14 @@ async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
     tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
         .await
         .expect("the first merge never came to its commit");
-    // Enough for a second merge, once the first has committed.
-    flushed_four(50).await;
+    for from in [50, 60, 70, 80] {
+        held.write(ten_notes(from)).await.unwrap();
+        held.flush().await.unwrap();
+    }
     let builds = node.merge_builds().clone();
     let turns = builds.turns_taken();
     coordinator.refusing.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while held.write(ten_notes(90)).await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("the refused renewal never lost the hold");
+    until_lost(&held).await;
     assert_eq!(node.merges().stopped, vellev_node::MergesStopped::default());
     held.writer().stop_holding_merges();
     gate.release.notify_one();
