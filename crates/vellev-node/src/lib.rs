@@ -1597,6 +1597,7 @@ impl TenantWork {
     async fn cleaned(&self, grace: Duration) -> Result<usize> {
         let mut deleted = 0;
         loop {
+            self.not_lost()?;
             let cleaned = self.writer.clean(grace).await;
             let more = cleaned.map_err(|error| self.failed(error))?;
             deleted += more;
