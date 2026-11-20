@@ -1539,13 +1539,28 @@ mod tests {
     /// counts the passes made, which are the same on every machine and every
     /// run, where timing them once failed at a ratio of 3.35 to a limit of
     /// 3.0 on a machine busy with other work. It runs in a debug build too.
+    ///
+    /// What it cannot see is how fast a pass runs: a sum shaped so that the
+    /// compiler does not vectorise it makes the same number of passes. That
+    /// is covered only as far as the release benchmark's search latency
+    /// shows it; no rule here times a score.
     #[test]
     fn scoring_by_cosine_reads_each_row_once() {
         let mut random = Random(59);
         let rows: Vec<Vec<f32>> = (0..32).map(|_| random.vector(768)).collect();
         let zero = vec![0.0; 768];
         let query = random.vector(768);
-        let scorer = Scorer::new(Distance::Cosine, &query);
+        // Taking the query's own measure is one pass, in `f32`, and no more.
+        let (scorer, made) = passes::during(|| Scorer::new(Distance::Cosine, &query));
+        assert_eq!(
+            made,
+            passes::Made {
+                narrow: 1,
+                wide: 0,
+                zero_looks: 0
+            },
+            "a scorer for an ordinary query"
+        );
 
         for row in &rows {
             let (_, made) = passes::during(|| scorer.distance(row));
