@@ -2193,9 +2193,27 @@ async fn a_merge_begun_after_shutdown_is_not_stopped_again_by_renewal() {
     assert!(matches!(merged, Ok(Some(_))), "{merged:?}");
 }
 
-/// Tenant "lost" on a node with a three-second lease whose renewals
-/// `coordinator` refuses once told to, held, and flushed four times.
-async fn lost_tenant_flushed_four() -> (Cluster, Arc<Unrenewing>, Node, Arc<Tenant>, TenantId) {
+/// Write `held` ten notes from `from` and flush them, four times over.
+async fn flushed_four(held: &Tenant, from: u64) {
+    for from in (from..from + 40).step_by(10) {
+        held.write(ten_notes(from)).await.unwrap();
+        held.flush().await.unwrap();
+    }
+}
+
+/// Tenant `name`, "lost", `held` on a `node` with a three-second lease
+/// whose renewals `coordinator` refuses once told to, and flushed four
+/// times.
+struct LostTenant {
+    cluster: Cluster,
+    coordinator: Arc<Unrenewing>,
+    node: Node,
+    held: Arc<Tenant>,
+    name: TenantId,
+}
+
+/// See [`LostTenant`].
+async fn lost_tenant_flushed_four() -> LostTenant {
     let cluster = Cluster::new();
     let coordinator = Arc::new(Unrenewing::new(cluster.coordinator.clone()));
     let node = node_over_budget(&cluster, &coordinator, |settings| {
@@ -2208,11 +2226,14 @@ async fn lost_tenant_flushed_four() -> (Cluster, Arc<Unrenewing>, Node, Arc<Tena
     held.write(vec![schema(EmbeddingProvider::None)])
         .await
         .unwrap();
-    for from in [10, 20, 30, 40] {
-        held.write(ten_notes(from)).await.unwrap();
-        held.flush().await.unwrap();
+    flushed_four(&held, 10).await;
+    LostTenant {
+        cluster,
+        coordinator,
+        node,
+        held,
+        name,
     }
-    (cluster, coordinator, node, held, name)
 }
 
 /// Wait until a write on `held` is refused: its hold is lost.
@@ -2232,7 +2253,13 @@ async fn until_lost(held: &Tenant) {
 /// write is, and cleans nothing up. Merge builds are still held: the
 /// caller lets them go.
 async fn lost_with_its_merge_stopped() -> (Node, Arc<Tenant>, TenantId) {
-    let (cluster, coordinator, node, held, name) = lost_tenant_flushed_four().await;
+    let LostTenant {
+        cluster,
+        coordinator,
+        node,
+        held,
+        name,
+    } = lost_tenant_flushed_four().await;
     // Held at the start of its build, where a stop finds it.
     let builds = node.merge_builds().clone();
     builds.hold(Some(vellev_storage::Holding::UntilStopped));
@@ -2342,7 +2369,12 @@ async fn a_hold_lost_refuses_a_request_s_compact_and_flush_as_a_write() {
 /// among the node's merge builds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
-    let (_cluster, coordinator, node, held, _) = lost_tenant_flushed_four().await;
+    let LostTenant {
+        coordinator,
+        node,
+        held,
+        ..
+    } = lost_tenant_flushed_four().await;
     let gate = held.hold_merges_before_commit();
     let compacting = tokio::spawn({
         let held = held.clone();
@@ -2351,10 +2383,7 @@ async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
     tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
         .await
         .expect("the first merge never came to its commit");
-    for from in [50, 60, 70, 80] {
-        held.write(ten_notes(from)).await.unwrap();
-        held.flush().await.unwrap();
-    }
+    flushed_four(&held, 50).await;
     let builds = node.merge_builds().clone();
     let turns = builds.turns_taken();
     coordinator.refusing.store(true, Ordering::SeqCst);
@@ -2373,17 +2402,23 @@ async fn a_hold_lost_between_a_compact_s_merges_refuses_the_next() {
     );
 }
 
-/// Review of 93df871, L1: a compact looks at the hold before each lot its
-/// clean deletes, not only before it cleans. The hold lost while the first
-/// lot is deleted, of more files left over than a lot holds, the clean
-/// deletes no more once that lot is done, and the compact is refused.
+/// Review of 93df871, L1: a compact's clean looks at the hold before each
+/// `Writer::clean` call, not only before it cleans. With more files to
+/// delete than one call does, the hold lost during the first call, the
+/// clean deletes no more once that call is done, and the compact is
+/// refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hold_lost_while_a_compact_cleans_ends_the_clean_at_its_lot() {
-    let (cluster, coordinator, _node, held, name) = lost_tenant_flushed_four().await;
-    // Left over from writes long past, as a flush that never committed
-    // leaves its files: nothing lists them.
-    let lots = Writer::CLEANED_AT_ONCE;
-    for n in 0..lots + lots / 2 {
+async fn a_hold_lost_while_a_compact_cleans_ends_the_clean_after_its_call() {
+    let LostTenant {
+        cluster,
+        coordinator,
+        held,
+        name,
+        ..
+    } = lost_tenant_flushed_four().await;
+    // Files no checkpoint names, older than the grace.
+    let at_once = Writer::CLEANED_AT_ONCE;
+    for n in 0..at_once + at_once / 2 {
         let key = format!("{name}/0/segment/{:020}-left-{n}.segment", 1);
         cluster
             .store
@@ -2413,8 +2448,8 @@ async fn a_hold_lost_while_a_compact_cleans_ends_the_clean_at_its_lot() {
         .unwrap();
     assert_eq!(
         cluster.store.deletes.load(Ordering::SeqCst) - deleted,
-        lots,
-        "the clean went on past its lot"
+        at_once,
+        "the clean went on past its call"
     );
     assert!(
         matches!(compacted, Err(NodeError::Storage(StorageError::Closed))),
